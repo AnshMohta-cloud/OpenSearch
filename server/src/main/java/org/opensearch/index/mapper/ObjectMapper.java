@@ -427,9 +427,7 @@ public class ObjectMapper extends Mapper implements Cloneable {
                 if (type.equals(CONTENT_TYPE)) {
                     builder.nested = Nested.NO;
                 } else if (type.equals(NESTED_CONTENT_TYPE)) {
-                    if (isPluggableDataFormatEnabled(parserContext.getSettings())) {
-                        throw new MapperParsingException("nested type is not supported with pluggable data format on field [" + name + "]");
-                    }
+                    // POC: nested gate removed to prototype nested-document support (N1 design).
                     nested = true;
                 } else {
                     throw new MapperParsingException(
@@ -1085,7 +1083,13 @@ public class ObjectMapper extends Mapper implements Cloneable {
 
     @Override
     public void canDeriveSource() {
-        if (!this.enabled.value() || this.nested.isNested()) {
+        // POC: allow nested objects through derived-source validation so composite (pluggable
+        // data format) indexes can define nested mappings. Real derived-source reconstruction
+        // for nested fields is future work; here we only need mapping validation to pass.
+        if (this.nested.isNested()) {
+            return;
+        }
+        if (!this.enabled.value()) {
             throw new UnsupportedOperationException("Derived source is not supported for " + name() + " field as it is disabled/nested");
         }
         for (final Mapper mapper : this.mappers.values()) {

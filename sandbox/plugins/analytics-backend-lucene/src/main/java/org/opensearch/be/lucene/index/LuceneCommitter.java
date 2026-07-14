@@ -384,8 +384,12 @@ public class LuceneCommitter extends SafeBootstrapCommitter {
 
         if (isSecondary) {
             iwc.setIndexSort(new Sort(new SortedNumericSortField(DocumentInput.ROW_ID_FIELD, SortField.Type.LONG)));
+            // POC nested: must match the parent field on the ingest writer (LuceneWriter) so
+            // segments carrying __nested_parent can be committed/merged by this writer too.
+            iwc.setParentField(LuceneWriter.NESTED_PARENT_FIELD);
         } else if (userProvidedSort != null) {
             iwc.setIndexSort(userProvidedSort);
+            iwc.setParentField(LuceneWriter.NESTED_PARENT_FIELD);
         }
         iwc.setCommitOnClose(false);
         iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);

@@ -9,8 +9,10 @@
 package org.opensearch.be.lucene.index;
 
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.SortedNumericDocValuesField;
+import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DocValuesType;
 import org.opensearch.be.lucene.LuceneFieldFactory;
 import org.opensearch.be.lucene.LuceneFieldFactoryRegistry;
@@ -20,6 +22,9 @@ import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.mapper.MappedFieldType;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -41,9 +46,23 @@ import java.util.Set;
 @ExperimentalApi
 public class LuceneDocumentInput implements DocumentInput<Document> {
 
+    /** Name of the nested path field used to identify nested docs by their path. */
+    private static final String NESTED_PATH_FIELD = "_nested_path";
+
     private final Document document;
     private final LuceneFieldFactoryRegistry fieldFactoryRegistry;
     private long rowId = -1L;
+
+    // --- POC nested support: tracks child documents forming a block ---
+    /**
+     * Finished nested child docs in block order. Because children are appended when they
+     * CLOSE (endNestedChild), multi-level nesting naturally lands post-order: inner replies
+     * close before their enclosing comment, so replies precede the comment — matching the
+     * vanilla OpenSearch nested block layout (descendants first, parent after, root last).
+     */
+    private final List<Document> childDocs = new ArrayList<>();
+    /** Stack of currently-open child docs (innermost on top) for multi-level nesting. */
+    private final ArrayDeque<Document> childDocStack = new ArrayDeque<>();
 
     /**
      * Creates a new LuceneDocumentInput with the default field factory registry.
@@ -63,13 +82,61 @@ public class LuceneDocumentInput implements DocumentInput<Document> {
     }
 
     /**
-     * Returns the built Lucene {@link Document} containing all added fields.
+     * Returns the built Lucene {@link Document} — the ROOT document (last in the block).
      *
      * @return the Lucene document
      */
     @Override
     public Document getFinalInput() {
         return document;
+    }
+
+    /**
+     * Returns the full block of documents for IndexWriter.addDocuments().
+     * Order: all child docs in parse order (deepest first already by parse recursion),
+     * then the root doc last. If no nested children exist, returns a single-element list.
+     *
+     * @return the ordered document block
+     */
+    public List<Document> getDocumentBlock() {
+        if (childDocs.isEmpty()) {
+            return List.of(document);
+        }
+        List<Document> block = new ArrayList<>(childDocs.size() + 1);
+        block.addAll(childDocs);
+        block.add(document); // root is LAST
+        return block;
+    }
+
+    /**
+     * Returns the number of Lucene documents this input will produce (children + 1 root).
+     */
+    public int getDocCount() {
+        return childDocs.size() + 1;
+    }
+
+    /**
+     * Returns whether this input has nested children.
+     */
+    public boolean hasNestedChildren() {
+        return childDocs.isEmpty() == false;
+    }
+
+    // --- Nested boundary signals ---
+
+    @Override
+    public void startNestedChild(String nestedPath) {
+        Document childDoc = new Document();
+        // Add _nested_path field (keyword, indexed) so we can build per-path bitsets
+        childDoc.add(new StringField(NESTED_PATH_FIELD, nestedPath, Field.Store.NO));
+        childDocStack.push(childDoc);
+    }
+
+    @Override
+    public void endNestedChild() {
+        // Emit on close: inner children close before their enclosing element, so the
+        // resulting childDocs order is post-order — the vanilla nested block layout.
+        childDocs.add(childDocStack.pop());
     }
 
     /**
@@ -105,7 +172,10 @@ public class LuceneDocumentInput implements DocumentInput<Document> {
             );
         }
         FieldType luceneFieldType = getFieldType(fieldType, capabilities);
-        factory.addField(document, fieldType, value, luceneFieldType);
+
+        // POC: route to the innermost open child document if we're inside a nested child
+        Document target = childDocStack.isEmpty() ? document : childDocStack.peek();
+        factory.addField(target, fieldType, value, luceneFieldType);
     }
 
     private static FieldType getFieldType(MappedFieldType fieldType, Set<FieldTypeCapabilities.Capability> capabilities) {

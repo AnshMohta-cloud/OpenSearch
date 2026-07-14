@@ -96,6 +96,22 @@ public class CompositeDocumentInput implements DocumentInput<List<? extends Docu
     }
 
     @Override
+    public void startNestedChild(String nestedPath) {
+        primaryDocumentInput.startNestedChild(nestedPath);
+        for (DocumentInput<?> input : secondaryDocumentInputs.values()) {
+            input.startNestedChild(nestedPath);
+        }
+    }
+
+    @Override
+    public void endNestedChild() {
+        primaryDocumentInput.endNestedChild();
+        for (DocumentInput<?> input : secondaryDocumentInputs.values()) {
+            input.endNestedChild();
+        }
+    }
+
+    @Override
     public List<? extends DocumentInput<?>> getFinalInput() {
         return null;
     }

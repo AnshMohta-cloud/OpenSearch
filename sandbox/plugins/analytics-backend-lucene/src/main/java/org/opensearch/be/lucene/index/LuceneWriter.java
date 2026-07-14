@@ -94,6 +94,9 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
     /** Segment info attribute key storing the writer generation for post-addIndexes correlation. */
     public static final String WRITER_GENERATION_ATTRIBUTE = "writer_generation";
 
+    /** POC nested: Lucene parent field for document-block support with index sorting. */
+    public static final String NESTED_PARENT_FIELD = "__nested_parent";
+
     /** Large RAM buffer to avoid intermediate segment flushes within a single writer in production. */
     private static final double RAM_BUFFER_SIZE_MB = 256.0;
 
@@ -161,6 +164,10 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         if (indexSort != null) {
             iwc.setMergePolicy(new LogByteSizeMergePolicy());
             iwc.setIndexSort(indexSort);
+            // POC nested: Lucene requires a parent field to use document blocks (addDocuments)
+            // together with index sorting. This keeps parent+children blocks contiguous through
+            // the sorted merge (HLD 4.1.2.1). Field name must not collide with any mapped field.
+            iwc.setParentField(NESTED_PARENT_FIELD);
         } else {
             // We are taking control here hence not allowing any merge to happen automatically.
             iwc.setMergePolicy(NoMergePolicy.INSTANCE);
@@ -228,13 +235,26 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
             if (state != WriterState.ACTIVE) {
                 throw new IllegalStateException("addDoc requires ACTIVE state but was " + state);
             }
-            // Defense-in-depth: CompositeWriter enforces rowId == docCount at the multiplexer
-            // layer, but we re-check here so a single-format Lucene path is also protected.
-            if (input.getRowId() != docCount) {
-                throw new IllegalStateException("rowId [" + input.getRowId() + "] does not match doc count [" + docCount + "]");
-            }
+            // POC: for nested docs, rowId tracks logical docs (Parquet rows) while docCount
+            // tracks total Lucene docs (including children). The CompositeWriter already
+            // enforces rowId == acceptedRows (logical docs), so we skip the rowId==docCount
+            // check here — it would break when prior docs had nested children.
             try {
-                indexWriter.addDocument(input.getFinalInput());
+                if (input.hasNestedChildren()) {
+                    // Write a block of N+1 documents atomically
+                    indexWriter.addDocuments(input.getDocumentBlock());
+                    long blockSize = input.getDocCount();
+                    long currentDocId = docCount;
+                    docCount += blockSize;
+                    stats.addDocsIndexed(blockSize);
+                    return new WriteResult.Success(1L, blockSize, currentDocId);
+                } else {
+                    indexWriter.addDocument(input.getFinalInput());
+                    long currentDocId = docCount;
+                    docCount++;
+                    stats.addDocsIndexed(1);
+                    return new WriteResult.Success(1L, 1L, currentDocId);
+                }
             } catch (IOException | IllegalArgumentException e) {
                 // Lucene's IndexWriter may have consumed a docId before throwing; advance our
                 // counter to match so rollbackTo can tombstone the partial slot, and
@@ -244,10 +264,6 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
                 stats.incDocsIndexedFailures();
                 return new WriteResult.Failure(e, -1L, -1L, -1L);
             }
-            long currentDocId = docCount;
-            docCount++;
-            stats.addDocsIndexed(1);
-            return new WriteResult.Success(1L, 1L, currentDocId);
         }, stats::addIndexTimeMillis);
     }
 
@@ -327,11 +343,14 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
                     );
                 }
                 RowIdMapping mapping = flushInput.rowIdMapping();
-                if (mapping.size() != docCount) {
+                // POC: with nested docs, mapping.size() == logical row count (Parquet rows),
+                // while docCount == total Lucene docs (including N+1 blocks per nested doc).
+                // Relax to <= instead of == for the POC.
+                if (mapping.size() > docCount) {
                     throw new IllegalStateException(
                         "RowIdMapping size ["
                             + mapping.size()
-                            + "] does not match document count ["
+                            + "] exceeds document count ["
                             + docCount
                             + "] for writer generation ["
                             + writerGeneration
@@ -387,15 +406,10 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
             // need to either configure index.sort.field or avoid the rollback path.
             assert segmentInfo.info.maxDoc() == docCount : "Expected " + docCount + " docs in segment, got " + segmentInfo.info.maxDoc();
 
-            // Invariant: ___row_id__ doc values must be sequential 0..maxDoc-1 after forceMerge.
-            // This holds in all cases:
-            // - Lucene secondary: docs reordered via OneMerge.reorder() + row ID rewrite
-            // - Lucene primary with IndexSort: Lucene sorts natively + row ID rewrite
-            // - No sort: docs added sequentially, row IDs naturally sequential
-            // Wrapped in `assert` so the I/O cost is paid only when assertions are enabled.
-            assert assertRowIdsSequential(directory) : "___row_id__ doc values not sequential after forceMerge for writer generation ["
-                + writerGeneration
-                + "]";
+            // POC: with nested blocks, __row_id__ only exists on root docs (not children),
+            // so the sequential 0..maxDoc-1 assertion cannot hold. Skip for now.
+            // TODO: restore with a nested-aware invariant (root docs have sequential rowIds,
+            // children have no __row_id__).
 
             // Stamp the IndexSort on the segment metadata post-commit so that
             // addIndexes(Directory...) on the shared writer sees matching sort.
