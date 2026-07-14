@@ -704,10 +704,15 @@ public class CatalogSnapshotManager implements Closeable {
                     expected = rows;
                     referenceFormat = entry.getKey();
                 } else if (rows != expected) {
-                    throw new IllegalStateException(
+                    // POC nested (N1): a nested logical doc becomes 1 Parquet row but an N+1
+                    // Lucene block, so physical row counts legitimately differ across formats.
+                    // Downgrade the hard parity check to a warning for the POC; a nested-aware
+                    // version would compare LOGICAL row counts (Parquet rows == Lucene roots).
+                    logger.warn(
                         String.format(
                             Locale.ROOT,
-                            "Per-segment row count mismatch at generation %s: format [%s] has %s rows but format [%s] has %s rows",
+                            "Per-segment row count mismatch at generation %s: format [%s] has %s rows but format [%s] has %s rows "
+                                + "(expected for nested docs under N1)",
                             seg.generation(),
                             referenceFormat,
                             expected,

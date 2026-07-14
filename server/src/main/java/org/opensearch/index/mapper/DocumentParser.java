@@ -607,6 +607,10 @@ final class DocumentParser {
         ObjectMapper.Nested nested = mapper.nested();
         if (nested.isNested()) {
             context = nestedContext(context, mapper);
+            // POC: signal child boundary to pluggable DocumentInput so engines can track nested elements
+            if (context.indexSettings().isPluggableDataFormatEnabled()) {
+                context.documentInput().startNestedChild(mapper.fullPath());
+            }
         }
 
         // if we are at the end of the previous object, advance
@@ -623,6 +627,10 @@ final class DocumentParser {
         // restore the enable path flag
         if (nested.isNested()) {
             nested(context, nested);
+            // POC: signal end of this nested child element
+            if (context.indexSettings().isPluggableDataFormatEnabled()) {
+                context.documentInput().endNestedChild();
+            }
         }
     }
 
@@ -840,7 +848,11 @@ final class DocumentParser {
             // We just need to store the id as indexed field, so that IndexWriter#deleteDocuments(term) can then
             // delete it when the root document is deleted too.
             nestedDoc.add(new Field(IdFieldMapper.NAME, idField.binaryValue(), IdFieldMapper.Defaults.NESTED_FIELD_TYPE));
-        } else {
+        } else if (context.indexSettings().isPluggableDataFormatEnabled() == false) {
+            // POC: in pluggable/composite mode, field values (including _id) route to the
+            // DocumentInput rather than to ParseContext.Document, so the legacy per-Document
+            // _id copy isn't populated. The nested Lucene block is built by LuceneDocumentInput
+            // from start/endNestedChild signals instead, so this legacy path is unused.
             throw new IllegalStateException("The root document of a nested document should have an _id field");
         }
 

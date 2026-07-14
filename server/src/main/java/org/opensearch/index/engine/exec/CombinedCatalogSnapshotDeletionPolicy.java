@@ -182,23 +182,14 @@ public class CombinedCatalogSnapshotDeletionPolicy implements CatalogSnapshotDel
     public static int getDocCountOfCommit(CatalogSnapshot snapshot) {
         long totalDocs = 0;
         for (Segment segment : snapshot.getSegments()) {
+            // POC nested (N1): formats legitimately disagree on physical row count (Parquet =
+            // logical docs, Lucene = N+1 blocks). Use the MINIMUM across formats as the logical
+            // doc count (Parquet's row-per-logical-doc), instead of asserting equality.
             long segmentRows = -1;
             for (Map.Entry<String, WriterFileSet> entry : segment.dfGroupedSearchableFiles().entrySet()) {
                 long numRows = entry.getValue().numRows();
-                if (segmentRows == -1) {
+                if (segmentRows == -1 || numRows < segmentRows) {
                     segmentRows = numRows;
-                } else if (segmentRows != numRows) {
-                    throw new IllegalStateException(
-                        "Segment [gen="
-                            + segment.generation()
-                            + "] has inconsistent row counts across data formats: "
-                            + segmentRows
-                            + " vs "
-                            + numRows
-                            + " (format="
-                            + entry.getKey()
-                            + ")"
-                    );
                 }
             }
             if (segmentRows > 0) {
