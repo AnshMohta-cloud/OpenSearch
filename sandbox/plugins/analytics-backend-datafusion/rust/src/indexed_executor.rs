@@ -39,7 +39,10 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     physical_plan::ExecutionPlan
 };
-use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+// [NESTED-POC] Route Substrait->LogicalPlan through the unnest-aware consumer so the N1
+// UNNEST (carried as an ExtensionSingleRel) becomes a native LogicalPlan::Unnest. Drop-in
+// replacement for the stock from_substrait_plan (same signature).
+use crate::unnest_consumer::from_substrait_plan_unnest_aware as from_substrait_plan;
 use prost::Message;
 use substrait::proto::Plan;
 

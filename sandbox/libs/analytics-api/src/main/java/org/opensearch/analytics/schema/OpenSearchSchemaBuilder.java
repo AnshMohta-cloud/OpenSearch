@@ -27,6 +27,7 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.common.Strings;
 import org.opensearch.index.IndexNotFoundException;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -310,6 +311,9 @@ public class OpenSearchSchemaBuilder {
         Map<String, Object> properties,
         String pathPrefix
     ) {
+        if (pathPrefix.isEmpty()) {
+            System.out.println("[NESTED-POC] OpenSearchSchemaBuilder.addLeafFields called, properties: " + properties.keySet());
+        }
         for (Map.Entry<String, Object> fieldEntry : properties.entrySet()) {
             String fieldName = pathPrefix.isEmpty() ? fieldEntry.getKey() : pathPrefix + "." + fieldEntry.getKey();
             Map<String, Object> fieldProps = (Map<String, Object>) fieldEntry.getValue();
@@ -323,8 +327,23 @@ public class OpenSearchSchemaBuilder {
                 }
                 continue;
             }
-            // Nested type (array-of-sub-docs) is a different beast — deferred.
+            // POC nested (N1): expose nested fields as ARRAY<ROW<leaf children...>>
+            // so Calcite can see them. Mirrors the LIST<STRUCT> Arrow schema that
+            // ArrowSchemaBuilder produces on the write side.
             if ("nested".equals(fieldType)) {
+                System.out.println("[NESTED-POC] HANDLING nested field '" + fieldName + "' (POC: mapped to ARRAY<ROW> so the planner can see it)");
+                Map<String, Object> nestedProps = (Map<String, Object>) fieldProps.get("properties");
+                if (nestedProps != null) {
+                    System.out.println("[NESTED-POC]   Sub-properties: " + nestedProps.keySet());
+                    RelDataType structType = buildNestedStructType(typeFactory, nestedProps);
+                    if (structType != null) {
+                        RelDataType arrayType = typeFactory.createArrayType(structType, -1);
+                        builder.add(fieldName, typeFactory.createTypeWithNullability(arrayType, true));
+                        System.out.println("[NESTED-POC]   ADDED nested field '" + fieldName + "' as ARRAY(" + structType + ")");
+                    }
+                } else {
+                    System.out.println("[NESTED-POC]   SKIPPED nested field '" + fieldName + "' — no sub-properties in mapping");
+                }
                 continue;
             }
             String format = (String) fieldProps.get("format");
@@ -337,5 +356,59 @@ public class OpenSearchSchemaBuilder {
             }
             builder.add(fieldName, columnType);
         }
+    }
+
+    /**
+     * POC nested (N1): builds a Calcite ROW type for the struct inside a nested LIST&lt;STRUCT&gt;
+     * column. Recursively handles nested-in-nested (becomes ARRAY&lt;ROW&gt; inside the struct).
+     */
+    @SuppressWarnings("unchecked")
+    private static RelDataType buildNestedStructType(RelDataTypeFactory typeFactory, Map<String, Object> properties) {
+        // Struct fields are matched BY POSITION downstream (Substrait / DataFusion), so the
+        // order here MUST match the Parquet write side (ArrowSchemaBuilder). Both sides order
+        // struct children deterministically by field name (natural String order) via a TreeMap.
+        System.out.println("[NESTED-POC] buildNestedStructType called, sub-properties: " + properties.keySet()
+            + " (POC: struct children sorted BY NAME so read schema matches the Parquet write order — DataFusion matches struct fields by POSITION)");
+        java.util.TreeMap<String, RelDataType> sorted = new java.util.TreeMap<>();
+        for (Map.Entry<String, Object> entry : properties.entrySet()) {
+            Map<String, Object> fieldProps = (Map<String, Object>) entry.getValue();
+            String fieldType = (String) fieldProps.get("type");
+            if ("nested".equals(fieldType)) {
+                // nested-in-nested: recurse as ARRAY<ROW<...>>
+                Map<String, Object> subProps = (Map<String, Object>) fieldProps.get("properties");
+                if (subProps != null) {
+                    RelDataType innerStruct = buildNestedStructType(typeFactory, subProps);
+                    if (innerStruct != null) {
+                        RelDataType innerArray = typeFactory.createArrayType(innerStruct, -1);
+                        sorted.put(entry.getKey(), typeFactory.createTypeWithNullability(innerArray, true));
+                        System.out.println("[NESTED-POC]   Nested-in-nested sub-field '" + entry.getKey() + "' -> ARRAY(ROW(...))");
+                    }
+                }
+            } else if (fieldType == null || "object".equals(fieldType)) {
+                // sub-object: flatten into dotted leaves inside the struct
+                Map<String, Object> subProps = (Map<String, Object>) fieldProps.get("properties");
+                if (subProps != null) {
+                    RelDataType subStruct = buildNestedStructType(typeFactory, subProps);
+                    if (subStruct != null) {
+                        sorted.put(entry.getKey(), subStruct);
+                    }
+                }
+            } else {
+                String format = (String) fieldProps.get("format");
+                RelDataType leafType = buildLeafType(fieldType, format, typeFactory);
+                if (leafType != null) {
+                    sorted.put(entry.getKey(), leafType);
+                    System.out.println("[NESTED-POC]   Nested sub-field (leaf): '" + entry.getKey() + "' type='" + fieldType + "' -> " + leafType);
+                }
+            }
+        }
+        if (sorted.isEmpty()) {
+            return null;
+        }
+        List<String> fieldNames = new ArrayList<>(sorted.keySet());
+        List<RelDataType> fieldTypes = new ArrayList<>(sorted.values());
+        RelDataType struct = typeFactory.createStructType(fieldTypes, fieldNames);
+        System.out.println("[NESTED-POC] buildNestedStructType built ROW" + fieldNames + " (name-sorted)");
+        return struct;
     }
 }

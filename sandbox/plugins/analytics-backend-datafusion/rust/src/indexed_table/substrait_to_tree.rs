@@ -91,10 +91,16 @@ pub struct ExtractionResult {
 /// Extract the scan-level filter from a logical plan, skipping HAVING/window
 /// filters that sit above Aggregate or Window nodes (those reference derived
 /// columns that `expr_to_bool_tree` cannot resolve against the base schema).
+///
+/// [NESTED-POC] Also skips a filter sitting above an UNNEST: its predicate
+/// references post-unnest (exploded) columns (e.g. `comments.score`) that do not
+/// exist in the base scan schema, so it cannot be pushed to the columnar scan.
+/// Leaving it unextracted keeps it in the logical plan for DataFusion to evaluate
+/// natively above the unnest.
 pub fn extract_filter_expr(plan: &LogicalPlan) -> Option<Expr> {
     match plan {
         LogicalPlan::Filter(filter) => {
-            if has_aggregate_or_window_below(&filter.input) {
+            if has_aggregate_or_window_below(&filter.input) || has_unnest_below(&filter.input) {
                 extract_filter_expr(&filter.input)
             } else {
                 Some(filter.predicate.clone())
@@ -108,6 +114,22 @@ pub fn extract_filter_expr(plan: &LogicalPlan) -> Option<Expr> {
             }
             None
         }
+    }
+}
+
+/// [NESTED-POC] True if an UNNEST appears below `plan` before any row-reshaping
+/// operator that would re-establish scan-resolvable columns. A filter above an
+/// unnest references exploded columns and must be evaluated natively by DataFusion,
+/// not extracted for columnar pushdown against the base scan schema.
+fn has_unnest_below(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Unnest(_) => true,
+        LogicalPlan::Projection(p) => has_unnest_below(&p.input),
+        LogicalPlan::Filter(f) => has_unnest_below(&f.input),
+        LogicalPlan::Sort(s) => has_unnest_below(&s.input),
+        LogicalPlan::SubqueryAlias(s) => has_unnest_below(&s.input),
+        LogicalPlan::Limit(l) => has_unnest_below(&l.input),
+        _ => false,
     }
 }
 

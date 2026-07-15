@@ -468,6 +468,25 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
 
     @Override
     public byte[] convertFragment(RelNode fragment) {
+        // [NESTED-POC] If a hand-authored N1 descriptor was supplied for this query (nested query
+        // whose UNNEST isthmus cannot emit), assemble the Substrait plan by hand and skip isthmus
+        // entirely. The descriptor is staged on a thread-local by DefaultPlanExecutor.executeInternal.
+        // Grep: NESTED-POC.
+        org.opensearch.analytics.N1Descriptor n1 = org.opensearch.analytics.NestedPocOverride.get();
+        if (n1 != null) {
+            byte[] bytes = N1SubstraitBuilder.build(n1, SCHEMA_ONLY_TYPE_PROTO_CONVERTER);
+            LOGGER.info(
+                "[NESTED-POC] convertFragment: assembled hand-built N1 Substrait plan for index [{}] "
+                    + "(unnest '{}', filter {}>{}, group by '{}') = {} bytes, skipping isthmus",
+                n1.indexName(),
+                n1.unnestColumn(),
+                n1.filterStructField(),
+                n1.threshold(),
+                n1.groupByColumn(),
+                bytes.length
+            );
+            return bytes;
+        }
         LOGGER.debug("Converting fragment [{}]", fragment.getClass().getSimpleName());
         RelNode rewritten = rewriteStageInputScans(fragment);
         return convertToSubstrait(rewritten);
@@ -569,7 +588,24 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
             throw new IllegalStateException("Substrait conversion rejected the plan: " + e.getMessage(), e);
         }
 
-        List<String> fieldNames = root.fields.stream().map(field -> field.getValue()).toList();
+        // Substrait Root.names is a DEPTH-FIRST FLATTENED name list: DataFusion's consumer
+        // (rename_data_type in datafusion-substrait) consumes one name per field INCLUDING
+        // struct children and list-of-struct element fields. Top-level output names come from
+        // root.fields (preserves projection aliasing); nested struct child names are appended
+        // depth-first from the row type. For scalar-only outputs this equals the top-level list.
+        List<String> topLevelNames = root.fields.stream().map(field -> field.getValue()).toList();
+        List<String> fieldNames = flattenOutputNames(topLevelNames, root.validatedRowType);
+
+        // [NESTED-POC] When the output has a nested (ARRAY<ROW>) column, the flattened name list is
+        // LONGER than the top-level list (it appends struct child names depth-first). If these two
+        // sizes differ, a nested column is present in this fragment's output. Grep: NESTED-POC.
+        if (fieldNames.size() != topLevelNames.size()) {
+            LOGGER.info(
+                "[NESTED-POC] nested output detected: top-level names {} -> Substrait flattened names {}",
+                topLevelNames,
+                fieldNames
+            );
+        }
 
         Plan.Root substraitRoot = Plan.Root.builder().input(substraitRel).names(fieldNames).build();
         Plan plan = Plan.builder().addRoots(substraitRoot).build();
@@ -580,6 +616,42 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
         byte[] bytes = protoPlan.toByteArray();
         LOGGER.debug("Substrait plan: {} bytes", bytes.length);
         return bytes;
+    }
+
+    /**
+     * Builds the depth-first flattened name list Substrait's {@code Root.names} requires when the
+     * output row type contains struct (ROW) or list-of-struct (ARRAY&lt;ROW&gt;) columns. DataFusion's
+     * consumer walks the schema depth-first and consumes one name per field including nested struct
+     * children (see {@code rename_data_type} in datafusion-substrait): a bare struct consumes a name
+     * for the struct field then recurses into its children; a list recurses into its element WITHOUT
+     * consuming an extra name for the list itself.
+     *
+     * <p>The top-level names use {@code topLevelNames} (which preserves projection aliasing); nested
+     * child names come from the type's declared field names. For a purely scalar row type this returns
+     * exactly {@code topLevelNames}.
+     */
+    private static List<String> flattenOutputNames(List<String> topLevelNames, RelDataType rowType) {
+        List<RelDataTypeField> fields = rowType.getFieldList();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (int i = 0; i < fields.size(); i++) {
+            String name = i < topLevelNames.size() ? topLevelNames.get(i) : fields.get(i).getName();
+            out.add(name);
+            appendNestedNames(fields.get(i).getType(), out);
+        }
+        return out;
+    }
+
+    /** Appends depth-first names for struct children reachable through the given type (through ARRAY/MAP element types). */
+    private static void appendNestedNames(RelDataType type, List<String> out) {
+        if (type.getComponentType() != null) {
+            // ARRAY / MULTISET: recurse into the element type WITHOUT consuming a name for the collection.
+            appendNestedNames(type.getComponentType(), out);
+        } else if (type.isStruct()) {
+            for (RelDataTypeField child : type.getFieldList()) {
+                out.add(child.getName());
+                appendNestedNames(child.getType(), out);
+            }
+        }
     }
 
     /** Converts a single operator into a Substrait {@link Rel}; children are discarded and rewired by {@link #rewire}. */

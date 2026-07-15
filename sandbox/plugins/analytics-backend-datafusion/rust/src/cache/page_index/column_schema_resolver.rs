@@ -107,6 +107,33 @@ pub(super) fn resolve_with_schema(
         if let Ok(conv) = StatisticsConverter::try_new(name, arrow_schema, parquet_schema) {
             if let Some(idx) = conv.parquet_column_index() {
                 set.insert(idx);
+                continue;
+            }
+        }
+        // `parquet_column_index()` (arrow-rs `parquet_column`) returns None for a NESTED
+        // field (LIST/STRUCT/MAP) because a nested column maps to MULTIPLE parquet leaves,
+        // not one. Expand it here: find the field's root index in the arrow schema, then
+        // collect every parquet leaf whose column-root-index matches. Without this, a nested
+        // column resolves to zero leaves, is dropped from the scoped page-index's real-column
+        // set, and gets a single-page placeholder OffsetIndex — which then corrupts a real
+        // multi-page read of that column ("output too small for the decompressed data").
+        if let Some((root_idx, field)) = arrow_schema.fields().find(name) {
+            if field.data_type().is_nested() {
+                let mut leaves = Vec::new();
+                for leaf in 0..parquet_schema.num_columns() {
+                    if parquet_schema.get_column_root_idx(leaf) == root_idx {
+                        set.insert(leaf);
+                        leaves.push(leaf);
+                    }
+                }
+                log::info!(
+                    "[NESTED-POC] scoped-page-index: expanded nested column '{}' (root_idx={}) to parquet leaves {:?} \
+                     (POC fix: arrow-rs parquet_column() returns None for nested, so we resolve all leaves ourselves — \
+                     without this the leaves get a placeholder OffsetIndex and a real read fails with 'output too small')",
+                    name,
+                    root_idx,
+                    leaves
+                );
             }
         }
     }

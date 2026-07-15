@@ -58,6 +58,7 @@ pub mod stats;
 pub mod task_monitors;
 pub mod scoped_index_optimizer;
 pub mod scoped_page_index_reader;
+pub mod unnest_consumer;
 
 #[cfg(target_os = "linux")]
 pub mod liquid_cache;

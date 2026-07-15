@@ -17,6 +17,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.analytics.EngineContextProvider;
+import org.opensearch.analytics.N1Descriptor;
 import org.opensearch.analytics.QueryRequestContext;
 import org.opensearch.analytics.exec.QueryPlanExecutor;
 import org.opensearch.analytics.exec.profile.ProfiledResult;
@@ -116,17 +117,67 @@ public class UnifiedQueryService {
             // Log what the context's root schema looks like
             logger.info("[UnifiedQueryService] Context built, planning PPL: {}", pplText);
             UnifiedQueryPlanner planner = new UnifiedQueryPlanner(context);
-            RelNode logicalPlan = planner.plan(pplText);
+
+            // [NESTED-POC] N1-rewrite stand-in. A nested predicate like `where comments.score > 4`
+            // can't be planned by the unified-query planner (it dies with "Unsupported conversion for
+            // Relational Data type: ROW") and isthmus can't emit relational UNNEST — the real
+            // customer-query -> N1 rewrite is a separate workstream that isn't built yet. For queries
+            // we have hand-authored (see N1PlanRegistry) we instead: (1) plan a bare `source=<index>`
+            // to get a valid single-fragment scan RelNode to carry through the planner/DAG, and (2)
+            // attach an N1Descriptor to the request so the DataFusion convertor assembles the real N1
+            // Substrait plan (Scan -> UNNEST -> Filter -> distinct) by hand, skipping isthmus. Grep: NESTED-POC.
+            RelNode logicalPlan;
+            N1Descriptor n1Descriptor = null;
+            if (N1PlanRegistry.has(pplText)) {
+                String indexName = extractSourceIndex(pplText);
+                logger.info("[NESTED-POC] query matched the N1 registry; planning base scan for index [{}]", indexName);
+                logicalPlan = planner.plan("source=" + indexName);
+                n1Descriptor = N1PlanRegistry.describe(pplText, indexName, logicalPlan.getRowType());
+                logger.info(
+                    "[NESTED-POC] built N1 descriptor: unnest '{}', filter {}>{}, group by '{}'; base row type {}",
+                    n1Descriptor.unnestColumn(),
+                    n1Descriptor.filterStructField(),
+                    n1Descriptor.threshold(),
+                    n1Descriptor.groupByColumn(),
+                    logicalPlan.getRowType().getFieldNames()
+                );
+            } else {
+                logicalPlan = planner.plan(pplText);
+            }
+
+            // [NESTED-POC] Dump the logical plan the front-end produced. For an N1 query this is just
+            // the base scan; the real N1 plan is assembled later in the convertor from the descriptor.
+            logger.info(
+                "[NESTED-POC] logical plan for PPL [{}]:\n{}",
+                pplText,
+                org.apache.calcite.plan.RelOptUtil.toString(logicalPlan)
+            );
 
             // Extract column names from the RelNode's row type
-            List<RelDataTypeField> fields = logicalPlan.getRowType().getFieldList();
-            List<String> columns = new ArrayList<>(fields.size());
-            for (RelDataTypeField field : fields) {
-                columns.add(field.getName());
+            List<String> columns;
+            if (n1Descriptor != null) {
+                // [NESTED-POC] The executed plan is the hand-built N1 plan, whose OUTPUT is the
+                // group-by column (distinct parent __row_id__), NOT the base-scan row type we used
+                // as a carrier. Declare the output columns to match what the plan actually returns,
+                // else DefaultPlanExecutor.orderedColumns fails matching the result batch schema.
+                columns = List.of(n1Descriptor.groupByColumn());
+                logger.info("[NESTED-POC] output columns for N1 query = {}", columns);
+            } else {
+                List<RelDataTypeField> fields = logicalPlan.getRowType().getFieldList();
+                columns = new ArrayList<>(fields.size());
+                for (RelDataTypeField field : fields) {
+                    columns.add(field.getName());
+                }
             }
 
             QueryRequestContext baseCtx = contextProvider.getContext();
-            QueryRequestContext queryCtx = new QueryRequestContext(baseCtx.clusterState(), baseCtx.schema(), pplText);
+            QueryRequestContext queryCtx = new QueryRequestContext(
+                baseCtx.clusterState(),
+                baseCtx.schema(),
+                pplText,
+                baseCtx.parentTask(),
+                n1Descriptor
+            );
 
             if (profile) {
                 PlainActionFuture<ProfiledResult> future = new PlainActionFuture<>();
@@ -164,5 +215,29 @@ public class UnifiedQueryService {
             }
             throw new RuntimeException("Failed to execute PPL query: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * [NESTED-POC] Extracts the index name from the leading {@code source=<index>} of a PPL query,
+     * used only to plan a base scan for a registry-matched query. Deliberately trivial — this is not
+     * a query parser, just enough to pull the table name for the hand-built N1 stand-in.
+     */
+    private static String extractSourceIndex(String pplText) {
+        String s = pplText.trim();
+        int eq = s.indexOf('=');
+        if (eq < 0) {
+            throw new IllegalArgumentException("[NESTED-POC] cannot extract source index from query: " + pplText);
+        }
+        String afterEq = s.substring(eq + 1).trim();
+        // stop at the first whitespace or pipe
+        int end = afterEq.length();
+        for (int i = 0; i < afterEq.length(); i++) {
+            char c = afterEq.charAt(i);
+            if (Character.isWhitespace(c) || c == '|') {
+                end = i;
+                break;
+            }
+        }
+        return afterEq.substring(0, end);
     }
 }

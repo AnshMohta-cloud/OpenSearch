@@ -179,5 +179,10 @@ configurations.all {
     force "commons-io:commons-io:${versions.commonsio}"
     force "org.codehaus.janino:janino:3.1.12"
     force "org.codehaus.janino:commons-compiler:3.1.12"
+    // A freshly republished unified-query-core:3.8.0.0-SNAPSHOT bumped these transitively,
+    // clashing with the versions the rest of the classpath expects. Pin to the lower
+    // (pre-bump) versions to break the resolution conflict.
+    force "com.jayway.jsonpath:json-path:2.9.0"
+    force "org.apache.calcite.avatica:avatica-core:1.27.0"
   }
 }

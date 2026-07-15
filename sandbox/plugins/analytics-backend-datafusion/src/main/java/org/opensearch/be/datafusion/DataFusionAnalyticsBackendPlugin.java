@@ -85,6 +85,10 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         SUPPORTED_FIELD_TYPES.add(FieldType.BINARY);
         SUPPORTED_FIELD_TYPES.add(FieldType.IP);
         SUPPORTED_FIELD_TYPES.add(FieldType.MATCH_ONLY_TEXT);
+        // POC nested (N1): DataFusion scans the Parquet LIST<STRUCT> column, so it must
+        // advertise a scan capability for NESTED — otherwise OpenSearchTableScanRule finds
+        // no viable backend for a `comments` projection and rejects the plan.
+        SUPPORTED_FIELD_TYPES.add(FieldType.NESTED);
     }
 
     // Filter-side scalar functions DataFusion can evaluate natively. Comparisons, arithmetic
