@@ -134,11 +134,11 @@ public class UnifiedQueryService {
                 logicalPlan = planner.plan("source=" + indexName);
                 n1Descriptor = N1PlanRegistry.describe(pplText, indexName, logicalPlan.getRowType());
                 logger.info(
-                    "[NESTED-POC] built N1 descriptor: unnest '{}', filter {}>{}, group by '{}'; base row type {}",
-                    n1Descriptor.unnestColumn(),
-                    n1Descriptor.filterStructField(),
-                    n1Descriptor.threshold(),
+                    "[NESTED-POC] built N1 descriptor: unnestPath {}, predicate {}, group by '{}', projection {}; base row type {}",
+                    n1Descriptor.unnestPath(),
+                    n1Descriptor.predicate(),
                     n1Descriptor.groupByColumn(),
+                    n1Descriptor.projection(),
                     logicalPlan.getRowType().getFieldNames()
                 );
             } else {

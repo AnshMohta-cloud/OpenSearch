@@ -89,29 +89,35 @@ impl SubstraitConsumer for UnnestConsumer<'_> {
             DataFusionError::NotImplemented("ExtensionSingleRel without detail".to_string())
         })?;
 
-        if let Some(column) = detail.type_url.strip_prefix(UNNEST_TYPE_URL_PREFIX) {
+        if let Some(path_spec) = detail.type_url.strip_prefix(UNNEST_TYPE_URL_PREFIX) {
             let input_rel = rel.input.as_ref().ok_or_else(|| {
                 DataFusionError::Execution("[NESTED-POC] unnest ExtensionSingleRel has no input".to_string())
             })?;
             // Recurse through THIS consumer so any nested unnest/extension inside the input is
             // also handled (consume_rel dispatches back through our overrides).
             let input_plan = self.consume_rel(input_rel).await?;
+
+            // The tag is a comma-separated PATH of nested levels to unnest, outermost first, e.g.
+            // "comments" (1-level) or "comments,comments.replies,comments.replies.reactions" (3-level).
+            // Each level is a column that is a LIST<STRUCT>; unnesting it TWICE (list->struct, then
+            // struct->top-level `level.field` columns) makes the next level's list column addressable
+            // by its dotted name (Column::from_name does NOT split on '.', so "comments.replies" is one
+            // column). Two passes per level because DataFusion's Substrait consumer only accepts
+            // single-level (top-level) StructField references, not nested StructField.child access.
+            let levels: Vec<&str> = path_spec.split(',').filter(|s| !s.is_empty()).collect();
             log::info!(
-                "[NESTED-POC] unnest-consumer: expanding column '{}' -> LogicalPlan::Unnest (x2: \
-                 list->struct then struct->top-level fields) so '{}.field' become top-level columns \
-                 a Substrait field-reference can address (DataFusion rejects StructField-with-child). \
-                 POC: carries the N1 UNNEST across Substrait as an ExtensionSingleRel.",
-                column,
-                column
+                "[NESTED-POC] unnest-consumer: expanding nested path {:?} -> LogicalPlan::Unnest (x2 per \
+                 level: list->struct then struct->top-level fields). POC: carries the N1 UNNEST across \
+                 Substrait as an ExtensionSingleRel since neither isthmus nor DF-54 model it natively.",
+                levels
             );
-            // First unnest: LIST<STRUCT> -> one row per element, `column` becomes a STRUCT column.
-            // Second unnest: STRUCT -> top-level columns named `column.field` (e.g. comments.score).
-            // Two passes are needed because DataFusion's Substrait consumer only accepts single-level
-            // (top-level) StructField references, not nested StructField.child access.
-            return LogicalPlanBuilder::from(input_plan)
-                .unnest_column(Column::from_name(column))?
-                .unnest_column(Column::from_name(column))?
-                .build();
+            let mut builder = LogicalPlanBuilder::from(input_plan);
+            for level in levels {
+                builder = builder
+                    .unnest_column(Column::from_name(level))?
+                    .unnest_column(Column::from_name(level))?;
+            }
+            return builder.build();
         }
 
         // Not ours — defer to the stock behaviour (which errors with "Missing handler").

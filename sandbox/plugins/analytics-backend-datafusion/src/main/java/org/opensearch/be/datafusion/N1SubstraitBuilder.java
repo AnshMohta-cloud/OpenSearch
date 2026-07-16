@@ -32,9 +32,11 @@ import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.N1Descriptor;
+import org.opensearch.analytics.N1Predicate;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * [NESTED-POC] Hand-assembles the Substrait plan for an N1-rewritten nested predicate query,
@@ -62,11 +64,8 @@ final class N1SubstraitBuilder {
 
     private static final Logger LOGGER = LogManager.getLogger(N1SubstraitBuilder.class);
 
-    /** Anchor for the `gt` comparison function declared in Plan.extensions. */
-    private static final int GT_FUNCTION_ANCHOR = 1;
-
-    /** Anchor for the `equal` function (semi-join condition) declared in Plan.extensions. */
-    private static final int EQUAL_FUNCTION_ANCHOR = 2;
+    /** `equal` function name (used for the semi-join condition + `=` comparisons). */
+    private static final String EQUAL_FN = "equal";
 
     private N1SubstraitBuilder() {}
 
@@ -74,37 +73,53 @@ final class N1SubstraitBuilder {
         RelDataType rowType = d.baseRowType();
         List<RelDataTypeField> fields = rowType.getFieldList();
 
-        // Positional index of the nested column in the scan row type.
-        int unnestColIdx = indexOf(fields, d.unnestColumn());
-        if (unnestColIdx < 0) {
-            throw new IllegalStateException("[NESTED-POC] unnest column '" + d.unnestColumn() + "' not in row type " + rowType.getFieldNames());
+        // Simulate the POST-UNNEST column layout. DataFusion unnests each path level twice
+        // (list->struct, then struct expands IN PLACE into `level.child` columns — verified). We
+        // reproduce that on the Calcite types to get the exact flat column-name list the Filter/
+        // Aggregate see, so field references (which are POSITIONAL in Substrait) land correctly for
+        // ANY nesting depth. __row_id__ is a physical parquet column appended after the user fields
+        // (not in the Calcite row type); we track it as the last column.
+        List<String> layout = new ArrayList<>();
+        List<RelDataType> layoutTypes = new ArrayList<>(); // parallel: element/leaf type per column (null for scalars)
+        for (RelDataTypeField f : fields) {
+            layout.add(f.getName());
+            layoutTypes.add(f.getType());
         }
-        // Struct-field index of the filtered field within the nested column's element struct.
-        RelDataType structType = fields.get(unnestColIdx).getType().getComponentType() != null
-            ? fields.get(unnestColIdx).getType().getComponentType()
-            : fields.get(unnestColIdx).getType();
-        int structFieldIdx = structFieldIndex(structType, d.filterStructField());
-        if (structFieldIdx < 0) {
-            throw new IllegalStateException(
-                "[NESTED-POC] struct field '" + d.filterStructField() + "' not in nested column '" + d.unnestColumn() + "'"
-            );
-        }
-        int structFieldCount = structType.getFieldList().size();
+        layout.add(d.groupByColumn()); // __row_id__
+        layoutTypes.add(null);
 
-        // The Filter/Aggregate sit ABOVE a double UNNEST of the nested column (list->struct, then
-        // struct->top-level fields — see UnnestConsumer). DataFusion's unnest expands the struct
-        // IN PLACE: the nested column at `unnestColIdx` is replaced by its `structFieldCount`
-        // fields (named `col.field`), and every column after it shifts right by structFieldCount-1.
-        // So field references above the unnest are positional against this POST-UNNEST layout, NOT
-        // the ReadRel layout. (Verified empirically with a DataFusion unnest probe.)
-        //   filtered field  ->  unnestColIdx + structFieldIdx        (a top-level column now)
-        //   __row_id__       ->  originalRowIdIdx + (structFieldCount - 1)
-        // __row_id__ is a PHYSICAL parquet column appended after the user fields (ArrowSchemaBuilder
-        // writes it after them); it is not in the logical Calcite row type, so its pre-unnest index
-        // is fields.size(). DataFusion widens the scan to the physical parquet schema so it resolves.
-        int postUnnestFilterFieldIdx = unnestColIdx + structFieldIdx;
-        int originalRowIdIdx = fields.size();
-        int postUnnestGroupByIdx = originalRowIdIdx + (structFieldCount - 1);
+        for (String level : d.unnestPath()) {
+            int at = layout.indexOf(level);
+            if (at < 0) {
+                throw new IllegalStateException("[NESTED-POC] unnest level '" + level + "' not present in layout " + layout);
+            }
+            RelDataType colType = layoutTypes.get(at);
+            RelDataType elem = colType != null && colType.getComponentType() != null ? colType.getComponentType() : colType;
+            if (elem == null || !elem.isStruct()) {
+                throw new IllegalStateException("[NESTED-POC] unnest level '" + level + "' is not a LIST<STRUCT> (type " + colType + ")");
+            }
+            // Replace the level column IN PLACE with its struct children named `level.child`.
+            layout.remove(at);
+            layoutTypes.remove(at);
+            List<RelDataTypeField> children = elem.getFieldList();
+            for (int i = 0; i < children.size(); i++) {
+                RelDataTypeField child = children.get(i);
+                layout.add(at + i, level + "." + child.getName());
+                layoutTypes.add(at + i, child.getType());
+            }
+        }
+
+        String deepestLevel = d.unnestPath().get(d.unnestPath().size() - 1);
+        // Group-by (__row_id__) index in the final layout.
+        int postUnnestGroupByIdx = layout.indexOf(d.groupByColumn());
+        if (postUnnestGroupByIdx < 0) {
+            throw new IllegalStateException("[NESTED-POC] group-by '" + d.groupByColumn() + "' vanished from layout " + layout);
+        }
+
+        // Function-anchor allocator: each distinct scalar function used (comparisons, and/or, plus
+        // the join's `equal`) is declared once in Plan.extensions with a stable anchor.
+        java.util.LinkedHashMap<String, Integer> fnAnchors = new java.util.LinkedHashMap<>();
+        fnAnchors.put(EQUAL_FN, 1); // reserve anchor 1 for the semi-join equality
 
         // --- ReadRel: the parent-row scan, with a base schema matching what DataFusion infers ---
         // Start from the user-field NamedStruct isthmus derives, then append the physical
@@ -121,36 +136,25 @@ final class N1SubstraitBuilder {
             .build();
         Rel scan = Rel.newBuilder().setRead(readRel).build();
 
-        // --- ExtensionSingleRel: our unnest marker over the scan (Rust consumer -> LogicalPlan::Unnest) ---
+        // --- ExtensionSingleRel: our unnest marker over the scan. The tag carries the full path
+        // (comma-separated), and the Rust consumer unnests each level twice (Rust: UnnestConsumer). ---
+        String pathSpec = String.join(",", d.unnestPath());
         Rel unnest = Rel.newBuilder()
             .setExtensionSingle(
                 ExtensionSingleRel.newBuilder()
                     .setCommon(directCommon())
                     .setInput(scan)
-                    .setDetail(Any.newBuilder().setTypeUrl("unnest:" + d.unnestColumn()).build())
+                    .setDetail(Any.newBuilder().setTypeUrl("unnest:" + pathSpec).build())
                     .build()
             )
             .build();
 
-        // --- FilterRel: gt( <col>.<field> , threshold ) ---
-        // After the double unnest, <col>.<field> is a TOP-LEVEL column (single-level StructField
-        // reference, no child) — the only shape DataFusion's Substrait consumer accepts.
-        Expression fieldRef = fieldReference(postUnnestFilterFieldIdx);
-        Expression literal = Expression.newBuilder()
-            .setLiteral(Expression.Literal.newBuilder().setI32(d.threshold()).setNullable(true).build())
-            .build();
-        Expression gt = Expression.newBuilder()
-            .setScalarFunction(
-                Expression.ScalarFunction.newBuilder()
-                    .setFunctionReference(GT_FUNCTION_ANCHOR)
-                    .setOutputType(nullableBool())
-                    .addArguments(FunctionArgument.newBuilder().setValue(fieldRef).build())
-                    .addArguments(FunctionArgument.newBuilder().setValue(literal).build())
-                    .build()
-            )
-            .build();
+        // --- FilterRel: the general predicate tree. Each predicate field `f` is a leaf of the deepest
+        // level, resolving to the post-unnest column `<deepestLevel>.<f>` (looked up by name in the
+        // simulated layout → its positional index). ---
+        Expression predicateExpr = buildPredicate(d.predicate(), deepestLevel, layout, fnAnchors);
         Rel filter = Rel.newBuilder()
-            .setFilter(FilterRel.newBuilder().setCommon(directCommon()).setInput(unnest).setCondition(gt).build())
+            .setFilter(FilterRel.newBuilder().setCommon(directCommon()).setInput(unnest).setCondition(predicateExpr).build())
             .build();
 
         // --- AggregateRel: group by __row_id__ → the distinct MATCHING PARENT row-ids (RIGHT branch) ---
@@ -191,7 +195,7 @@ final class N1SubstraitBuilder {
         Expression joinCond = Expression.newBuilder()
             .setScalarFunction(
                 Expression.ScalarFunction.newBuilder()
-                    .setFunctionReference(EQUAL_FUNCTION_ANCHOR)
+                    .setFunctionReference(fnAnchors.get(EQUAL_FN))
                     .setOutputType(nullableBool())
                     .addArguments(FunctionArgument.newBuilder().setValue(fieldReference(leftRowIdIdx)).build())
                     .addArguments(FunctionArgument.newBuilder().setValue(fieldReference(leftFieldCount)).build())
@@ -251,38 +255,33 @@ final class N1SubstraitBuilder {
         // its struct children appended depth-first — handled by flattenOutputNames on the normal path;
         // for the POC the projected columns are scalars or the whole array is emitted as one name.
         RelRoot root = RelRoot.newBuilder().setInput(project).addAllNames(flattenNames(outputNames, selectedLeftIdx, fields, d.groupByColumn())).build();
-        Plan plan = Plan.newBuilder()
-            .addExtensions(
+        // --- Declare every scalar function used (comparisons, and/or, join equal) with its anchor ---
+        Plan.Builder planBuilder = Plan.newBuilder();
+        for (Map.Entry<String, Integer> e : fnAnchors.entrySet()) {
+            planBuilder.addExtensions(
                 SimpleExtensionDeclaration.newBuilder()
                     .setExtensionFunction(
-                        SimpleExtensionDeclaration.ExtensionFunction.newBuilder().setFunctionAnchor(GT_FUNCTION_ANCHOR).setName("gt").build()
+                        SimpleExtensionDeclaration.ExtensionFunction.newBuilder().setFunctionAnchor(e.getValue()).setName(e.getKey()).build()
                     )
                     .build()
-            )
-            .addExtensions(
-                SimpleExtensionDeclaration.newBuilder()
-                    .setExtensionFunction(
-                        SimpleExtensionDeclaration.ExtensionFunction.newBuilder().setFunctionAnchor(EQUAL_FUNCTION_ANCHOR).setName("equal").build()
-                    )
-                    .build()
-            )
-            .addRelations(PlanRel.newBuilder().setRoot(root).build())
-            .build();
+            );
+        }
+        Plan plan = planBuilder.addRelations(PlanRel.newBuilder().setRoot(root).build()).build();
 
         Plan finalPlan = SubstraitPlanProtoRewriter.rewrite(plan);
         byte[] bytes = finalPlan.toByteArray();
         LOGGER.info(
-            "[NESTED-POC] N1SubstraitBuilder: index='{}' filter '{}.{}'(postUnnestIdx {}) > {}, groupBy '{}'(postUnnestIdx {}), "
-                + "semi-join back on '{}', output columns {} -> {} bytes",
+            "[NESTED-POC] N1SubstraitBuilder: index='{}' unnestPath {}, post-unnest layout {}, predicate {}, "
+                + "groupBy '{}'(postUnnestIdx {}), semi-join back on '{}', output columns {}, functions {} -> {} bytes",
             d.indexName(),
-            d.unnestColumn(),
-            d.filterStructField(),
-            postUnnestFilterFieldIdx,
-            d.threshold(),
+            d.unnestPath(),
+            layout,
+            d.predicate(),
             d.groupByColumn(),
             postUnnestGroupByIdx,
             d.groupByColumn(),
             outputNames,
+            fnAnchors.keySet(),
             bytes.length
         );
         // [NESTED-POC] Full readable hand-built N1 Substrait plan shipped to the data node — shows the
@@ -328,6 +327,104 @@ final class N1SubstraitBuilder {
         return RelCommon.newBuilder().setDirect(RelCommon.Direct.newBuilder().build()).build();
     }
 
+    /**
+     * [NESTED-POC] Recursively build the Substrait filter expression for a predicate tree. A
+     * comparison becomes a scalar function (equal/gt/lt/...) over the post-unnest struct-field column
+     * and a literal; AND/OR become the `and`/`or` scalar functions over their children. Each distinct
+     * function name is assigned a stable anchor in {@code fnAnchors} (declared once in Plan.extensions).
+     * The comparison field resolves to the post-unnest column {@code <deepestLevel>.<field>}, looked
+     * up by name in the simulated {@code layout} to get its positional index.
+     */
+    private static Expression buildPredicate(
+        N1Predicate pred,
+        String deepestLevel,
+        List<String> layout,
+        java.util.Map<String, Integer> fnAnchors
+    ) {
+        if (pred instanceof N1Predicate.Comparison c) {
+            // Predicate fields are leaves of the deepest unnested level → post-unnest column
+            // `<deepestLevel>.<field>` (e.g. comments.score, or comments.replies.reactions.by).
+            String colName = deepestLevel + "." + c.field();
+            int idx = layout.indexOf(colName);
+            if (idx < 0) {
+                throw new IllegalStateException("[NESTED-POC] predicate field '" + colName + "' not in post-unnest layout " + layout);
+            }
+            Expression fieldRef = fieldReference(idx);
+            Expression literal = literalOf(c.value());
+            int anchor = anchorFor(c.op().substraitName(), fnAnchors);
+            return Expression.newBuilder()
+                .setScalarFunction(
+                    Expression.ScalarFunction.newBuilder()
+                        .setFunctionReference(anchor)
+                        .setOutputType(nullableBool())
+                        .addArguments(FunctionArgument.newBuilder().setValue(fieldRef).build())
+                        .addArguments(FunctionArgument.newBuilder().setValue(literal).build())
+                        .build()
+                )
+                .build();
+        }
+        if (pred instanceof N1Predicate.And a) {
+            return combine("and", a.children(), deepestLevel, layout, fnAnchors);
+        }
+        if (pred instanceof N1Predicate.Or o) {
+            return combine("or", o.children(), deepestLevel, layout, fnAnchors);
+        }
+        throw new IllegalStateException("[NESTED-POC] unknown predicate node: " + pred);
+    }
+
+    /** Fold a list of child predicates into a left-deep chain of the given boolean function (and/or). */
+    private static Expression combine(
+        String boolFn,
+        List<N1Predicate> children,
+        String deepestLevel,
+        List<String> layout,
+        java.util.Map<String, Integer> fnAnchors
+    ) {
+        if (children.isEmpty()) {
+            throw new IllegalStateException("[NESTED-POC] " + boolFn + " with no children");
+        }
+        Expression acc = buildPredicate(children.get(0), deepestLevel, layout, fnAnchors);
+        int anchor = anchorFor(boolFn, fnAnchors);
+        for (int i = 1; i < children.size(); i++) {
+            Expression next = buildPredicate(children.get(i), deepestLevel, layout, fnAnchors);
+            acc = Expression.newBuilder()
+                .setScalarFunction(
+                    Expression.ScalarFunction.newBuilder()
+                        .setFunctionReference(anchor)
+                        .setOutputType(nullableBool())
+                        .addArguments(FunctionArgument.newBuilder().setValue(acc).build())
+                        .addArguments(FunctionArgument.newBuilder().setValue(next).build())
+                        .build()
+                )
+                .build();
+        }
+        return acc;
+    }
+
+    /** Allocate (or reuse) a stable function anchor for a Substrait function name. */
+    private static int anchorFor(String fnName, java.util.Map<String, Integer> fnAnchors) {
+        return fnAnchors.computeIfAbsent(fnName, k -> fnAnchors.size() + 1);
+    }
+
+    /** Build a Substrait nullable literal for an Integer/Long/Double/String/Boolean value. */
+    private static Expression literalOf(Object value) {
+        Expression.Literal.Builder lit = Expression.Literal.newBuilder().setNullable(true);
+        if (value instanceof Integer i) {
+            lit.setI32(i);
+        } else if (value instanceof Long l) {
+            lit.setI64(l);
+        } else if (value instanceof Double db) {
+            lit.setFp64(db);
+        } else if (value instanceof Boolean b) {
+            lit.setBoolean(b);
+        } else if (value instanceof String s) {
+            lit.setString(s);
+        } else {
+            throw new IllegalStateException("[NESTED-POC] unsupported literal type: " + (value == null ? "null" : value.getClass()));
+        }
+        return Expression.newBuilder().setLiteral(lit.build()).build();
+    }
+
     private static Type nullableBool() {
         return Type.newBuilder()
             .setBool(Type.Boolean.newBuilder().setNullability(Type.Nullability.NULLABILITY_NULLABLE).build())
@@ -365,18 +462,4 @@ final class N1SubstraitBuilder {
         return -1;
     }
 
-    /**
-     * Index of {@code fieldName} within the element struct of a nested (ARRAY&lt;ROW&gt;) column type.
-     * The column type is ARRAY whose component is a ROW; we search the ROW's fields.
-     */
-    private static int structFieldIndex(RelDataType nestedColumnType, String fieldName) {
-        RelDataType structType = nestedColumnType.getComponentType() != null ? nestedColumnType.getComponentType() : nestedColumnType;
-        List<RelDataTypeField> structFields = structType.getFieldList();
-        for (int i = 0; i < structFields.size(); i++) {
-            if (structFields.get(i).getName().equals(fieldName)) {
-                return i;
-            }
-        }
-        return -1;
-    }
 }

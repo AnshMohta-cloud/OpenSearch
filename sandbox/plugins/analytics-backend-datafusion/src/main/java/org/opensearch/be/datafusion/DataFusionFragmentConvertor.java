@@ -477,12 +477,12 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
             byte[] bytes = N1SubstraitBuilder.build(n1, SCHEMA_ONLY_TYPE_PROTO_CONVERTER);
             LOGGER.info(
                 "[NESTED-POC] convertFragment: assembled hand-built N1 Substrait plan for index [{}] "
-                    + "(unnest '{}', filter {}>{}, group by '{}') = {} bytes, skipping isthmus",
+                    + "(unnestPath {}, predicate {}, group by '{}', projection {}) = {} bytes, skipping isthmus",
                 n1.indexName(),
-                n1.unnestColumn(),
-                n1.filterStructField(),
-                n1.threshold(),
+                n1.unnestPath(),
+                n1.predicate(),
                 n1.groupByColumn(),
+                n1.projection(),
                 bytes.length
             );
             return bytes;

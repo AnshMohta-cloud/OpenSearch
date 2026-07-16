@@ -47,10 +47,17 @@ import org.apache.calcite.rel.type.RelDataType;
  */
 public record N1Descriptor(
     String indexName,
-    String unnestColumn,
-    String filterStructField,
-    int threshold,
+    List<String> unnestPath,
+    N1Predicate predicate,
     String groupByColumn,
     List<String> projection,
     RelDataType baseRowType
-) {}
+) {
+    /**
+     * The nested levels to UNNEST, outermost first. Single-level = {@code ["comments"]}; three-level
+     * = {@code ["comments", "comments.replies", "comments.replies.reactions"]}. Each entry is the
+     * dotted column name that is a {@code LIST<STRUCT>} at that point in the (progressively unnested)
+     * schema. The predicate's fields are relative to the DEEPEST level's struct.
+     */
+    public N1Descriptor {}
+}
