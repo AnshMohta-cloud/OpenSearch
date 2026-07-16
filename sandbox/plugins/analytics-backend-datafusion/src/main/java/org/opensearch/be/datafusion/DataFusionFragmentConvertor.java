@@ -614,7 +614,10 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
 
         io.substrait.proto.Plan protoPlan = SubstraitPlanProtoRewriter.rewrite(new PlanProtoConverter().toProto(plan));
         byte[] bytes = protoPlan.toByteArray();
-        LOGGER.debug("Substrait plan: {} bytes", bytes.length);
+        // [NESTED-POC] Full readable Substrait plan shipped to the data node (isthmus path).
+        // The proto toString shows the Read/Filter/Aggregate/Project/Join rel tree + extensions.
+        // Grep: NESTED-POC. (This is the exact wire content the Rust DataFusion consumer receives.)
+        LOGGER.info("[NESTED-POC] Substrait plan ({} bytes) [isthmus path]:\n{}", bytes.length, protoPlan);
         return bytes;
     }
 

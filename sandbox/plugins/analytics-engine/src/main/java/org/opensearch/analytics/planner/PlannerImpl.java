@@ -119,17 +119,26 @@ public class PlannerImpl {
      */
     public static RelNode runAllOptimizations(RelNode rawRelNode, PlannerContext context) {
         LOGGER.debug("Input RelNode:\n{}", RelOptUtil.toString(rawRelNode));
+        // [NESTED-POC] Stage-by-stage plan dump so the nested/N1 transform is visible end to end.
+        // Grep: NESTED-POC. Mirrors the customer-query -> N1-rewrite pipeline's logging style.
+        LOGGER.info("[NESTED-POC] Input RelNode row type: {}", rawRelNode.getRowType());
 
         RuleProfilingListener listener = context.isProfilingEnabled() ? new RuleProfilingListener() : null;
 
         RelNode modifiedRelNode = rawRelNode;
         modifiedRelNode = removeSubQueries(modifiedRelNode, listener);
+        logStage("After removeSubQueries", modifiedRelNode);
         modifiedRelNode = extractLiteralAgg(modifiedRelNode, listener);
         modifiedRelNode = reduceExpressions(modifiedRelNode, listener);
         modifiedRelNode = pushdownRules(modifiedRelNode, listener);
+        logStage("After pushdownRules", modifiedRelNode);
         modifiedRelNode = decomposeAggregates(modifiedRelNode, listener);
+        logStage("After decomposeAggregates", modifiedRelNode);
+        LOGGER.info("[NESTED-POC] Before mark() — RelNode entering mark():");
+        logStage("RelNode entering mark", modifiedRelNode);
         modifiedRelNode = mark(modifiedRelNode, context, listener);
         LOGGER.debug("After marking:\n{}", RelOptUtil.toString(modifiedRelNode));
+        logStage("After marking", modifiedRelNode);
         modifiedRelNode = splitAggLiteralArgProject(modifiedRelNode, listener);
         // TODO(combine-delegated-predicates): a post-marking HEP rule should fuse same-backend
         // AND-sibling AnnotatedPredicates into one combined predicate per group, collapsing N
@@ -142,6 +151,8 @@ public class PlannerImpl {
         // AnnotatedPredicates under OR/NOT (Lucene call buys nothing in those positions).
         modifiedRelNode = cbo(modifiedRelNode, rawRelNode, context, listener);
         LOGGER.debug("After CBO:\n{}", RelOptUtil.toString(modifiedRelNode));
+        logStage("After CBO", modifiedRelNode);
+        LOGGER.info("[NESTED-POC] After CBO row type: {}", modifiedRelNode.getRowType());
         Optional<RelNode> lateMat = OpenSearchLateMaterializationRewriter.rewrite(modifiedRelNode);
         if (lateMat.isPresent()) {
             modifiedRelNode = lateMat.get();
@@ -164,6 +175,11 @@ public class PlannerImpl {
             LOGGER.info("Planner profile for raw RelNode is :\n{}", profile.format());
         }
         return modifiedRelNode;
+    }
+
+    /** [NESTED-POC] Dump a plan-pipeline stage at INFO (tree form) so the nested transform is traceable. Grep: NESTED-POC. */
+    private static void logStage(String stage, RelNode plan) {
+        LOGGER.info("[NESTED-POC] {}:\n{}", stage, RelOptUtil.toString(plan));
     }
 
     /**

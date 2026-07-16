@@ -9,6 +9,8 @@
 package org.opensearch.be.datafusion;
 
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.backend.EngineResultStream;
 import org.opensearch.analytics.backend.SearchExecEngine;
 import org.opensearch.analytics.backend.ShardScanExecutionContext;
@@ -29,6 +31,8 @@ import java.io.IOException;
 @ExperimentalApi
 public class DatafusionSearchExecEngine implements SearchExecEngine<ShardScanExecutionContext, EngineResultStream> {
 
+    private static final Logger LOGGER = LogManager.getLogger(DatafusionSearchExecEngine.class);
+
     private final DatafusionContext datafusionContext;
 
     public DatafusionSearchExecEngine(DatafusionContext datafusionContext) {
@@ -39,6 +43,15 @@ public class DatafusionSearchExecEngine implements SearchExecEngine<ShardScanExe
     public void prepare(ShardScanExecutionContext requestContext) {
         byte[] substraitBytes = requestContext.getFragmentBytes();
         long contextId = datafusionContext.task() != null ? datafusionContext.task().getId() : 0L;
+        // [NESTED-POC] Data-node receipt: the DataFusion backend has received the fragment's Substrait
+        // bytes for this table and is about to hand them to the native runtime (from_substrait_plan).
+        // This is the coordinator→data-node handoff point. Grep: NESTED-POC.
+        LOGGER.info(
+            "[NESTED-POC] DataFusion backend received fragment for table [{}]: {} substrait bytes, contextId={}",
+            requestContext.getTableName(),
+            substraitBytes == null ? 0 : substraitBytes.length,
+            contextId
+        );
         datafusionContext.setDatafusionQuery(new DatafusionQuery(requestContext.getTableName(), substraitBytes, contextId));
     }
 

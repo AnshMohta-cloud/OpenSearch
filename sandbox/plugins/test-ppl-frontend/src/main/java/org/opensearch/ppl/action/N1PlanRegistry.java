@@ -52,12 +52,26 @@ final class N1PlanRegistry {
     private static final Map<String, DescriptorFactory> QUERIES = new LinkedHashMap<>();
 
     static {
-        // First demo: a Parquet-only nested predicate. `comments.score > 4` -> unnest comments,
-        // keep child elements whose score > 4, return the distinct parent rows (__row_id__).
+        // Parquet-only nested predicate, returning the DISTINCT PARENT ROW-IDS (the original demo).
+        // `comments.score > 4` -> unnest comments, keep elements score>4, semi-join back, project row-id.
         // Expected on poc_nested: {Post X (score 5), Post Y (score 9)}; Post Z (score 1) excluded.
         QUERIES.put(
             "source=poc_nested | where comments.score > 4",
-            (indexName, rowType) -> new N1Descriptor(indexName, "comments", "score", 4, "__row_id__", rowType)
+            (indexName, rowType) ->
+                new N1Descriptor(indexName, "comments", "score", 4, "__row_id__", java.util.List.of("__row_id__"), rowType)
+        );
+        // Same predicate, but return actual PARENT FIELDS (title, views) — proves output generality:
+        // the semi-join back recovers the intact parent columns after the unnest exploded the array.
+        QUERIES.put(
+            "source=poc_nested | where comments.score > 4 | fields title, views",
+            (indexName, rowType) ->
+                new N1Descriptor(indexName, "comments", "score", 4, "__row_id__", java.util.List.of("title", "views"), rowType)
+        );
+        // Same predicate, SELECT * — return all intact parent columns incl. the whole comments array.
+        QUERIES.put(
+            "source=poc_nested | where comments.score > 4 | fields *",
+            (indexName, rowType) ->
+                new N1Descriptor(indexName, "comments", "score", 4, "__row_id__", java.util.List.of(), rowType)
         );
     }
 

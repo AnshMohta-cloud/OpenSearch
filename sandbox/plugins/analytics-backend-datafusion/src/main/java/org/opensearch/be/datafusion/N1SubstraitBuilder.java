@@ -15,9 +15,11 @@ import io.substrait.proto.Expression;
 import io.substrait.proto.ExtensionSingleRel;
 import io.substrait.proto.FilterRel;
 import io.substrait.proto.FunctionArgument;
+import io.substrait.proto.JoinRel;
 import io.substrait.proto.NamedStruct;
 import io.substrait.proto.Plan;
 import io.substrait.proto.PlanRel;
+import io.substrait.proto.ProjectRel;
 import io.substrait.proto.ReadRel;
 import io.substrait.proto.Rel;
 import io.substrait.proto.RelCommon;
@@ -31,6 +33,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.N1Descriptor;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -61,6 +64,9 @@ final class N1SubstraitBuilder {
 
     /** Anchor for the `gt` comparison function declared in Plan.extensions. */
     private static final int GT_FUNCTION_ANCHOR = 1;
+
+    /** Anchor for the `equal` function (semi-join condition) declared in Plan.extensions. */
+    private static final int EQUAL_FUNCTION_ANCHOR = 2;
 
     private N1SubstraitBuilder() {}
 
@@ -147,8 +153,9 @@ final class N1SubstraitBuilder {
             .setFilter(FilterRel.newBuilder().setCommon(directCommon()).setInput(unnest).setCondition(gt).build())
             .build();
 
-        // --- AggregateRel: group by __row_id__ (distinct parents; also carries the routing needle) ---
-        Rel aggregate = Rel.newBuilder()
+        // --- AggregateRel: group by __row_id__ → the distinct MATCHING PARENT row-ids (RIGHT branch) ---
+        // Output schema of this branch = [__row_id__] (one column).
+        Rel matchingRowIds = Rel.newBuilder()
             .setAggregate(
                 AggregateRel.newBuilder()
                     .setCommon(directCommon())
@@ -162,39 +169,159 @@ final class N1SubstraitBuilder {
             )
             .build();
 
-        // --- Wrap in a plan; declare the `gt` function extension ---
-        RelRoot root = RelRoot.newBuilder().setInput(aggregate).addNames(d.groupByColumn()).build();
+        // --- LEFT branch: a second, INTACT scan of the same table (all parent columns incl. the
+        // whole comments array + __row_id__). This is what lets us return arbitrary output: UNNEST
+        // destroyed the array on the RIGHT branch, so the intact parent rows are recovered here and
+        // filtered to the matching ids via the semi-join. Same base schema as the RIGHT scan. ---
+        int leftFieldCount = fields.size() + 1; // user fields + appended __row_id__
+        int leftRowIdIdx = fields.size(); // __row_id__ position in the intact scan
+        Rel intactScan = Rel.newBuilder()
+            .setRead(
+                ReadRel.newBuilder()
+                    .setCommon(directCommon())
+                    .setNamedTable(ReadRel.NamedTable.newBuilder().addNames(d.indexName()).build())
+                    .setBaseSchema(baseSchema)
+                    .build()
+            )
+            .build();
+
+        // --- JoinRel (LEFT SEMI): keep intact-scan rows whose __row_id__ is in the matching set.
+        // The join condition references the CONCATENATED left++right schema: left.__row_id__ at
+        // leftRowIdIdx, right.__row_id__ at leftFieldCount + 0 (right branch outputs just [__row_id__]).
+        Expression joinCond = Expression.newBuilder()
+            .setScalarFunction(
+                Expression.ScalarFunction.newBuilder()
+                    .setFunctionReference(EQUAL_FUNCTION_ANCHOR)
+                    .setOutputType(nullableBool())
+                    .addArguments(FunctionArgument.newBuilder().setValue(fieldReference(leftRowIdIdx)).build())
+                    .addArguments(FunctionArgument.newBuilder().setValue(fieldReference(leftFieldCount)).build())
+                    .build()
+            )
+            .build();
+        Rel semiJoin = Rel.newBuilder()
+            .setJoin(
+                JoinRel.newBuilder()
+                    .setCommon(directCommon())
+                    .setLeft(intactScan)
+                    .setRight(matchingRowIds)
+                    .setType(JoinRel.JoinType.JOIN_TYPE_LEFT_SEMI)
+                    .setExpression(joinCond)
+                    .build()
+            )
+            .build();
+
+        // --- ProjectRel: subset to exactly the requested output columns (TIGHT output schema).
+        // A LEFT SEMI join outputs the LEFT (intact) columns in order: [user fields..., __row_id__]
+        // (leftFieldCount total). We add a ProjectRel selecting the requested columns. Substrait's
+        // ProjectRel outputs (all input cols ++ its expressions), so to emit ONLY our selected columns
+        // we set RelCommon.emit output_mapping to the expression outputs (offsets leftFieldCount ..
+        // leftFieldCount+projCount). This matches how the engine natively subsets columns; DataFusion
+        // hard-fails if RelRoot.names count != produced width, so the output MUST be tight. Empty
+        // projection = select * = all left user columns (the whole comments array included). ---
+        List<Integer> selectedLeftIdx = new ArrayList<>();
+        List<String> outputNames = new ArrayList<>();
+        if (d.projection().isEmpty()) {
+            for (int i = 0; i < fields.size(); i++) {
+                selectedLeftIdx.add(i);
+                outputNames.add(fields.get(i).getName());
+            }
+        } else {
+            for (String col : d.projection()) {
+                int idx = col.equals(d.groupByColumn()) ? leftRowIdIdx : indexOf(fields, col);
+                if (idx < 0) {
+                    throw new IllegalStateException("[NESTED-POC] projection column '" + col + "' not in scan schema " + rowType.getFieldNames());
+                }
+                selectedLeftIdx.add(idx);
+                outputNames.add(col);
+            }
+        }
+        ProjectRel.Builder projectBuilder = ProjectRel.newBuilder().setInput(semiJoin);
+        RelCommon.Emit.Builder emit = RelCommon.Emit.newBuilder();
+        for (int i = 0; i < selectedLeftIdx.size(); i++) {
+            projectBuilder.addExpressions(fieldReference(selectedLeftIdx.get(i)));
+            // ProjectRel output = [leftFieldCount input cols] ++ [our expressions]; select the expr outputs.
+            emit.addOutputMapping(leftFieldCount + i);
+        }
+        projectBuilder.setCommon(RelCommon.newBuilder().setEmit(emit.build()).build());
+        Rel project = Rel.newBuilder().setProject(projectBuilder.build()).build();
+
+        // --- Wrap in a plan; declare the `gt` and `equal` function extensions ---
+        // RelRoot.names = exactly the tight output columns (depth-first; these are scalars here, so
+        // the flattened list equals the top-level names). A nested column in `select *` would need
+        // its struct children appended depth-first — handled by flattenOutputNames on the normal path;
+        // for the POC the projected columns are scalars or the whole array is emitted as one name.
+        RelRoot root = RelRoot.newBuilder().setInput(project).addAllNames(flattenNames(outputNames, selectedLeftIdx, fields, d.groupByColumn())).build();
         Plan plan = Plan.newBuilder()
             .addExtensions(
                 SimpleExtensionDeclaration.newBuilder()
                     .setExtensionFunction(
-                        SimpleExtensionDeclaration.ExtensionFunction.newBuilder()
-                            .setFunctionAnchor(GT_FUNCTION_ANCHOR)
-                            .setName("gt")
-                            .build()
+                        SimpleExtensionDeclaration.ExtensionFunction.newBuilder().setFunctionAnchor(GT_FUNCTION_ANCHOR).setName("gt").build()
+                    )
+                    .build()
+            )
+            .addExtensions(
+                SimpleExtensionDeclaration.newBuilder()
+                    .setExtensionFunction(
+                        SimpleExtensionDeclaration.ExtensionFunction.newBuilder().setFunctionAnchor(EQUAL_FUNCTION_ANCHOR).setName("equal").build()
                     )
                     .build()
             )
             .addRelations(PlanRel.newBuilder().setRoot(root).build())
             .build();
 
-        byte[] bytes = SubstraitPlanProtoRewriter.rewrite(plan).toByteArray();
+        Plan finalPlan = SubstraitPlanProtoRewriter.rewrite(plan);
+        byte[] bytes = finalPlan.toByteArray();
         LOGGER.info(
-            "[NESTED-POC] N1SubstraitBuilder: index='{}' unnestCol='{}'(scanIdx {}) filter '{}.{}' -> postUnnestIdx {} > {}, "
-                + "groupBy '{}' -> postUnnestIdx {} ({} struct fields) -> {} bytes",
+            "[NESTED-POC] N1SubstraitBuilder: index='{}' filter '{}.{}'(postUnnestIdx {}) > {}, groupBy '{}'(postUnnestIdx {}), "
+                + "semi-join back on '{}', output columns {} -> {} bytes",
             d.indexName(),
-            d.unnestColumn(),
-            unnestColIdx,
             d.unnestColumn(),
             d.filterStructField(),
             postUnnestFilterFieldIdx,
             d.threshold(),
             d.groupByColumn(),
             postUnnestGroupByIdx,
-            structFieldCount,
+            d.groupByColumn(),
+            outputNames,
             bytes.length
         );
+        // [NESTED-POC] Full readable hand-built N1 Substrait plan shipped to the data node — shows the
+        // Read → ExtensionSingle(unnest) → Filter → Aggregate → (intact Read) → LEFT SEMI Join →
+        // Project(emit) rel tree + gt/equal extensions. This is the exact wire content the Rust
+        // unnest-aware consumer receives. Grep: NESTED-POC.
+        LOGGER.info("[NESTED-POC] Substrait plan ({} bytes) [hand-built N1 path]:\n{}", bytes.length, finalPlan);
         return bytes;
+    }
+
+    /**
+     * Depth-first flattened RelRoot.names for the output columns. Scalar columns contribute their
+     * own name; the nested unnest column (ARRAY&lt;ROW&gt;) contributes its own name followed, depth-first,
+     * by its struct child names (list element recurses without consuming a name for the collection).
+     * DataFusion's make_renamed_schema requires the flattened name count to equal the produced width.
+     */
+    private static List<String> flattenNames(
+        List<String> outputNames,
+        List<Integer> selectedLeftIdx,
+        List<RelDataTypeField> fields,
+        String groupByColumn
+    ) {
+        List<String> flat = new ArrayList<>();
+        for (int i = 0; i < outputNames.size(); i++) {
+            String name = outputNames.get(i);
+            flat.add(name);
+            int leftIdx = selectedLeftIdx.get(i);
+            if (leftIdx < fields.size()) {
+                RelDataType t = fields.get(leftIdx).getType();
+                RelDataType struct = t.getComponentType() != null ? t.getComponentType() : (t.isStruct() ? t : null);
+                if (struct != null) {
+                    // ARRAY<ROW> or ROW column: append the struct child names depth-first.
+                    for (RelDataTypeField child : struct.getFieldList()) {
+                        flat.add(child.getName());
+                    }
+                }
+            }
+        }
+        return flat;
     }
 
     private static RelCommon directCommon() {

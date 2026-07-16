@@ -125,17 +125,23 @@ public class FragmentConversionDriver {
             IntraOperatorDelegationBytes delegationBytes = new IntraOperatorDelegationBytes(registry);
             byte[] bytes = convert(plan.resolvedFragment(), convertor, delegationBytes);
 
+            // [NESTED-POC] The readable Substrait plan is logged in DataFusionFragmentConvertor
+            // (which owns the io.substrait proto classes; analytics-engine has no substrait dep).
+            // Here we log the shipped byte size + the DAG-level stage info below. Grep: NESTED-POC.
+
             // Assemble instruction list
             List<DelegatedExpression> delegated = delegationBytes.getResult();
             List<InstructionNode> instructions = assembleInstructions(backend, plan, treeShape, delegationBytes);
 
             converted.add(plan.withConvertedBytes(bytes, delegated).withInstructions(instructions));
-            LOGGER.debug(
-                "Stage [{}] converted: treeShape={}, delegatedExpressions={}{}",
+            LOGGER.info(
+                "[NESTED-POC] Stage [{}] converted: substraitBytes={}, treeShape={}, delegatedExpressions={}{}, instructions={}",
                 plan.backendId(),
+                bytes == null ? 0 : bytes.length,
                 treeShape,
                 delegated.size(),
-                delegated.isEmpty() ? "" : " [ids=" + delegated.stream().map(d -> String.valueOf(d.getAnnotationId())).toList() + "]"
+                delegated.isEmpty() ? "" : " [ids=" + delegated.stream().map(d -> String.valueOf(d.getAnnotationId())).toList() + "]",
+                instructions
             );
         }
         stage.setPlanAlternatives(converted);

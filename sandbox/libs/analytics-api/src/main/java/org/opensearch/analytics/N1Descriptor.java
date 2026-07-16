@@ -8,12 +8,26 @@
 
 package org.opensearch.analytics;
 
+import java.util.List;
+
 import org.apache.calcite.rel.type.RelDataType;
 
 /**
  * [NESTED-POC] Describes a hand-authored N1-rewritten nested query, enough for the DataFusion
- * fragment convertor to assemble the Substrait plan
- * {@code Scan -> UNNEST(unnestColumn) -> Filter(filterField > threshold) -> distinct(groupByColumn)}.
+ * fragment convertor to assemble the Substrait plan. The general shape is:
+ *
+ * <pre>
+ *   LEFT  = Scan(index)                              // intact parent rows (all columns)
+ *   RIGHT = Scan(index) -> UNNEST(unnestColumn)
+ *                       -> Filter(filterField &gt; threshold)
+ *                       -> distinct(groupByColumn)   // matching parent row-ids
+ *   LEFT SEMI JOIN on groupByColumn                  // keep intact parents that matched
+ *   -> Project(projection)                           // return whatever the user asked
+ * </pre>
+ *
+ * The semi-join back to the intact scan is what lets the query return arbitrary output (e.g.
+ * {@code select *}, {@code select title, views}) rather than just the row-id: UNNEST destroys the
+ * nested array, so the intact parent columns must be recovered by joining the matched ids back.
  *
  * <p>Why a descriptor and not the finished bytes: the Substrait proto is assembled with isthmus /
  * {@code io.substrait.proto} classes, which live in the analytics-backend-datafusion module — not
@@ -23,8 +37,11 @@ import org.apache.calcite.rel.type.RelDataType;
  * convertor builds the bytes. {@code baseRowType} is the row type of the plain {@code source=index}
  * scan, used to emit the ReadRel's base schema so it matches what DataFusion infers from Parquet.
  *
- * <p>This is POC scaffolding standing in for the real customer-query -> N1 rewrite. It intentionally
- * models only the one predicate shape the POC demonstrates ({@code nestedColumn.field > threshold}).
+ * <p>{@code projection} is the list of parent columns to return (from {@code baseRowType}); an empty
+ * list means "all parent columns" ({@code select *}). Only parent (scalar / nested-array) columns
+ * are projectable — the filter's exploded child fields are gone after the semi-join back.
+ *
+ * <p>This is POC scaffolding standing in for the real customer-query -> N1 rewrite.
  *
  * @opensearch.internal
  */
@@ -34,5 +51,6 @@ public record N1Descriptor(
     String filterStructField,
     int threshold,
     String groupByColumn,
+    List<String> projection,
     RelDataType baseRowType
 ) {}

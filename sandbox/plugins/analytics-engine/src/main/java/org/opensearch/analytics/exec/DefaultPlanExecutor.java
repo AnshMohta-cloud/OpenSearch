@@ -262,8 +262,13 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         );
         plannerContext.setPlannerSettings(plannerSettings);
         RelNode plan = PlannerImpl.createPlan(logicalFragment, plannerContext);
+        // [NESTED-POC] Trace the executor's view of the optimized plan + DAG. Grep: NESTED-POC.
+        logger.info("[NESTED-POC] ====== After PlannerImpl.createPlan() ======");
+        logger.info("[NESTED-POC] Final optimized plan:\n{}", RelOptUtil.toString(plan));
+        logger.info("[NESTED-POC] Final plan row type: {}", plan.getRowType());
         final String fullPlan = profile ? RelOptUtil.toString(plan) : null;
         QueryDAG dag = DAGBuilder.build(plan, capabilityRegistry, clusterService, indexNameExpressionResolver);
+        logger.info("[NESTED-POC] ====== QueryDAG built ======\n{}", dag);
         PlanForker.forkAll(dag, capabilityRegistry);
         BackendPlanAdapter.adaptAll(dag, capabilityRegistry);
         // Collapse multi-backend stages to a single chosen alternative before conversion
@@ -348,12 +353,16 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         );
 
         // [NESTED-POC] For an N1 query the executed plan is the hand-built N1 Substrait plan whose
-        // output is the group-by column (distinct parent __row_id__), NOT the base-scan RelNode we
-        // carried through the planner. Match the result-batch column order to what the plan actually
-        // returns, else orderedColumns fails looking for base-scan columns (e.g. `comments`).
-        final List<String> outputColumnOrder = (queryCtx != null && queryCtx.n1Descriptor() != null)
-            ? java.util.List.of(queryCtx.n1Descriptor().groupByColumn())
-            : logicalFragment.getRowType().getFieldNames();
+        // output is the descriptor's projection (parent columns recovered via the semi-join back),
+        // NOT the base-scan RelNode we carried through the planner. Match the result-batch column
+        // order to what the plan actually returns, else orderedColumns fails. Empty projection =
+        // select * = all base-scan columns.
+        final List<String> outputColumnOrder;
+        if (queryCtx != null && queryCtx.n1Descriptor() != null && !queryCtx.n1Descriptor().projection().isEmpty()) {
+            outputColumnOrder = queryCtx.n1Descriptor().projection();
+        } else {
+            outputColumnOrder = logicalFragment.getRowType().getFieldNames();
+        }
         // No taskManager.unregister here: the framework (HandledTransportAction) unregisters the
         // task it created for doExecute once this listener settles. Unregistering it ourselves
         // would double-free a task we no longer own.

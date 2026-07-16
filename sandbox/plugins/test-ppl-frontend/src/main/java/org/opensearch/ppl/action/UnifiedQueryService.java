@@ -157,10 +157,15 @@ public class UnifiedQueryService {
             List<String> columns;
             if (n1Descriptor != null) {
                 // [NESTED-POC] The executed plan is the hand-built N1 plan, whose OUTPUT is the
-                // group-by column (distinct parent __row_id__), NOT the base-scan row type we used
-                // as a carrier. Declare the output columns to match what the plan actually returns,
+                // descriptor's projection (parent columns recovered via the semi-join back), NOT the
+                // base-scan row type. Declare output columns to match what the plan actually returns,
                 // else DefaultPlanExecutor.orderedColumns fails matching the result batch schema.
-                columns = List.of(n1Descriptor.groupByColumn());
+                // Empty projection = select * = all parent columns from the base row type.
+                if (n1Descriptor.projection().isEmpty()) {
+                    columns = logicalPlan.getRowType().getFieldNames();
+                } else {
+                    columns = n1Descriptor.projection();
+                }
                 logger.info("[NESTED-POC] output columns for N1 query = {}", columns);
             } else {
                 List<RelDataTypeField> fields = logicalPlan.getRowType().getFieldList();
