@@ -156,12 +156,14 @@ public class UnifiedQueryService {
             // Extract column names from the RelNode's row type
             List<String> columns;
             if (n1Descriptor != null) {
-                // [NESTED-POC] The executed plan is the hand-built N1 plan, whose OUTPUT is the
-                // descriptor's projection (parent columns recovered via the semi-join back), NOT the
-                // base-scan row type. Declare output columns to match what the plan actually returns,
-                // else DefaultPlanExecutor.orderedColumns fails matching the result batch schema.
-                // Empty projection = select * = all parent columns from the base row type.
-                if (n1Descriptor.projection().isEmpty()) {
+                // [NESTED-POC] The executed plan is the hand-built N1 plan; declare output columns to
+                // match what it actually returns, else DefaultPlanExecutor.orderedColumns fails.
+                //  - aggregate (e.g. stats count()) -> the single aggregate output column
+                //  - projection -> those parent columns (recovered via the semi-join back)
+                //  - empty projection = select * -> all parent columns from the base row type
+                if (n1Descriptor.aggregate() != null) {
+                    columns = List.of(n1Descriptor.aggregate().outputColumn());
+                } else if (n1Descriptor.projection().isEmpty()) {
                     columns = logicalPlan.getRowType().getFieldNames();
                 } else {
                     columns = n1Descriptor.projection();

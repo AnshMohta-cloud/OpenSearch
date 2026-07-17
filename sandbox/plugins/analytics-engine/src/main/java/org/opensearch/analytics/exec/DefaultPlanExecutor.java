@@ -358,7 +358,9 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         // order to what the plan actually returns, else orderedColumns fails. Empty projection =
         // select * = all base-scan columns.
         final List<String> outputColumnOrder;
-        if (queryCtx != null && queryCtx.n1Descriptor() != null && !queryCtx.n1Descriptor().projection().isEmpty()) {
+        if (queryCtx != null && queryCtx.n1Descriptor() != null && queryCtx.n1Descriptor().aggregate() != null) {
+            outputColumnOrder = List.of(queryCtx.n1Descriptor().aggregate().outputColumn());
+        } else if (queryCtx != null && queryCtx.n1Descriptor() != null && !queryCtx.n1Descriptor().projection().isEmpty()) {
             outputColumnOrder = queryCtx.n1Descriptor().projection();
         } else {
             outputColumnOrder = logicalFragment.getRowType().getFieldNames();

@@ -149,6 +149,17 @@ final class N1SubstraitBuilder {
             )
             .build();
 
+        // --- METRIC aggregate (avg/sum/min/max over a CHILD field) — a DIFFERENT, simpler plan shape
+        // than count(). Per HLD §4.3 row 1, `stats avg(comments.score)` is a metric over the
+        // unnested (+ optionally filtered) CHILD rows: `SELECT AVG(c.score) FROM blogs b,
+        // UNNEST(b.comments) AS c [WHERE <pred>]`. No semi-join back to parents (that's the
+        // reverse_nested / count-of-distinct-parents shape). So we short-circuit here: Read → unnest
+        // → [filter] → Aggregate(measure(childField)). __row_id__ still rides in base_schema so the
+        // plan routes to the unnest-aware indexed executor. ---
+        if (d.aggregate() != null && !d.aggregate().isCountStar()) {
+            return buildChildMetric(d, layout, layoutTypes, deepestLevel, unnest, fnAnchors);
+        }
+
         // --- FilterRel: the general predicate tree. Each predicate field `f` is a leaf of the deepest
         // level, resolving to the post-unnest column `<deepestLevel>.<f>` (looked up by name in the
         // simulated layout → its positional index). ---
@@ -249,12 +260,39 @@ final class N1SubstraitBuilder {
         projectBuilder.setCommon(RelCommon.newBuilder().setEmit(emit.build()).build());
         Rel project = Rel.newBuilder().setProject(projectBuilder.build()).build();
 
-        // --- Wrap in a plan; declare the `gt` and `equal` function extensions ---
-        // RelRoot.names = exactly the tight output columns (depth-first; these are scalars here, so
-        // the flattened list equals the top-level names). A nested column in `select *` would need
-        // its struct children appended depth-first — handled by flattenOutputNames on the normal path;
-        // for the POC the projected columns are scalars or the whole array is emitted as one name.
-        RelRoot root = RelRoot.newBuilder().setInput(project).addAllNames(flattenNames(outputNames, selectedLeftIdx, fields, d.groupByColumn())).build();
+        // --- Optional AGGREGATE on top (e.g. `| stats count()`). count() of matching docs = count of
+        // the distinct matching PARENTS (mirrors vanilla reverse_nested), i.e. a count(*) over the
+        // semi-join+project result. Output = a single row, one column named per PPL convention. ---
+        Rel outputRel = project;
+        List<String> rootNames = flattenNames(outputNames, selectedLeftIdx, fields, d.groupByColumn());
+        if (d.aggregate() != null) {
+            org.opensearch.analytics.N1Aggregate agg = d.aggregate();
+            if (!agg.isCountStar()) {
+                throw new IllegalStateException("[NESTED-POC] only count() aggregate is supported so far, got: " + agg.fn());
+            }
+            int countAnchor = anchorFor(agg.fn().substraitName(), fnAnchors);
+            AggregateRel.Measure countMeasure = AggregateRel.Measure.newBuilder()
+                .setMeasure(
+                    io.substrait.proto.AggregateFunction.newBuilder()
+                        .setFunctionReference(countAnchor)
+                        .setPhase(io.substrait.proto.AggregationPhase.AGGREGATION_PHASE_INITIAL_TO_RESULT)
+                        .setInvocation(io.substrait.proto.AggregateFunction.AggregationInvocation.AGGREGATION_INVOCATION_ALL)
+                        .setOutputType(nullableI64())
+                        // count() with NO arguments → count(*) (DataFusion special-cases this).
+                        .build()
+                )
+                .build();
+            outputRel = Rel.newBuilder()
+                .setAggregate(
+                    AggregateRel.newBuilder().setCommon(directCommon()).setInput(project).addMeasures(countMeasure).build()
+                )
+                .build();
+            rootNames = List.of(agg.outputColumn());
+        }
+
+        // --- Wrap in a plan; declare the scalar+aggregate function extensions ---
+        // RelRoot.names = exactly the tight output columns (depth-first for nested; scalar otherwise).
+        RelRoot root = RelRoot.newBuilder().setInput(outputRel).addAllNames(rootNames).build();
         // --- Declare every scalar function used (comparisons, and/or, join equal) with its anchor ---
         Plan.Builder planBuilder = Plan.newBuilder();
         for (Map.Entry<String, Integer> e : fnAnchors.entrySet()) {
@@ -290,6 +328,151 @@ final class N1SubstraitBuilder {
         // unnest-aware consumer receives. Grep: NESTED-POC.
         LOGGER.info("[NESTED-POC] Substrait plan ({} bytes) [hand-built N1 path]:\n{}", bytes.length, finalPlan);
         return bytes;
+    }
+
+    /**
+     * [NESTED-POC] Build the plan for a metric aggregate (avg/sum/min/max) over a nested CHILD field.
+     *
+     * <p>This is the second nested-aggregate shape (HLD §4.3 row 1): a metric over the matched CHILD
+     * elements, NOT a count of distinct parents. Plan:
+     * <pre>
+     *   Read(index, base_schema incl. __row_id__)
+     *     -> ExtensionSingleRel(unnest:&lt;path&gt;)          // child rows, one per deepest element
+     *     -> [FilterRel(predicate)]                       // optional WHERE over child fields
+     *     -> AggregateRel( measure = avg/sum/min/max( &lt;deepestLevel&gt;.&lt;argField&gt; ) )   // GLOBAL, no grouping
+     * </pre>
+     *
+     * <p>No semi-join and no group-by: the metric is computed directly over the (filtered) child rows,
+     * exactly like {@code SELECT AVG(c.score) FROM blogs b, UNNEST(b.comments) AS c WHERE ...}. The
+     * argument column {@code <deepestLevel>.<argField>} is resolved positionally against the SAME
+     * simulated post-unnest {@code layout} the predicate uses, so it works at any nesting depth. Output
+     * type: {@code fp64} for avg (and for sum/min/max over a fp64 arg); otherwise the argument's own
+     * type (i64 promotion for integer sum, matching DataFusion). {@code __row_id__} stays in the base
+     * schema so the {@code has_row_id} routing gate still selects the unnest-aware indexed executor.
+     */
+    private static byte[] buildChildMetric(
+        N1Descriptor d,
+        List<String> layout,
+        List<RelDataType> layoutTypes,
+        String deepestLevel,
+        Rel unnest,
+        java.util.Map<String, Integer> fnAnchors
+    ) {
+        org.opensearch.analytics.N1Aggregate agg = d.aggregate();
+
+        // Optional predicate over the child rows (a bare `stats avg(x)` with no where has predicate==null).
+        Rel input = unnest;
+        if (d.predicate() != null) {
+            Expression predicateExpr = buildPredicate(d.predicate(), deepestLevel, layout, fnAnchors);
+            input = Rel.newBuilder()
+                .setFilter(FilterRel.newBuilder().setCommon(directCommon()).setInput(unnest).setCondition(predicateExpr).build())
+                .build();
+        }
+
+        // Resolve the metric's argument column: <deepestLevel>.<argField> in the post-unnest layout.
+        if (agg.argField() == null) {
+            throw new IllegalStateException("[NESTED-POC] metric " + agg.fn() + " requires an argField");
+        }
+        String argColumn = deepestLevel + "." + agg.argField();
+        int argIdx = layout.indexOf(argColumn);
+        if (argIdx < 0) {
+            throw new IllegalStateException("[NESTED-POC] metric arg '" + argColumn + "' not in post-unnest layout " + layout);
+        }
+        RelDataType argType = layoutTypes.get(argIdx);
+        Type outputType = metricOutputType(agg.fn(), argType);
+
+        int fnAnchor = anchorFor(agg.fn().substraitName(), fnAnchors);
+        AggregateRel.Measure measure = AggregateRel.Measure.newBuilder()
+            .setMeasure(
+                io.substrait.proto.AggregateFunction.newBuilder()
+                    .setFunctionReference(fnAnchor)
+                    .setPhase(io.substrait.proto.AggregationPhase.AGGREGATION_PHASE_INITIAL_TO_RESULT)
+                    .setInvocation(io.substrait.proto.AggregateFunction.AggregationInvocation.AGGREGATION_INVOCATION_ALL)
+                    .setOutputType(outputType)
+                    .addArguments(FunctionArgument.newBuilder().setValue(fieldReference(argIdx)).build())
+                    .build()
+            )
+            .build();
+        // GLOBAL aggregate: no groupings → one output row, one column (the metric value).
+        Rel outputRel = Rel.newBuilder()
+            .setAggregate(AggregateRel.newBuilder().setCommon(directCommon()).setInput(input).addMeasures(measure).build())
+            .build();
+
+        RelRoot root = RelRoot.newBuilder().setInput(outputRel).addNames(agg.outputColumn()).build();
+        Plan.Builder planBuilder = Plan.newBuilder();
+        for (Map.Entry<String, Integer> e : fnAnchors.entrySet()) {
+            planBuilder.addExtensions(
+                SimpleExtensionDeclaration.newBuilder()
+                    .setExtensionFunction(
+                        SimpleExtensionDeclaration.ExtensionFunction.newBuilder().setFunctionAnchor(e.getValue()).setName(e.getKey()).build()
+                    )
+                    .build()
+            );
+        }
+        Plan plan = planBuilder.addRelations(PlanRel.newBuilder().setRoot(root).build()).build();
+        Plan finalPlan = SubstraitPlanProtoRewriter.rewrite(plan);
+        byte[] bytes = finalPlan.toByteArray();
+        LOGGER.info(
+            "[NESTED-POC] N1SubstraitBuilder (CHILD METRIC): index='{}' unnestPath {}, metric {}({}) over post-unnest col '{}'(idx {}), "
+                + "predicate {}, output column '{}', functions {} -> {} bytes",
+            d.indexName(),
+            d.unnestPath(),
+            agg.fn().substraitName(),
+            argColumn,
+            argColumn,
+            argIdx,
+            d.predicate(),
+            agg.outputColumn(),
+            fnAnchors.keySet(),
+            bytes.length
+        );
+        LOGGER.info("[NESTED-POC] Substrait plan ({} bytes) [hand-built N1 child-metric path]:\n{}", bytes.length, finalPlan);
+        return bytes;
+    }
+
+    /**
+     * Output type of a metric aggregate. {@code avg} is always {@code fp64}. {@code sum} of an integer
+     * arg promotes to {@code i64} (DataFusion semantics); {@code sum} of a floating arg stays
+     * {@code fp64}. {@code min}/{@code max} preserve the argument's type. Falls back to {@code fp64}
+     * when the argument type is unknown. All nullable (an empty child set yields NULL).
+     */
+    private static Type metricOutputType(org.opensearch.analytics.N1Aggregate.Fn fn, RelDataType argType) {
+        boolean floating = isFloating(argType);
+        switch (fn) {
+            case AVG:
+                return nullableFp64();
+            case SUM:
+                return floating ? nullableFp64() : nullableI64();
+            case MIN:
+            case MAX:
+                if (argType == null) {
+                    return nullableFp64();
+                }
+                return floating ? nullableFp64() : nullableI64();
+            default:
+                throw new IllegalStateException("[NESTED-POC] not a metric aggregate: " + fn);
+        }
+    }
+
+    private static boolean isFloating(RelDataType t) {
+        if (t == null) {
+            return false;
+        }
+        switch (t.getSqlTypeName()) {
+            case DOUBLE:
+            case FLOAT:
+            case REAL:
+            case DECIMAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static Type nullableFp64() {
+        return Type.newBuilder()
+            .setFp64(Type.FP64.newBuilder().setNullability(Type.Nullability.NULLABILITY_NULLABLE).build())
+            .build();
     }
 
     /**

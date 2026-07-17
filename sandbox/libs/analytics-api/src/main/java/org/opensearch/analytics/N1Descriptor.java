@@ -51,6 +51,7 @@ public record N1Descriptor(
     N1Predicate predicate,
     String groupByColumn,
     List<String> projection,
+    N1Aggregate aggregate,
     RelDataType baseRowType
 ) {
     /**
@@ -58,6 +59,21 @@ public record N1Descriptor(
      * = {@code ["comments", "comments.replies", "comments.replies.reactions"]}. Each entry is the
      * dotted column name that is a {@code LIST<STRUCT>} at that point in the (progressively unnested)
      * schema. The predicate's fields are relative to the DEEPEST level's struct.
+     *
+     * <p>{@code aggregate} is optional (nullable): when set, the query returns an aggregate over the
+     * matched rows (e.g. {@code stats count()}) instead of the projected documents.
      */
     public N1Descriptor {}
+
+    /** Convenience for the common non-aggregate case (projection output, no {@code stats}). */
+    public N1Descriptor(
+        String indexName,
+        List<String> unnestPath,
+        N1Predicate predicate,
+        String groupByColumn,
+        List<String> projection,
+        RelDataType baseRowType
+    ) {
+        this(indexName, unnestPath, predicate, groupByColumn, projection, null, baseRowType);
+    }
 }
