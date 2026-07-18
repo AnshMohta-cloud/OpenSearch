@@ -241,7 +241,15 @@ public class FragmentConversionDriver {
         if (leaf instanceof OpenSearchTableScan tableScan) {
             // QTF narrows the Scan to [belowAnchorPhysicalFields..., __row_id__]; signal that to the
             // backend so it picks the row-id-aware table provider regardless of delegation.
-            boolean requestsRowIds = tableScan.getRowType().getFieldNames().contains(OpenSearchLateMaterialization.ROW_ID_FIELD);
+            //
+            // [NESTED] N1 nested plans also need this: they semi-join/group on __row_id__ inside the
+            // hand-built Substrait (not visible in the RelNode row type). The PHYSICAL parquet
+            // __row_id__ column restarts at 0 per writer generation, so with >1 generation the join
+            // would collide ids across generations (e.g. parent 0 of gen1 == parent 0 of gen2).
+            // requestsRowIds=true selects the indexed session context whose table provider COMPUTES
+            // shard-global ids (global_base + rg.first_row + position) — same mechanism QTF uses.
+            boolean requestsRowIds = tableScan.getRowType().getFieldNames().contains(OpenSearchLateMaterialization.ROW_ID_FIELD)
+                || org.opensearch.analytics.NestedPocOverride.get() != null;
             List<DelegatedExpression> delegated = delegationBytes.getResult();
             if (!delegated.isEmpty()) {
                 factory.createShardScanWithDelegationNode(treeShape, delegated.size(), requestsRowIds).ifPresent(instructions::add);

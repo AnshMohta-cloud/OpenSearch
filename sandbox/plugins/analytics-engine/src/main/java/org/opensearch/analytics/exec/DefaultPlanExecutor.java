@@ -359,7 +359,8 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         // select * = all base-scan columns.
         final List<String> outputColumnOrder;
         if (queryCtx != null && queryCtx.n1Descriptor() != null && queryCtx.n1Descriptor().aggregate() != null) {
-            outputColumnOrder = List.of(queryCtx.n1Descriptor().aggregate().outputColumn());
+            // Grouped aggregate emits [groupKey, measure]; ungrouped emits [measure]. See N1Aggregate.
+            outputColumnOrder = queryCtx.n1Descriptor().aggregate().outputColumns();
         } else if (queryCtx != null && queryCtx.n1Descriptor() != null && !queryCtx.n1Descriptor().projection().isEmpty()) {
             outputColumnOrder = queryCtx.n1Descriptor().projection();
         } else {

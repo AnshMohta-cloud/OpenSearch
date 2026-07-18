@@ -472,7 +472,13 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
         // whose UNNEST isthmus cannot emit), assemble the Substrait plan by hand and skip isthmus
         // entirely. The descriptor is staged on a thread-local by DefaultPlanExecutor.executeInternal.
         // Grep: NESTED-POC.
-        org.opensearch.analytics.N1Descriptor n1 = org.opensearch.analytics.NestedPocOverride.get();
+        // [NESTED] Hand-built N1 path is used only when the generic Calcite-rewrite flag is OFF.
+        // When ON, nested queries are already rewritten to Correlate+Uncollect in the RelNode tree
+        // (OpenSearchNestedFieldRewriter) and flow through the normal isthmus emission below, with
+        // only the UNNEST node injected as an ExtensionSingleRel (see convertToSubstrait).
+        org.opensearch.analytics.N1Descriptor n1 = org.opensearch.analytics.NestedRewriteFlag.genericRewriteEnabled()
+            ? null
+            : org.opensearch.analytics.NestedPocOverride.get();
         if (n1 != null) {
             byte[] bytes = N1SubstraitBuilder.build(n1, SCHEMA_ONLY_TYPE_PROTO_CONVERTER);
             LOGGER.info(
@@ -577,6 +583,19 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
 
     private byte[] convertToSubstrait(RelNode fragment) {
         RelNode preprocessed = preprocessForSubstrait(fragment);
+        // [NESTED] Generic-path emission boundary. If the rewritten tree still contains an
+        // Uncollect/Correlate (the injected UNNEST), isthmus cannot serialize it — the clean design
+        // is to let isthmus emit filter/aggregate/project and inject only the UNNEST node as an
+        // ExtensionSingleRel(unnest:...). That emitter is the remaining production task; until it
+        // lands we fail loudly here rather than emit a silently-wrong plan. The default (flag OFF)
+        // path never reaches this — nested queries go through the hand-built N1SubstraitBuilder.
+        if (NestedUnnestEmission.containsUnnest(preprocessed)) {
+            throw new UnsupportedOperationException(
+                "[NESTED] generic UNNEST rewrite produced an Uncollect/Correlate that the isthmus emitter "
+                    + "does not yet serialize. Set -D" + org.opensearch.analytics.NestedRewriteFlag.PROPERTY
+                    + "=false to use the hand-built path. Pending: isthmus-emits-all + inject unnest ExtensionSingleRel."
+            );
+        }
         RelRoot root = RelRoot.of(preprocessed, SqlKind.SELECT);
         SubstraitRelVisitor visitor = createVisitor(preprocessed);
         Rel substraitRel;

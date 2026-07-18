@@ -369,36 +369,94 @@ final class N1SubstraitBuilder {
                 .build();
         }
 
-        // Resolve the metric's argument column: <deepestLevel>.<argField> in the post-unnest layout.
-        if (agg.argField() == null) {
-            throw new IllegalStateException("[NESTED-POC] metric " + agg.fn() + " requires an argField");
-        }
-        String argColumn = deepestLevel + "." + agg.argField();
-        int argIdx = layout.indexOf(argColumn);
-        if (argIdx < 0) {
-            throw new IllegalStateException("[NESTED-POC] metric arg '" + argColumn + "' not in post-unnest layout " + layout);
-        }
-        RelDataType argType = layoutTypes.get(argIdx);
-        Type outputType = metricOutputType(agg.fn(), argType);
-
+        // Build the measure. count() (no argField) → count(*) (no argument); else fn(argCol).
         int fnAnchor = anchorFor(agg.fn().substraitName(), fnAnchors);
-        AggregateRel.Measure measure = AggregateRel.Measure.newBuilder()
-            .setMeasure(
-                io.substrait.proto.AggregateFunction.newBuilder()
-                    .setFunctionReference(fnAnchor)
-                    .setPhase(io.substrait.proto.AggregationPhase.AGGREGATION_PHASE_INITIAL_TO_RESULT)
-                    .setInvocation(io.substrait.proto.AggregateFunction.AggregationInvocation.AGGREGATION_INVOCATION_ALL)
-                    .setOutputType(outputType)
-                    .addArguments(FunctionArgument.newBuilder().setValue(fieldReference(argIdx)).build())
-                    .build()
-            )
-            .build();
-        // GLOBAL aggregate: no groupings → one output row, one column (the metric value).
-        Rel outputRel = Rel.newBuilder()
-            .setAggregate(AggregateRel.newBuilder().setCommon(directCommon()).setInput(input).addMeasures(measure).build())
-            .build();
+        io.substrait.proto.AggregateFunction.Builder measureFn = io.substrait.proto.AggregateFunction.newBuilder()
+            .setFunctionReference(fnAnchor)
+            .setPhase(io.substrait.proto.AggregationPhase.AGGREGATION_PHASE_INITIAL_TO_RESULT)
+            .setInvocation(io.substrait.proto.AggregateFunction.AggregationInvocation.AGGREGATION_INVOCATION_ALL);
+        Type measureOutputType;
+        if (agg.argField() == null) {
+            // Grouped count() → count of child elements per group (count(*), no argument, i64).
+            if (!agg.hasGroupBy()) {
+                throw new IllegalStateException("[NESTED-POC] ungrouped count() should use the reverse_nested path, not buildChildMetric");
+            }
+            measureOutputType = nullableI64();
+            measureFn.setOutputType(measureOutputType);
+        } else {
+            String argColumn = deepestLevel + "." + agg.argField();
+            int argIdx = layout.indexOf(argColumn);
+            if (argIdx < 0) {
+                throw new IllegalStateException("[NESTED-POC] metric arg '" + argColumn + "' not in post-unnest layout " + layout);
+            }
+            measureOutputType = metricOutputType(agg.fn(), layoutTypes.get(argIdx));
+            measureFn.setOutputType(measureOutputType).addArguments(FunctionArgument.newBuilder().setValue(fieldReference(argIdx)).build());
+        }
+        AggregateRel.Measure measure = AggregateRel.Measure.newBuilder().setMeasure(measureFn.build()).build();
 
-        RelRoot root = RelRoot.newBuilder().setInput(outputRel).addNames(agg.outputColumn()).build();
+        // GROUP BY a child dimension: <deepestLevel>.<groupByField>. Substrait emits grouping keys
+        // FIRST then measures, so the output layout is [groupKey, measure]. Ungrouped → one row,
+        // [measure] only.
+        List<String> rootNames;
+        int groupKeyIdx = -1;
+        if (agg.hasGroupBy()) {
+            String groupCol = deepestLevel + "." + agg.groupByField();
+            groupKeyIdx = layout.indexOf(groupCol);
+            if (groupKeyIdx < 0) {
+                throw new IllegalStateException("[NESTED-POC] group-by field '" + groupCol + "' not in post-unnest layout " + layout);
+            }
+            // DataFusion's unnest preserves a row for parents whose array is empty/absent (Wayne's
+            // empty variants, the Empty doc's no products) — the child columns come out NULL. Vanilla
+            // `nested`->`terms` aggregation has NO child docs for those parents, so it emits no NULL
+            // bucket. Match that: drop rows whose group key is NULL before grouping (unless a WHERE
+            // already filtered them out — harmless then). is_not_null(groupCol).
+            int notNullAnchor = anchorFor("is_not_null", fnAnchors);
+            Expression notNull = Expression.newBuilder()
+                .setScalarFunction(
+                    Expression.ScalarFunction.newBuilder()
+                        .setFunctionReference(notNullAnchor)
+                        .setOutputType(nullableBool())
+                        .addArguments(FunctionArgument.newBuilder().setValue(fieldReference(groupKeyIdx)).build())
+                        .build()
+                )
+                .build();
+            input = Rel.newBuilder()
+                .setFilter(FilterRel.newBuilder().setCommon(directCommon()).setInput(input).setCondition(notNull).build())
+                .build();
+        }
+
+        AggregateRel.Builder aggRel = AggregateRel.newBuilder().setCommon(directCommon()).setInput(input).addMeasures(measure);
+        if (agg.hasGroupBy()) {
+            aggRel.addGroupings(AggregateRel.Grouping.newBuilder().addGroupingExpressions(fieldReference(groupKeyIdx)).build());
+            rootNames = List.of(agg.groupByOutputColumn(), agg.outputColumn());
+        } else {
+            rootNames = List.of(agg.outputColumn());
+        }
+        Rel outputRel = Rel.newBuilder().setAggregate(aggRel.build()).build();
+
+        // HAVING: filter the grouped aggregate result on the measure. In the aggregate's output the
+        // group key is field 0 and the measure is field 1; compare field 1 <havingOp> <literal>.
+        if (agg.hasHaving()) {
+            if (!agg.hasGroupBy()) {
+                throw new IllegalStateException("[NESTED-POC] HAVING without GROUP BY is unsupported");
+            }
+            int havingAnchor = anchorFor(agg.havingOp().substraitName(), fnAnchors);
+            Expression havingCond = Expression.newBuilder()
+                .setScalarFunction(
+                    Expression.ScalarFunction.newBuilder()
+                        .setFunctionReference(havingAnchor)
+                        .setOutputType(nullableBool())
+                        .addArguments(FunctionArgument.newBuilder().setValue(fieldReference(1)).build())
+                        .addArguments(FunctionArgument.newBuilder().setValue(literalOf(agg.havingValue())).build())
+                        .build()
+                )
+                .build();
+            outputRel = Rel.newBuilder()
+                .setFilter(FilterRel.newBuilder().setCommon(directCommon()).setInput(outputRel).setCondition(havingCond).build())
+                .build();
+        }
+
+        RelRoot root = RelRoot.newBuilder().setInput(outputRel).addAllNames(rootNames).build();
         Plan.Builder planBuilder = Plan.newBuilder();
         for (Map.Entry<String, Integer> e : fnAnchors.entrySet()) {
             planBuilder.addExtensions(
@@ -413,16 +471,17 @@ final class N1SubstraitBuilder {
         Plan finalPlan = SubstraitPlanProtoRewriter.rewrite(plan);
         byte[] bytes = finalPlan.toByteArray();
         LOGGER.info(
-            "[NESTED-POC] N1SubstraitBuilder (CHILD METRIC): index='{}' unnestPath {}, metric {}({}) over post-unnest col '{}'(idx {}), "
-                + "predicate {}, output column '{}', functions {} -> {} bytes",
+            "[NESTED-POC] N1SubstraitBuilder (CHILD METRIC): index='{}' unnestPath {}, metric {}(argField={}), "
+                + "groupBy={}, having={} {}, predicate {}, output columns {}, functions {} -> {} bytes",
             d.indexName(),
             d.unnestPath(),
             agg.fn().substraitName(),
-            argColumn,
-            argColumn,
-            argIdx,
+            agg.argField(),
+            agg.groupByField(),
+            agg.hasHaving() ? agg.havingOp() : "none",
+            agg.hasHaving() ? agg.havingValue() : "",
             d.predicate(),
-            agg.outputColumn(),
+            agg.outputColumns(),
             fnAnchors.keySet(),
             bytes.length
         );
@@ -447,6 +506,10 @@ final class N1SubstraitBuilder {
             case MAX:
                 if (argType == null) {
                     return nullableFp64();
+                }
+                if (isCharacter(argType)) {
+                    // min/max of a keyword/text field preserves the string type.
+                    return nullableString();
                 }
                 return floating ? nullableFp64() : nullableI64();
             default:
@@ -473,6 +536,26 @@ final class N1SubstraitBuilder {
         return Type.newBuilder()
             .setFp64(Type.FP64.newBuilder().setNullability(Type.Nullability.NULLABILITY_NULLABLE).build())
             .build();
+    }
+
+    private static Type nullableString() {
+        return Type.newBuilder()
+            .setString(Type.String.newBuilder().setNullability(Type.Nullability.NULLABILITY_NULLABLE).build())
+            .build();
+    }
+
+    /** True for character (keyword/text → VARCHAR/CHAR) argument types. */
+    private static boolean isCharacter(RelDataType t) {
+        if (t == null) {
+            return false;
+        }
+        switch (t.getSqlTypeName()) {
+            case VARCHAR:
+            case CHAR:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /**

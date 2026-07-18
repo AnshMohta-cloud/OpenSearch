@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use datafusion::common::{Column, DFSchema, DataFusionError};
 use datafusion::execution::{FunctionRegistry, SessionState};
-use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{col, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -34,7 +34,23 @@ use substrait::proto::{ExtensionSingleRel, Plan};
 
 /// type_url prefix marking an ExtensionSingleRel as "unnest the named column of my input".
 /// The column name follows the colon, e.g. "unnest:comments".
+///
+/// This is the ORIGINAL (hardcoded-path) marker: it unnests each level IN PLACE (the array column
+/// is replaced by its struct fields at the same position), matching the layout `N1SubstraitBuilder`
+/// hand-simulates. Used by the flag-OFF path — do not change its layout.
 pub(crate) const UNNEST_TYPE_URL_PREFIX: &str = "unnest:";
+
+/// type_url prefix marking a RESHAPING unnest, for the generic (flag-ON) path. Same comma-separated
+/// path as `unnest:`, but the output is reshaped to CALCITE's Correlate+Uncollect layout:
+/// `[all original columns INCLUDING the array column, positions unchanged] ++ [unnested struct fields]`.
+///
+/// Why: on the generic path, isthmus emits the Filter/Aggregate/Project with POSITIONAL field refs
+/// against Calcite's layout. DataFusion's native `unnest_column` instead replaces the array in place,
+/// a different column order — so those refs would point at the wrong columns. Reshaping here makes the
+/// engine's output match what isthmus assumed, so any isthmus-emitted plan "just works" with no
+/// Java-side index remapping. Mechanism: duplicate the array column to the end, then unnest the
+/// duplicate — originals stay put, exploded fields append. Grep: NESTED.
+pub(crate) const UNNEST_RESHAPE_TYPE_URL_PREFIX: &str = "unnest_reshape:";
 
 /// A consumer that understands the unnest ExtensionSingleRel and otherwise behaves exactly like
 /// the stock `DefaultSubstraitConsumer` (which it wraps and delegates to).
@@ -89,6 +105,23 @@ impl SubstraitConsumer for UnnestConsumer<'_> {
             DataFusionError::NotImplemented("ExtensionSingleRel without detail".to_string())
         })?;
 
+        // Generic (flag-ON) path: reshaping unnest → Calcite Correlate+Uncollect layout.
+        // Checked BEFORE the plain `unnest:` prefix because "unnest_reshape:" also starts with
+        // "unnest" but must NOT be handled by the in-place branch.
+        if let Some(path_spec) = detail.type_url.strip_prefix(UNNEST_RESHAPE_TYPE_URL_PREFIX) {
+            let input_rel = rel.input.as_ref().ok_or_else(|| {
+                DataFusionError::Execution("[NESTED] unnest_reshape ExtensionSingleRel has no input".to_string())
+            })?;
+            let input_plan = self.consume_rel(input_rel).await?;
+            let levels: Vec<&str> = path_spec.split(',').filter(|s| !s.is_empty()).collect();
+            log::info!(
+                "[NESTED] unnest-consumer(reshape): expanding path {:?} to CALCITE layout \
+                 (originals kept in place + struct fields appended) so isthmus positional refs align.",
+                levels
+            );
+            return build_reshaping_unnest(input_plan, &levels);
+        }
+
         if let Some(path_spec) = detail.type_url.strip_prefix(UNNEST_TYPE_URL_PREFIX) {
             let input_rel = rel.input.as_ref().ok_or_else(|| {
                 DataFusionError::Execution("[NESTED-POC] unnest ExtensionSingleRel has no input".to_string())
@@ -123,6 +156,44 @@ impl SubstraitConsumer for UnnestConsumer<'_> {
         // Not ours — defer to the stock behaviour (which errors with "Missing handler").
         self.inner.consume_extension_single(rel).await
     }
+}
+
+/// Builds a RESHAPING unnest producing Calcite's Correlate+Uncollect layout: original columns stay
+/// in place (including the array column itself) and the exploded struct fields are appended.
+///
+/// Per level: we append a DUPLICATE of the array column (aliased) to the end of the row, then unnest
+/// that duplicate. DataFusion's `unnest_column` replaces the duplicate in place — but since the
+/// duplicate is last, the effect is "originals unchanged, struct fields appended". The two
+/// `unnest_column` passes mirror the in-place branch (list→struct, then struct→top-level `alias.field`
+/// columns). For a multi-level path, the next level's array column lives among the appended fields and
+/// is addressed by its dotted name (`Column::from_name` does not split on '.').
+///
+/// Example — base `[comments: List<Struct<author,score>>, title, __row_id__]`, level "comments":
+///   after project:  [comments, title, __row_id__, comments__u]         (duplicate appended)
+///   after unnest×2: [comments, title, __row_id__, comments__u.author, comments__u.score]
+/// i.e. every original index is preserved and the child fields are appended — Calcite's layout.
+fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusion::common::Result<LogicalPlan> {
+    let mut builder = LogicalPlanBuilder::from(input_plan);
+    for level in levels {
+        // Alias for the duplicated array column: a name that cannot collide with a real column.
+        let dup_alias = format!("{level}__u");
+        // Project: keep every existing column (SELECT *), then append `array_col AS <level>__u`.
+        let existing: Vec<Expr> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| col(Column::from_name(f.name())))
+            .collect();
+        let mut proj_exprs = existing;
+        proj_exprs.push(col(Column::from_name(*level)).alias(dup_alias.clone()));
+        builder = builder.project(proj_exprs)?;
+
+        // Unnest the duplicate twice (list -> struct, struct -> top-level `<dup_alias>.field`).
+        builder = builder
+            .unnest_column(Column::from_name(&dup_alias))?
+            .unnest_column(Column::from_name(&dup_alias))?;
+    }
+    builder.build()
 }
 
 /// Unnest-aware replacement for `from_substrait_plan`. Builds `Extensions` from the plan exactly

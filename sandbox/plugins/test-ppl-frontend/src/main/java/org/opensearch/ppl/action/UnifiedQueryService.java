@@ -162,7 +162,8 @@ public class UnifiedQueryService {
                 //  - projection -> those parent columns (recovered via the semi-join back)
                 //  - empty projection = select * -> all parent columns from the base row type
                 if (n1Descriptor.aggregate() != null) {
-                    columns = List.of(n1Descriptor.aggregate().outputColumn());
+                    // Grouped aggregate returns [groupKey, measure]; ungrouped returns [measure].
+                    columns = n1Descriptor.aggregate().outputColumns();
                 } else if (n1Descriptor.projection().isEmpty()) {
                     columns = logicalPlan.getRowType().getFieldNames();
                 } else {

@@ -134,6 +134,18 @@ public class PlannerImpl {
         logStage("After pushdownRules", modifiedRelNode);
         modifiedRelNode = decomposeAggregates(modifiedRelNode, listener);
         logStage("After decomposeAggregates", modifiedRelNode);
+        // [NESTED] Generic path (flag ON): rewrite ITEM-on-ARRAY(ROW) nested refs into a real
+        // Correlate+Uncollect (UNNEST) subtree BEFORE marking, so the marking rules only ever see
+        // plain column refs to the flattened struct fields (never the unsupported ITEM function).
+        // Flag OFF (default): no-op — the hand-authored N1Descriptor path in the DataFusion convertor
+        // handles nested queries instead, keeping the proven behaviour unchanged.
+        if (org.opensearch.analytics.NestedRewriteFlag.genericRewriteEnabled()) {
+            RelNode beforeNested = modifiedRelNode;
+            modifiedRelNode = org.opensearch.analytics.planner.rules.OpenSearchNestedFieldRewriter.rewrite(modifiedRelNode);
+            if (modifiedRelNode != beforeNested) {
+                logStage("After nested UNNEST rewrite", modifiedRelNode);
+            }
+        }
         LOGGER.info("[NESTED-POC] Before mark() — RelNode entering mark():");
         logStage("RelNode entering mark", modifiedRelNode);
         modifiedRelNode = mark(modifiedRelNode, context, listener);
@@ -410,7 +422,12 @@ public class PlannerImpl {
                     new OpenSearchJoinRule(context),
                     new OpenSearchSortRule(context),
                     new OpenSearchUnionRule(context),
-                    new OpenSearchValuesRule(context)
+                    new OpenSearchValuesRule(context),
+                    // [NESTED] Mark the Correlate+Uncollect (UNNEST) nodes the generic nested rewrite
+                    // injects → forced to the DataFusion backend. Harmless no-ops when the flag is off
+                    // (no such nodes exist in the tree, so the rules never match).
+                    new org.opensearch.analytics.planner.rules.OpenSearchCorrelateRule(context),
+                    new org.opensearch.analytics.planner.rules.OpenSearchUncollectRule(context)
                 )
             )
             .run(input, listener);
