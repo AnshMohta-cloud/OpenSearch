@@ -128,7 +128,11 @@ public class UnifiedQueryService {
             // Substrait plan (Scan -> UNNEST -> Filter -> distinct) by hand, skipping isthmus. Grep: NESTED-POC.
             RelNode logicalPlan;
             N1Descriptor n1Descriptor = null;
-            if (N1PlanRegistry.has(pplText)) {
+            // [NESTED] When the generic Calcite-rewrite path is ON, DO NOT consult the hardcoded
+            // registry — plan the query normally so its ITEM(array,'field') tree reaches
+            // OpenSearchNestedFieldRewriter (which injects Correlate+Uncollect) and isthmus emits it.
+            // The registry/N1Descriptor path is the flag-OFF fallback only.
+            if (org.opensearch.analytics.NestedRewriteFlag.genericRewriteEnabled() == false && N1PlanRegistry.has(pplText)) {
                 String indexName = extractSourceIndex(pplText);
                 logger.info("[NESTED-POC] query matched the N1 registry; planning base scan for index [{}]", indexName);
                 logicalPlan = planner.plan("source=" + indexName);

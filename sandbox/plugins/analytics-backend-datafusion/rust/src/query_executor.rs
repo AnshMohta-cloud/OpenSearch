@@ -20,7 +20,9 @@ use datafusion::execution::cache::cache_manager::{CacheManagerConfig, CachedFile
 use datafusion::execution::cache::{CacheAccessor, DefaultListFilesCache};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{col, lit};
-use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+// [NESTED] Unnest-aware entry (understands our `unnest_reshape:` ExtensionSingle; delegates all
+// other rels to the stock consumer). Safe superset of the stock from_substrait_plan.
+use crate::unnest_consumer::from_substrait_plan_unnest_aware as from_substrait_plan;
 use log::error;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;

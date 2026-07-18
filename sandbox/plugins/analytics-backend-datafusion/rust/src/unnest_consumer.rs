@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::{Column, DFSchema, DataFusionError};
+use datafusion::common::{Column, DFSchema, DataFusionError, UnnestOptions};
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::{col, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
@@ -171,7 +171,12 @@ impl SubstraitConsumer for UnnestConsumer<'_> {
 /// Example — base `[comments: List<Struct<author,score>>, title, __row_id__]`, level "comments":
 ///   after project:  [comments, title, __row_id__, comments__u]         (duplicate appended)
 ///   after unnest×2: [comments, title, __row_id__, comments__u.author, comments__u.score]
-/// i.e. every original index is preserved and the child fields are appended — Calcite's layout.
+///   after rename:   [comments, title, __row_id__, author, score]       (BARE Calcite names)
+/// i.e. every original index is preserved and the child fields are appended with their BARE names —
+/// exactly Calcite's Correlate row type, by name AND position. The bare names are essential for
+/// multi-level `expand` (e.g. `expand products | expand variants`): the second level's
+/// `unnest_reshape:variants` and isthmus's positional refs both address the column as `variants`,
+/// not `products__u.variants`.
 fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusion::common::Result<LogicalPlan> {
     let mut builder = LogicalPlanBuilder::from(input_plan);
     for level in levels {
@@ -189,9 +194,29 @@ fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusio
         builder = builder.project(proj_exprs)?;
 
         // Unnest the duplicate twice (list -> struct, struct -> top-level `<dup_alias>.field`).
+        // preserve_nulls=false so an empty/absent array yields NO row (matches OpenSearch nested
+        // semantics — a parent with no children contributes nothing to a nested-scoped query),
+        // rather than DataFusion's default of one preserved row with null child fields.
+        let opts = UnnestOptions::new().with_preserve_nulls(false);
         builder = builder
-            .unnest_column(Column::from_name(&dup_alias))?
-            .unnest_column(Column::from_name(&dup_alias))?;
+            .unnest_column_with_options(Column::from_name(&dup_alias), opts.clone())?
+            .unnest_column_with_options(Column::from_name(&dup_alias), opts)?;
+
+        // Rename the freshly-appended `<dup_alias>.field` columns to their BARE `field` names so the
+        // output matches Calcite's Correlate row type by name (originals kept verbatim). Without this,
+        // a following level (or isthmus's by-name refs) can't find e.g. `variants` — it'd be
+        // `products__u.variants`.
+        let prefix = format!("{dup_alias}.");
+        let renamed: Vec<Expr> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| match f.name().strip_prefix(&prefix) {
+                Some(bare) => col(Column::from_name(f.name())).alias(bare.to_string()),
+                None => col(Column::from_name(f.name())),
+            })
+            .collect();
+        builder = builder.project(renamed)?;
     }
     builder.build()
 }

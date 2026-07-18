@@ -249,7 +249,8 @@ public class FragmentConversionDriver {
             // requestsRowIds=true selects the indexed session context whose table provider COMPUTES
             // shard-global ids (global_base + rg.first_row + position) — same mechanism QTF uses.
             boolean requestsRowIds = tableScan.getRowType().getFieldNames().contains(OpenSearchLateMaterialization.ROW_ID_FIELD)
-                || org.opensearch.analytics.NestedPocOverride.get() != null;
+                || org.opensearch.analytics.NestedPocOverride.get() != null
+                || containsUnnest(resolvedFragment);
             List<DelegatedExpression> delegated = delegationBytes.getResult();
             if (!delegated.isEmpty()) {
                 factory.createShardScanWithDelegationNode(treeShape, delegated.size(), requestsRowIds).ifPresent(instructions::add);
@@ -270,6 +271,21 @@ public class FragmentConversionDriver {
         if (root instanceof OpenSearchAggregate agg && agg.getMode() == AggregateMode.PARTIAL) return true;
         for (RelNode child : root.getInputs()) {
             if (containsPartialAggregate(child)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * [NESTED] True if the fragment contains an UNNEST ({@link org.apache.calcite.rel.core.Uncollect},
+     * possibly the marked {@code OpenSearchUncollect}) — i.e. the generic nested-field rewrite injected
+     * a {@code Correlate + Uncollect}. Such plans reference the physical {@code __row_id__} for
+     * parent de-duplication/grouping, which is computed shard-globally only by the indexed executor;
+     * so we request row ids to select it (same reason as QTF, generalised to the generic nested path).
+     */
+    private static boolean containsUnnest(RelNode root) {
+        if (root instanceof org.apache.calcite.rel.core.Uncollect) return true;
+        for (RelNode child : root.getInputs()) {
+            if (containsUnnest(child)) return true;
         }
         return false;
     }

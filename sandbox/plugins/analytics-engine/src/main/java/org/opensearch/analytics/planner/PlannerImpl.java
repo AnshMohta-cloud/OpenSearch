@@ -206,6 +206,15 @@ public class PlannerImpl {
      * emission. Runs first so every later phase observes a subquery-free tree.
      */
     private static RelNode removeSubQueries(RelNode input, RuleProfilingListener listener) {
+        // [NESTED] This phase exists only to remove RexSubQuery nodes and decorrelate the
+        // LogicalCorrelates that removal introduces. When the tree has NO subquery it is a no-op —
+        // except RelDecorrelator.decorrelateQuery would still rewrite an unrelated structural
+        // Correlate (the one PPL `expand` emits for UNNEST), pushing an outer Filter down into the
+        // Correlate's Uncollect leg. That breaks the unnest emitter (it expects Correlate(left,
+        // Uncollect)). Skip the whole phase when there is no subquery to remove.
+        if (containsSubQuery(input) == false) {
+            return input;
+        }
         // The PPL frontend injects a SUBSEARCH_MAXOUT Sort(fetch=N) at the top of every subsearch.
         // Inside an EXISTS that limit is semantically irrelevant (existence needs only one row), but
         // it becomes a correlated Sort(fetch>1) after FILTER_SUB_QUERY_TO_CORRELATE, which
@@ -233,6 +242,34 @@ public class PlannerImpl {
                 )
             )
             .run(prepared, listener);
+    }
+
+    /**
+     * True if any Filter / Project / Join in the tree carries a {@link RexSubQuery}. Used to skip the
+     * subquery-removal + decorrelation phase entirely for subquery-free queries, so it cannot disturb
+     * an unrelated structural {@code Correlate} (e.g. the one PPL {@code expand} emits for UNNEST).
+     */
+    private static boolean containsSubQuery(RelNode node) {
+        RelNode unwrapped = org.opensearch.analytics.planner.RelNodeUtils.unwrapHep(node);
+        if (unwrapped instanceof org.apache.calcite.rel.core.Filter filter) {
+            if (org.apache.calcite.rex.RexUtil.SubQueryFinder.containsSubQuery(filter)) {
+                return true;
+            }
+        } else if (unwrapped instanceof org.apache.calcite.rel.core.Project project) {
+            if (org.apache.calcite.rex.RexUtil.SubQueryFinder.containsSubQuery(project)) {
+                return true;
+            }
+        } else if (unwrapped instanceof org.apache.calcite.rel.core.Join join) {
+            if (org.apache.calcite.rex.RexUtil.SubQueryFinder.containsSubQuery(join)) {
+                return true;
+            }
+        }
+        for (RelNode child : unwrapped.getInputs()) {
+            if (containsSubQuery(child)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

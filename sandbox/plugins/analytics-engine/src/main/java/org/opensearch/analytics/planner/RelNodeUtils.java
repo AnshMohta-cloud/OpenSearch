@@ -24,6 +24,7 @@ import org.apache.calcite.rex.RexShuttle;
 import org.apache.calcite.rex.RexUtil;
 import org.opensearch.analytics.planner.rel.OpenSearchAggregate;
 import org.opensearch.analytics.planner.rel.OpenSearchConvention;
+import org.opensearch.analytics.planner.rel.OpenSearchCorrelate;
 import org.opensearch.analytics.planner.rel.OpenSearchDistribution;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
 import org.opensearch.analytics.planner.rel.OpenSearchExchangeReducer;
@@ -32,6 +33,7 @@ import org.opensearch.analytics.planner.rel.OpenSearchJoin;
 import org.opensearch.analytics.planner.rel.OpenSearchProject;
 import org.opensearch.analytics.planner.rel.OpenSearchSort;
 import org.opensearch.analytics.planner.rel.OpenSearchTableScan;
+import org.opensearch.analytics.planner.rel.OpenSearchUncollect;
 import org.opensearch.analytics.planner.rel.OpenSearchUnion;
 import org.opensearch.analytics.planner.rel.OpenSearchValues;
 import org.opensearch.analytics.spi.FieldStorageInfo;
@@ -123,6 +125,28 @@ public class RelNodeUtils {
             return new OpenSearchUnion(newCluster, newTraits, newInputs, union.all, union.getViableBackends());
         } else if (node instanceof OpenSearchValues values) {
             return new OpenSearchValues(newCluster, newTraits, values.getRowType(), values.getTuples(), values.getViableBackends());
+        } else if (node instanceof OpenSearchCorrelate correlate) {
+            // [NESTED] UNNEST via PPL `expand`: frontend emits Correlate(left, Uncollect(...)).
+            return new OpenSearchCorrelate(
+                newCluster,
+                newTraits,
+                newInputs.get(0),
+                newInputs.get(1),
+                correlate.getCorrelationId(),
+                correlate.getRequiredColumns(),
+                correlate.getJoinType(),
+                correlate.getViableBackends()
+            );
+        } else if (node instanceof OpenSearchUncollect uncollect) {
+            // [NESTED] The array-explosion side of the `expand` Correlate.
+            return new OpenSearchUncollect(
+                newCluster,
+                newTraits,
+                newInputs.getFirst(),
+                uncollect.withOrdinality,
+                uncollect.getItemAliases(),
+                uncollect.getViableBackends()
+            );
         } else if (node instanceof OpenSearchExchangeReducer reducer) {
             return new OpenSearchExchangeReducer(
                 newCluster,
@@ -201,8 +225,13 @@ public class RelNodeUtils {
         return null;
     }
 
-    /** Maximum recursion depth when walking a RelNode tree to extract indices. */
-    static final int MAX_EXTRACT_INDICES_DEPTH = 15;
+    /**
+     * Maximum recursion depth when walking a RelNode tree to extract indices. Deep nested queries
+     * add ~3 rels per level (each PPL {@code expand} lowers to Correlate + Uncollect + Project), so a
+     * 6-7 level nested dig needs headroom well beyond a handful of levels. This only bounds a linear
+     * tree walk (no combinatorial cost), so a generous ceiling is safe.
+     */
+    static final int MAX_EXTRACT_INDICES_DEPTH = 40;
 
     /**
      * Extracts all index names referenced by {@link org.apache.calcite.rel.core.TableScan}

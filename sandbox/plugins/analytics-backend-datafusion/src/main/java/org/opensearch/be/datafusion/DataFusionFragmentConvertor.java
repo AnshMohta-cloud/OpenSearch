@@ -583,19 +583,6 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
 
     private byte[] convertToSubstrait(RelNode fragment) {
         RelNode preprocessed = preprocessForSubstrait(fragment);
-        // [NESTED] Generic-path emission boundary. If the rewritten tree still contains an
-        // Uncollect/Correlate (the injected UNNEST), isthmus cannot serialize it — the clean design
-        // is to let isthmus emit filter/aggregate/project and inject only the UNNEST node as an
-        // ExtensionSingleRel(unnest:...). That emitter is the remaining production task; until it
-        // lands we fail loudly here rather than emit a silently-wrong plan. The default (flag OFF)
-        // path never reaches this — nested queries go through the hand-built N1SubstraitBuilder.
-        if (NestedUnnestEmission.containsUnnest(preprocessed)) {
-            throw new UnsupportedOperationException(
-                "[NESTED] generic UNNEST rewrite produced an Uncollect/Correlate that the isthmus emitter "
-                    + "does not yet serialize. Set -D" + org.opensearch.analytics.NestedRewriteFlag.PROPERTY
-                    + "=false to use the hand-built path. Pending: isthmus-emits-all + inject unnest ExtensionSingleRel."
-            );
-        }
         RelRoot root = RelRoot.of(preprocessed, SqlKind.SELECT);
         SubstraitRelVisitor visitor = createVisitor(preprocessed);
         Rel substraitRel;
@@ -869,7 +856,54 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
                 Rel rel = super.visit(aggregate);
                 return rel instanceof Aggregate agg ? addNullArgFilters(aggregate, agg) : rel;
             }
+
+            @Override
+            public Rel visit(org.apache.calcite.rel.core.Correlate correlate) {
+                // [NESTED] The generic nested rewrite injects Correlate(left, Uncollect(...)) to mean
+                // UNNEST(left.arrayColumn). isthmus's default would emit this as a JOIN (wrong — a join
+                // is not an unnest). Intercept it: emit an ExtensionSingle carrying "unnest_reshape:<col>"
+                // over the converted LEFT input; the Rust consumer rebuilds LogicalPlan::Unnest reshaped
+                // to this correlate's (Calcite append) row type, so field indices above line up. Every
+                // other rel (Filter/Aggregate/GroupBy/Having/Sort/Project) flows through isthmus as usual.
+                Rel unnest = tryEmitUnnest(correlate, this);
+                return unnest != null ? unnest : super.visit(correlate);
+            }
         };
+    }
+
+    /**
+     * If {@code correlate} is the {@code Correlate(left, Uncollect(project($cor.arrayCol)))} shape the
+     * nested rewrite injects, emit it as an {@code ExtensionSingle(unnest_reshape:&lt;arrayColName&gt;)} over
+     * the converted left input; otherwise return {@code null} (a genuine correlated join). The unnest
+     * path is the dotted name of the left column named by {@code requiredColumns}; the extension rel's
+     * record type is this correlate's Calcite row type (originals + appended struct fields), which the
+     * Rust reshape reproduces.
+     */
+    private static Rel tryEmitUnnest(org.apache.calcite.rel.core.Correlate correlate, SubstraitRelVisitor visitor) {
+        RelNode right = stripHep(correlate.getRight());
+        if (!(right instanceof org.apache.calcite.rel.core.Uncollect)) {
+            return null; // not our injected unnest — a real correlated join
+        }
+        RelNode left = correlate.getLeft();
+        org.apache.calcite.util.ImmutableBitSet required = correlate.getRequiredColumns();
+        if (required.cardinality() != 1) {
+            return null;
+        }
+        int arrayColIdx = required.nth(0);
+        String arrayColName = left.getRowType().getFieldList().get(arrayColIdx).getName();
+
+        io.substrait.relation.Rel leftRel = visitor.apply(left);
+        Type.Struct recordType = TypeConverter.DEFAULT.toNamedStruct(correlate.getRowType()).struct();
+        UnnestExtensionDetail detail = new UnnestExtensionDetail(arrayColName, recordType);
+        // isthmus's ExtensionSingle immutable has a MANDATORY builder attribute deriveRecordType
+        // (the post-unnest output row type) — separate from the detail's own deriveRecordType(Rel).
+        // Both carry the Calcite Correlate row type (originals + appended exploded struct fields).
+        return io.substrait.relation.ExtensionSingle.builder().input(leftRel).detail(detail).deriveRecordType(recordType).build();
+    }
+
+    /** Unwrap a Calcite HepRelVertex so instanceof checks see the real rel. */
+    private static RelNode stripHep(RelNode node) {
+        return node instanceof org.apache.calcite.plan.hep.HepRelVertex v ? v.getCurrentRel() : node;
     }
 
     /**

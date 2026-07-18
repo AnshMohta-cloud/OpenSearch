@@ -39,7 +39,9 @@ use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use native_bridge_common::log_debug;
-use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+// [NESTED] Unnest-aware entry (understands our `unnest_reshape:` ExtensionSingle; delegates every
+// other rel to the stock consumer) — the reduce/local session executes plans that may carry it.
+use crate::unnest_consumer::from_substrait_plan_unnest_aware as from_substrait_plan;
 use prost::Message;
 use substrait::proto::Plan;
 

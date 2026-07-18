@@ -445,7 +445,8 @@ pub async fn prepare_partial_plan(
     handle: &mut SessionContextHandle,
     substrait_bytes: &[u8],
 ) -> Result<(), datafusion::common::DataFusionError> {
-    use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+    // [NESTED] Unnest-aware (understands `unnest_reshape:`; delegates all else to stock).
+    use crate::unnest_consumer::from_substrait_plan_unnest_aware as from_substrait_plan;
     use prost::Message;
     use substrait::proto::Plan;
 
