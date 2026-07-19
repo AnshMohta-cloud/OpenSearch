@@ -44,15 +44,20 @@ final class UnnestExtensionDetail implements Extension.SingleRelDetail {
 
     private final String pathSpec;
     private final Type.Struct outputRecordType;
+    private final int postUnnestWidth;
 
-    UnnestExtensionDetail(String pathSpec, Type.Struct outputRecordType) {
+    UnnestExtensionDetail(String pathSpec, Type.Struct outputRecordType, int postUnnestWidth) {
         this.pathSpec = pathSpec;
         this.outputRecordType = outputRecordType;
+        this.postUnnestWidth = postUnnestWidth;
     }
 
     @Override
     public Any toProto(io.substrait.relation.RelProtoConverter converter) {
-        return Any.newBuilder().setTypeUrl(TYPE_URL_PREFIX + pathSpec).build();
+        // type_url = "unnest_reshape:<path>|w=<postUnnestWidth>". The Rust consumer strips the "|w=..."
+        // suffix (it only needs <path>); the parent-dedup post-pass reads it to place __row_id__ (which
+        // the reshape reorders to the tail, i.e. index == postUnnestWidth) without re-deriving the layout.
+        return Any.newBuilder().setTypeUrl(TYPE_URL_PREFIX + pathSpec + "|w=" + postUnnestWidth).build();
     }
 
     @Override

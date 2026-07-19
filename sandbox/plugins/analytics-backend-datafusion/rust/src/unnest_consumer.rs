@@ -113,7 +113,10 @@ impl SubstraitConsumer for UnnestConsumer<'_> {
                 DataFusionError::Execution("[NESTED] unnest_reshape ExtensionSingleRel has no input".to_string())
             })?;
             let input_plan = self.consume_rel(input_rel).await?;
-            let levels: Vec<&str> = path_spec.split(',').filter(|s| !s.is_empty()).collect();
+            // The Java emitter stamps "<path>|w=<postUnnestWidth>" — the "|w=" suffix is a hint for the
+            // Java parent-dedup post-pass only; strip it here so the reshape sees just the level path.
+            let path_only = path_spec.split('|').next().unwrap_or(path_spec);
+            let levels: Vec<&str> = path_only.split(',').filter(|s| !s.is_empty()).collect();
             log::info!(
                 "[NESTED] unnest-consumer(reshape): expanding path {:?} to CALCITE layout \
                  (originals kept in place + struct fields appended) so isthmus positional refs align.",
@@ -179,6 +182,11 @@ impl SubstraitConsumer for UnnestConsumer<'_> {
 /// not `products__u.variants`.
 fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusion::common::Result<LogicalPlan> {
     let mut builder = LogicalPlanBuilder::from(input_plan);
+    native_bridge_common::log_error!(
+        "[NESTED][diag] reshape INPUT: levels={:?} input schema = {:?}",
+        levels,
+        builder.schema().columns().iter().map(|c| c.flat_name()).collect::<Vec<_>>()
+    );
     for level in levels {
         // Alias for the duplicated array column: a name that cannot collide with a real column.
         let dup_alias = format!("{level}__u");
@@ -217,7 +225,39 @@ fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusio
             })
             .collect();
         builder = builder.project(renamed)?;
+
+        // [NESTED][diag] visible via the FFM bridge (log::info is dropped — no `log` provider in the
+        // native lib). Shows the schema after each level so a dropped nested-list child is observable.
+        native_bridge_common::log_error!(
+            "[NESTED][diag] after level '{}': {:?}",
+            level,
+            builder.schema().columns().iter().map(|c| c.flat_name()).collect::<Vec<_>>()
+        );
     }
+
+    // [NESTED] Parent-dedup invariant: if the scan carries __row_id__ (the parent doc identity,
+    // requested when the query is a parent-returning nested shape), reorder it to the LAST output
+    // column. isthmus emitted every filter/project/aggregate above this unnest with POSITIONAL field
+    // references computed WITHOUT __row_id__; keeping it strictly after all those columns leaves every
+    // existing index undisturbed, and lets the Java dedup post-pass reference __row_id__ at a single
+    // known tail index. No-op when __row_id__ is absent (the common, non-dedup case).
+    //
+    let fields = builder.schema().fields();
+    if fields.iter().any(|f| f.name() == crate::ROW_ID_COLUMN_NAME) {
+        let mut reordered: Vec<Expr> = fields
+            .iter()
+            .filter(|f| f.name() != crate::ROW_ID_COLUMN_NAME)
+            .map(|f| col(Column::from_name(f.name())))
+            .collect();
+        reordered.push(col(Column::from_name(crate::ROW_ID_COLUMN_NAME)));
+        builder = builder.project(reordered)?;
+    }
+
+    native_bridge_common::log_error!(
+        "[NESTED][diag] reshape done: levels={:?} output = {:?}",
+        levels,
+        builder.schema().columns().iter().map(|c| c.flat_name()).collect::<Vec<_>>()
+    );
     builder.build()
 }
 

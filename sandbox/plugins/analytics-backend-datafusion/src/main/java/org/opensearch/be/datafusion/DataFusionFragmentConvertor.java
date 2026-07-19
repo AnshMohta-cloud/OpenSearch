@@ -619,6 +619,12 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
         plan = SubstraitPlanPojoRewriter.rewrite(plan);
 
         io.substrait.proto.Plan protoPlan = SubstraitPlanProtoRewriter.rewrite(new PlanProtoConverter().toProto(plan));
+        // [NESTED] Generic path only: restore vanilla nested count() = distinct-parent count by
+        // rewriting count() -> count(DISTINCT __row_id__) for the parent-returning count shape. No-op
+        // for every other shape (and for the flag-OFF hardcoded path, which never reaches here).
+        if (org.opensearch.analytics.NestedRewriteFlag.genericRewriteEnabled()) {
+            protoPlan = NestedParentDedupRewriter.rewrite(protoPlan);
+        }
         byte[] bytes = protoPlan.toByteArray();
         // [NESTED-POC] Full readable Substrait plan shipped to the data node (isthmus path).
         // The proto toString shows the Read/Filter/Aggregate/Project/Join rel tree + extensions.
@@ -894,7 +900,12 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
 
         io.substrait.relation.Rel leftRel = visitor.apply(left);
         Type.Struct recordType = TypeConverter.DEFAULT.toNamedStruct(correlate.getRowType()).struct();
-        UnnestExtensionDetail detail = new UnnestExtensionDetail(arrayColName, recordType);
+        // [NESTED] The Calcite post-unnest width (Correlate row-type field count) is the single source of
+        // truth for where a physical __row_id__ lands after the reshape reorders it to the tail. Stamp it
+        // into the detail so the parent-dedup post-pass can reference __row_id__ at a known index without
+        // re-deriving the reshape's in-place-array-keeping layout from the proto (error-prone at depth).
+        int postUnnestWidth = correlate.getRowType().getFieldCount();
+        UnnestExtensionDetail detail = new UnnestExtensionDetail(arrayColName, recordType, postUnnestWidth);
         // isthmus's ExtensionSingle immutable has a MANDATORY builder attribute deriveRecordType
         // (the post-unnest output row type) — separate from the detail's own deriveRecordType(Rel).
         // Both carry the Calcite Correlate row type (originals + appended exploded struct fields).
