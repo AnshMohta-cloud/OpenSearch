@@ -249,7 +249,6 @@ public class FragmentConversionDriver {
             // requestsRowIds=true selects the indexed session context whose table provider COMPUTES
             // shard-global ids (global_base + rg.first_row + position) — same mechanism QTF uses.
             boolean requestsRowIds = tableScan.getRowType().getFieldNames().contains(OpenSearchLateMaterialization.ROW_ID_FIELD)
-                || org.opensearch.analytics.NestedPocOverride.get() != null
                 || containsUnnest(resolvedFragment);
             List<DelegatedExpression> delegated = delegationBytes.getResult();
             if (!delegated.isEmpty()) {

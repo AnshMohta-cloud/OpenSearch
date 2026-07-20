@@ -26,32 +26,20 @@ import org.opensearch.tasks.Task;
  * <p>{@code parentTask} is the front-end request task used to link the analytics query task for
  * cancellation propagation (see {@code DefaultPlanExecutor}). May be {@code null}.
  *
- * <p>[NESTED-POC] {@code n1Descriptor} describes a hand-authored N1-rewritten nested query (see
- * {@code N1PlanRegistry} / {@link N1Descriptor}). When non-null, the fragment convertor assembles
- * the Substrait plan by hand and skips isthmus — the POC stand-in for the customer-query -> N1
- * rewrite, needed because isthmus cannot emit relational UNNEST. May be {@code null} (normal path).
- * Carried on this context because it must cross the transport thread hop between the front-end and
- * {@code DefaultPlanExecutor.executeInternal}.
- *
  * @opensearch.internal
  */
 public record QueryRequestContext(
     ClusterState clusterState,
     SchemaPlus schema,
     String querySource,
-    Task parentTask,
-    N1Descriptor n1Descriptor
+    Task parentTask
 ) {
 
-    public QueryRequestContext(ClusterState clusterState, SchemaPlus schema, String querySource, Task parentTask) {
-        this(clusterState, schema, querySource, parentTask, null);
-    }
-
     public QueryRequestContext(ClusterState clusterState, SchemaPlus schema, String querySource) {
-        this(clusterState, schema, querySource, null, null);
+        this(clusterState, schema, querySource, null);
     }
 
     public QueryRequestContext(ClusterState clusterState, SchemaPlus schema) {
-        this(clusterState, schema, null, null, null);
+        this(clusterState, schema, null, null);
     }
 }

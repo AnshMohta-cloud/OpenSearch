@@ -274,15 +274,7 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         // Collapse multi-backend stages to a single chosen alternative before conversion
         // so the convertor runs once per stage and the wire request carries one PlanAlternative.
         PlanAlternativeSelector.selectAll(dag, capabilityRegistry, preferMetadataDriver);
-        // [NESTED-POC] Bridge the hand-authored N1 descriptor (if any) to the fragment convertor,
-        // which runs synchronously on this thread inside convertAll. Cleared immediately after so
-        // the value never leaks onto this pooled SEARCH thread. See NestedPocOverride.
-        org.opensearch.analytics.NestedPocOverride.set(queryCtx != null ? queryCtx.n1Descriptor() : null);
-        try {
-            FragmentConversionDriver.convertAll(dag, capabilityRegistry);
-        } finally {
-            org.opensearch.analytics.NestedPocOverride.clear();
-        }
+        FragmentConversionDriver.convertAll(dag, capabilityRegistry);
         final long planningTimeNanos = System.nanoTime() - planStartNanos;
         final long planningTimeMs = TimeUnit.NANOSECONDS.toMillis(planningTimeNanos);
         logger.debug("[DefaultPlanExecutor] QueryDAG:\n{}", dag);
@@ -352,20 +344,9 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
             listener
         );
 
-        // [NESTED-POC] For an N1 query the executed plan is the hand-built N1 Substrait plan whose
-        // output is the descriptor's projection (parent columns recovered via the semi-join back),
-        // NOT the base-scan RelNode we carried through the planner. Match the result-batch column
-        // order to what the plan actually returns, else orderedColumns fails. Empty projection =
-        // select * = all base-scan columns.
-        final List<String> outputColumnOrder;
-        if (queryCtx != null && queryCtx.n1Descriptor() != null && queryCtx.n1Descriptor().aggregate() != null) {
-            // Grouped aggregate emits [groupKey, measure]; ungrouped emits [measure]. See N1Aggregate.
-            outputColumnOrder = queryCtx.n1Descriptor().aggregate().outputColumns();
-        } else if (queryCtx != null && queryCtx.n1Descriptor() != null && !queryCtx.n1Descriptor().projection().isEmpty()) {
-            outputColumnOrder = queryCtx.n1Descriptor().projection();
-        } else {
-            outputColumnOrder = logicalFragment.getRowType().getFieldNames();
-        }
+        // Result-batch column order = the executed plan's actual output row type. On the generic nested
+        // path the UNNEST/reshape is reflected in the RelNode's row type, so this is authoritative.
+        final List<String> outputColumnOrder = logicalFragment.getRowType().getFieldNames();
         // No taskManager.unregister here: the framework (HandledTransportAction) unregisters the
         // task it created for doExecute once this listener settles. Unregistering it ourselves
         // would double-free a task we no longer own.

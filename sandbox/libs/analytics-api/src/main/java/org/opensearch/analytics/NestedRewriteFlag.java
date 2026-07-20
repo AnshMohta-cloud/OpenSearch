@@ -9,27 +9,19 @@
 package org.opensearch.analytics;
 
 /**
- * [NESTED] Feature flag selecting how nested-field queries are turned into a Substrait plan.
+ * [NESTED] Feature flag enabling the generic Calcite UNNEST-rewrite for nested-field queries.
  *
- * <p>There are two implementations of nested-query support in the tree while the generic path is
- * brought to production quality:
- * <ul>
- *   <li><b>generic (flag ON)</b> — the query is rewritten in Calcite ({@code ITEM(array,'f')} on an
- *       {@code ARRAY(ROW)} column ⇒ inject {@code Correlate + Uncollect} = UNNEST, rewrite the ref to
- *       the flattened column) and then serialized: isthmus emits filter/aggregate/project as usual and
- *       only the UNNEST node is injected as an {@code ExtensionSingleRel(unnest:...)}. No per-query
- *       code — works for arbitrary queries. This is the production direction.</li>
- *   <li><b>hardcoded (flag OFF, default)</b> — the proven POC path: a hand-authored {@link N1Descriptor}
- *       (looked up per query) is hand-assembled into the whole Substrait plan by
- *       {@code N1SubstraitBuilder}. Complete for the cases we authored (filter/agg/metric, depth 1-7)
- *       but not general. Kept as the safe default and as the fallback for query shapes the generic
- *       rewrite does not handle yet.</li>
- * </ul>
+ * <p>When enabled, a nested-field reference ({@code ITEM(array,'f')} on an {@code ARRAY(ROW)} column,
+ * as produced by PPL {@code expand}) is rewritten in Calcite to inject {@code Correlate + Uncollect}
+ * (= UNNEST) and the reference is repointed at the flattened column. isthmus then emits
+ * filter/aggregate/project as usual, and only the UNNEST node is carried as an
+ * {@code ExtensionSingleRel(unnest_reshape:...)}. No per-query code — works for arbitrary queries.
  *
- * <p>Controlled by the JVM system property {@value #PROPERTY} (default {@code false}). A single
- * boolean read — the "simple if condition" seam. Set with
- * {@code -Dopensearch.analytics.nested.generic_rewrite=true} (e.g. via the run task's jvm args) to
- * exercise the generic path without blocking the default/tested path.
+ * <p>This is the ONLY nested-query path: the former hand-authored POC path (a per-query descriptor
+ * hand-assembled into Substrait) has been removed. The flag is retained as a kill-switch: when it is
+ * OFF the rewrite does not fire and nested-field queries are not supported (they fail to plan), so it
+ * defaults to {@code true}. Set {@code -Dopensearch.analytics.nested.generic_rewrite=false} only to
+ * disable nested support entirely (e.g. to isolate a planner issue).
  *
  * <p>Read fresh each call (not cached) so it can be toggled per-run without rebuilding.
  *
@@ -37,13 +29,13 @@ package org.opensearch.analytics;
  */
 public final class NestedRewriteFlag {
 
-    /** System property that turns the generic Calcite-rewrite path on. */
+    /** System property controlling the generic Calcite UNNEST-rewrite path. Default {@code true}. */
     public static final String PROPERTY = "opensearch.analytics.nested.generic_rewrite";
 
     private NestedRewriteFlag() {}
 
-    /** True when the generic Calcite UNNEST-rewrite path should be used instead of the hardcoded POC path. */
+    /** True (default) when the generic Calcite UNNEST-rewrite path is enabled. */
     public static boolean genericRewriteEnabled() {
-        return Boolean.getBoolean(PROPERTY);
+        return Boolean.parseBoolean(System.getProperty(PROPERTY, "true"));
     }
 }

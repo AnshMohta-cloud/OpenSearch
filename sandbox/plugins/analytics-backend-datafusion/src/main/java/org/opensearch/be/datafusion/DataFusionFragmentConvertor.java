@@ -468,31 +468,11 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
 
     @Override
     public byte[] convertFragment(RelNode fragment) {
-        // [NESTED-POC] If a hand-authored N1 descriptor was supplied for this query (nested query
-        // whose UNNEST isthmus cannot emit), assemble the Substrait plan by hand and skip isthmus
-        // entirely. The descriptor is staged on a thread-local by DefaultPlanExecutor.executeInternal.
-        // Grep: NESTED-POC.
-        // [NESTED] Hand-built N1 path is used only when the generic Calcite-rewrite flag is OFF.
-        // When ON, nested queries are already rewritten to Correlate+Uncollect in the RelNode tree
-        // (OpenSearchNestedFieldRewriter) and flow through the normal isthmus emission below, with
-        // only the UNNEST node injected as an ExtensionSingleRel (see convertToSubstrait).
-        org.opensearch.analytics.N1Descriptor n1 = org.opensearch.analytics.NestedRewriteFlag.genericRewriteEnabled()
-            ? null
-            : org.opensearch.analytics.NestedPocOverride.get();
-        if (n1 != null) {
-            byte[] bytes = N1SubstraitBuilder.build(n1, SCHEMA_ONLY_TYPE_PROTO_CONVERTER);
-            LOGGER.info(
-                "[NESTED-POC] convertFragment: assembled hand-built N1 Substrait plan for index [{}] "
-                    + "(unnestPath {}, predicate {}, group by '{}', projection {}) = {} bytes, skipping isthmus",
-                n1.indexName(),
-                n1.unnestPath(),
-                n1.predicate(),
-                n1.groupByColumn(),
-                n1.projection(),
-                bytes.length
-            );
-            return bytes;
-        }
+        // [NESTED] Every fragment — including nested-field queries — flows through the standard isthmus
+        // emission. Nested queries were rewritten to Correlate+Uncollect in the RelNode tree
+        // (OpenSearchNestedFieldRewriter) and the UNNEST is carried as an ExtensionSingleRel by
+        // convertToSubstrait / the visit(Correlate) override. (The legacy hand-built N1SubstraitBuilder
+        // path was removed — the generic path is now the only one.)
         LOGGER.debug("Converting fragment [{}]", fragment.getClass().getSimpleName());
         RelNode rewritten = rewriteStageInputScans(fragment);
         return convertToSubstrait(rewritten);
@@ -626,10 +606,12 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
             protoPlan = NestedParentDedupRewriter.rewrite(protoPlan);
         }
         byte[] bytes = protoPlan.toByteArray();
-        // [NESTED-POC] Full readable Substrait plan shipped to the data node (isthmus path).
-        // The proto toString shows the Read/Filter/Aggregate/Project/Join rel tree + extensions.
-        // Grep: NESTED-POC. (This is the exact wire content the Rust DataFusion consumer receives.)
-        LOGGER.info("[NESTED-POC] Substrait plan ({} bytes) [isthmus path]:\n{}", bytes.length, protoPlan);
+        // [NESTED] Full readable Substrait plan shipped to the data node (isthmus path). The proto
+        // toString shows the Read/Filter/Aggregate/Project/Join rel tree + extensions. Guarded at DEBUG
+        // (and computed only when DEBUG is enabled) so it costs nothing on the default hot path.
+        if (LOGGER.isDebugEnabled()) {
+            LOGGER.debug("[NESTED] Substrait plan ({} bytes) [isthmus path]:\n{}", bytes.length, protoPlan);
+        }
         return bytes;
     }
 
@@ -906,6 +888,11 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
         // re-deriving the reshape's in-place-array-keeping layout from the proto (error-prone at depth).
         int postUnnestWidth = correlate.getRowType().getFieldCount();
         UnnestExtensionDetail detail = new UnnestExtensionDetail(arrayColName, recordType, postUnnestWidth);
+        // [NESTED] Intentional one-line INFO breadcrumb marking the GENERIC UNNEST emission (isthmus
+        // path). Cheap (no full-plan toString) and stable — it is the signal the differential harness
+        // greps to verify every nested query took the generic ExtensionSingleRel path, not the legacy
+        // hand-built one. Grep: unnest_reshape.
+        LOGGER.info("[NESTED] emitting generic unnest ExtensionSingleRel: unnest_reshape:{}|w={}", arrayColName, postUnnestWidth);
         // isthmus's ExtensionSingle immutable has a MANDATORY builder attribute deriveRecordType
         // (the post-unnest output row type) — separate from the detail's own deriveRecordType(Rel).
         // Both carry the Calcite Correlate row type (originals + appended exploded struct fields).

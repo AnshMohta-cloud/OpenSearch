@@ -36,7 +36,8 @@ import org.apache.logging.log4j.Logger;
  * physical parent-doc identity.
  *
  * <p>{@code __row_id__} is physical-only (never in the Calcite schema, so isthmus never emits it).
- * The mechanism, mirroring the proven {@link N1SubstraitBuilder} hardcoded path:
+ * The mechanism (the same group-by-{@code __row_id__} distinct-parent trick the former hand-built
+ * path used, now applied generically as a proto post-pass):
  * <ol>
  *   <li>Append {@code __row_id__} (i64) to the unnest read's {@code base_schema}. This both makes the
  *       physical scan materialise it (the {@code requestsRowIds} routing, tripped by the unnest,
@@ -67,22 +68,6 @@ final class NestedParentDedupRewriter {
     static final String ROW_ID = "__row_id__";
     private static final String UNNEST_RESHAPE_PREFIX = "unnest_reshape:";
 
-    /**
-     * [NESTED] Master switch for count parent-dedup. Currently OFF.
-     *
-     * <p>Count dedup (count() → distinct-parent count via an injected {@code group by __row_id__})
-     * requires the physical {@code __row_id__} to survive the REDUCE-side
-     * {@code derive_schema_from_partial_plan}, which re-lowers the producer fragment on an EMPTY
-     * {@code MemTable} (with combine-partial-final disabled). In that throwaway lowering the reshape
-     * output does not carry {@code __row_id__} to the tail the way the real producer scan does, so the
-     * injected {@code group by __row_id__@W} indexes out of bounds. This affects single- AND multi-level
-     * counts. Rather than ship a path that crashes count queries, the dedup is disabled until the derive
-     * path is made row-id-aware (candidate fix: have {@code derive_schema_from_partial_plan} use the
-     * emitter-stamped output schema instead of re-lowering the reshape, or preserve {@code __row_id__}
-     * in the synthetic MemTable + reshape). All machinery below is retained for that fix. Grep: NESTED count-dedup.
-     */
-    private static final boolean COUNT_DEDUP_ENABLED = true;
-
     private NestedParentDedupRewriter() {}
 
     /**
@@ -90,9 +75,6 @@ final class NestedParentDedupRewriter {
      * {@code count} nested shape; otherwise returns {@code plan} unchanged.
      */
     static Plan rewrite(Plan plan) {
-        if (COUNT_DEDUP_ENABLED == false) {
-            return plan; // dedup disabled — see COUNT_DEDUP_ENABLED (reduce-derivation row_id limitation)
-        }
         if (plan.getRelationsCount() != 1) {
             return plan; // multi-root plans are not the single-fragment nested shape we target
         }
@@ -151,8 +133,8 @@ final class NestedParentDedupRewriter {
      * with the combine-partial-final optimizer pass DISABLED. A {@code count(DISTINCT)} in that mode
      * stays a PARTIAL distinct-aggregate whose state is {@code List(Int64)} — mismatching the reduce's
      * scalar {@code i64 count()} input and failing at the exchange. A plain {@code count()} over rows
-     * already deduped by a group-by decomposes normally (partial-count + merge), exactly as the proven
-     * hardcoded {@link N1SubstraitBuilder} path does (group-by {@code __row_id__} then plain count).
+     * already deduped by a group-by decomposes normally (partial-count + merge), which is the proven
+     * group-by-{@code __row_id__}-then-plain-count shape.
      */
     private static Rel tryCountDedup(Rel aggRel) {
         AggregateRel agg = aggRel.getAggregate();
@@ -204,52 +186,6 @@ final class NestedParentDedupRewriter {
             }
         }
         return true;
-    }
-
-    /**
-     * Walks down from {@code rel} (through Project/Filter/Aggregate/Sort/Fetch) to the FIRST (topmost)
-     * {@code unnest_reshape} {@code ExtensionSingle} and returns the post-unnest width {@code W} the
-     * emitter stamped into its {@code type_url} as {@code "unnest_reshape:<path>|w=<N>"}. That width is
-     * the Calcite Correlate row-type field count = the index the physical {@code __row_id__} occupies
-     * after the reshape reorders it to the tail. Returns {@code null} if no marker (or no {@code |w=})
-     * is found. Only the OUTERMOST reshape matters — inner levels' widths are subsumed by it.
-     */
-    private static Integer outermostReshapeWidth(Rel rel) {
-        switch (rel.getRelTypeCase()) {
-            case EXTENSION_SINGLE: {
-                String typeUrl = rel.getExtensionSingle().getDetail().getTypeUrl();
-                if (typeUrl.startsWith(UNNEST_RESHAPE_PREFIX)) {
-                    return parseWidth(typeUrl);
-                }
-                return rel.getExtensionSingle().hasInput() ? outermostReshapeWidth(rel.getExtensionSingle().getInput()) : null;
-            }
-            case PROJECT:
-                return rel.getProject().hasInput() ? outermostReshapeWidth(rel.getProject().getInput()) : null;
-            case FILTER:
-                return rel.getFilter().hasInput() ? outermostReshapeWidth(rel.getFilter().getInput()) : null;
-            case AGGREGATE:
-                return rel.getAggregate().hasInput() ? outermostReshapeWidth(rel.getAggregate().getInput()) : null;
-            case SORT:
-                return rel.getSort().hasInput() ? outermostReshapeWidth(rel.getSort().getInput()) : null;
-            case FETCH:
-                return rel.getFetch().hasInput() ? outermostReshapeWidth(rel.getFetch().getInput()) : null;
-            default:
-                return null;
-        }
-    }
-
-    /** Counts the number of {@code unnest_reshape} ExtensionSingle levels in the chain beneath {@code rel}. */
-    private static int countReshapeLevels(Rel rel) {
-        int here = 0;
-        if (rel.getRelTypeCase() == Rel.RelTypeCase.EXTENSION_SINGLE
-            && rel.getExtensionSingle().getDetail().getTypeUrl().startsWith(UNNEST_RESHAPE_PREFIX)) {
-            here = 1;
-        }
-        int childMax = 0;
-        for (Rel child : inputsOf(rel)) {
-            childMax = Math.max(childMax, countReshapeLevels(child));
-        }
-        return here + childMax;
     }
 
     /** Parses the {@code |w=<N>} width suffix from an {@code unnest_reshape:<path>|w=<N>} type_url. */

@@ -134,11 +134,10 @@ public class PlannerImpl {
         logStage("After pushdownRules", modifiedRelNode);
         modifiedRelNode = decomposeAggregates(modifiedRelNode, listener);
         logStage("After decomposeAggregates", modifiedRelNode);
-        // [NESTED] Generic path (flag ON): rewrite ITEM-on-ARRAY(ROW) nested refs into a real
-        // Correlate+Uncollect (UNNEST) subtree BEFORE marking, so the marking rules only ever see
-        // plain column refs to the flattened struct fields (never the unsupported ITEM function).
-        // Flag OFF (default): no-op — the hand-authored N1Descriptor path in the DataFusion convertor
-        // handles nested queries instead, keeping the proven behaviour unchanged.
+        // [NESTED] Rewrite ITEM-on-ARRAY(ROW) nested refs into a real Correlate+Uncollect (UNNEST)
+        // subtree BEFORE marking, so the marking rules only ever see plain column refs to the flattened
+        // struct fields (never the unsupported ITEM function). Gated by the generic-rewrite kill-switch
+        // (default ON); when OFF the rewrite is skipped and nested-field queries are unsupported.
         if (org.opensearch.analytics.NestedRewriteFlag.genericRewriteEnabled()) {
             RelNode beforeNested = modifiedRelNode;
             modifiedRelNode = org.opensearch.analytics.planner.rules.OpenSearchNestedFieldRewriter.rewrite(modifiedRelNode);

@@ -30,7 +30,7 @@ use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
     from_substrait_plan_with_consumer, DefaultSubstraitConsumer, SubstraitConsumer,
 };
-use substrait::proto::{ExtensionSingleRel, Plan};
+use substrait::proto::{ExtensionLeafRel, ExtensionMultiRel, ExtensionSingleRel, Plan};
 
 /// type_url prefix marking an ExtensionSingleRel as "unnest the named column of my input".
 /// The column name follows the colon, e.g. "unnest:comments".
@@ -93,6 +93,19 @@ impl SubstraitConsumer for UnnestConsumer<'_> {
 
     fn get_outer_schema(&self, steps_out: usize) -> Option<Arc<DFSchema>> {
         self.inner.get_outer_schema(steps_out)
+    }
+
+    // Forward the OTHER extension-rel kinds to the stock consumer so this wrapper is a strict
+    // superset of DefaultSubstraitConsumer: only ExtensionSingle (our unnest marker) is special-cased;
+    // ExtensionLeaf/ExtensionMulti must still deserialize via the serializer registry exactly as the
+    // stock consumer does (the trait DEFAULTS error, so without these overrides the wrapper would
+    // regress any plan carrying a leaf/multi extension rel).
+    async fn consume_extension_leaf(&self, rel: &ExtensionLeafRel) -> datafusion::common::Result<LogicalPlan> {
+        self.inner.consume_extension_leaf(rel).await
+    }
+
+    async fn consume_extension_multi(&self, rel: &ExtensionMultiRel) -> datafusion::common::Result<LogicalPlan> {
+        self.inner.consume_extension_multi(rel).await
     }
 
     /// The one override: an ExtensionSingleRel whose detail type_url is "unnest:<column>" becomes
@@ -182,11 +195,6 @@ impl SubstraitConsumer for UnnestConsumer<'_> {
 /// not `products__u.variants`.
 fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusion::common::Result<LogicalPlan> {
     let mut builder = LogicalPlanBuilder::from(input_plan);
-    native_bridge_common::log_error!(
-        "[NESTED][diag] reshape INPUT: levels={:?} input schema = {:?}",
-        levels,
-        builder.schema().columns().iter().map(|c| c.flat_name()).collect::<Vec<_>>()
-    );
     for level in levels {
         // Alias for the duplicated array column: a name that cannot collide with a real column.
         let dup_alias = format!("{level}__u");
@@ -225,14 +233,6 @@ fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusio
             })
             .collect();
         builder = builder.project(renamed)?;
-
-        // [NESTED][diag] visible via the FFM bridge (log::info is dropped — no `log` provider in the
-        // native lib). Shows the schema after each level so a dropped nested-list child is observable.
-        native_bridge_common::log_error!(
-            "[NESTED][diag] after level '{}': {:?}",
-            level,
-            builder.schema().columns().iter().map(|c| c.flat_name()).collect::<Vec<_>>()
-        );
     }
 
     // [NESTED] Parent-dedup invariant: if the scan carries __row_id__ (the parent doc identity,
@@ -253,11 +253,6 @@ fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusio
         builder = builder.project(reordered)?;
     }
 
-    native_bridge_common::log_error!(
-        "[NESTED][diag] reshape done: levels={:?} output = {:?}",
-        levels,
-        builder.schema().columns().iter().map(|c| c.flat_name()).collect::<Vec<_>>()
-    );
     builder.build()
 }
 
