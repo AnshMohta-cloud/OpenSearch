@@ -222,14 +222,29 @@ fn build_reshaping_unnest(input_plan: LogicalPlan, levels: &[&str]) -> datafusio
         // output matches Calcite's Correlate row type by name (originals kept verbatim). Without this,
         // a following level (or isthmus's by-name refs) can't find e.g. `variants` — it'd be
         // `products__u.variants`.
+        //
+        // COLLISION GUARD: only bare-rename a child whose bare name does NOT already exist among the
+        // ORIGINAL (pre-explosion) columns. A nested leaf that shares a parent field's name (e.g.
+        // employees has parent `name` AND skills.name) would otherwise produce an ambiguous unqualified
+        // `name` alongside the qualified `employees.name`, which DataFusion rejects for the WHOLE query.
+        // Such a colliding child keeps its `<dup_alias>.field` name (still positionally correct — the
+        // final output is relabeled by position, and only ARRAY children need a bare name to be
+        // re-expanded by a following level; a colliding scalar leaf never is). Grep: NESTED name-collision.
         let prefix = format!("{dup_alias}.");
+        let original_names: std::collections::HashSet<String> = builder
+            .schema()
+            .fields()
+            .iter()
+            .filter(|f| !f.name().starts_with(&prefix))
+            .map(|f| f.name().clone())
+            .collect();
         let renamed: Vec<Expr> = builder
             .schema()
             .fields()
             .iter()
             .map(|f| match f.name().strip_prefix(&prefix) {
-                Some(bare) => col(Column::from_name(f.name())).alias(bare.to_string()),
-                None => col(Column::from_name(f.name())),
+                Some(bare) if !original_names.contains(bare) => col(Column::from_name(f.name())).alias(bare.to_string()),
+                _ => col(Column::from_name(f.name())),
             })
             .collect();
         builder = builder.project(renamed)?;

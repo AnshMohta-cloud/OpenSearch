@@ -98,11 +98,16 @@ final class NestedParentDedupRewriter {
         return plan.toBuilder().setRelations(0, pr.toBuilder().setRoot(newRoot).build()).build();
     }
 
-    /** Dispatch on the top rel shape. Only {@code Aggregate(count)} (optionally under Fetch/Sort). */
+    /**
+     * Dispatch on the top rel shape. {@code Aggregate(count)} → count-dedup; {@code Project} of
+     * parent-only columns → docs-dedup (distinct parents); recurse through {@code Fetch}/{@code Sort}.
+     */
     private static Rel tryDedup(Rel top) {
         switch (top.getRelTypeCase()) {
             case AGGREGATE:
                 return tryCountDedup(top);
+            case PROJECT:
+                return tryDocsDedup(top);
             case FETCH: {
                 if (top.getFetch().hasInput() == false) return top;
                 Rel inner = tryDedup(top.getFetch().getInput());
@@ -120,6 +125,71 @@ final class NestedParentDedupRewriter {
             default:
                 return top;
         }
+    }
+
+    /**
+     * docs shape: a top {@code Project} of PARENT-only columns over a nested-filter unnest chain
+     * (e.g. {@code where comments.score>4 | fields title}). PPL {@code expand} flattens, so the raw
+     * result has one row per matching child; vanilla nested returns each matching PARENT once. Restore
+     * that by deduping on parent identity ({@code __row_id__}) before the projection.
+     *
+     * <p>Mechanism: thread {@code __row_id__} up the projection's input chain (see {@link #threadRowId}),
+     * then insert an {@code Aggregate} grouping by {@code [__row_id__, ...projected-parent-cols]} — one
+     * row per distinct parent (the parent columns are functionally dependent on {@code __row_id__}, so
+     * grouping by them too is harmless and keeps them in the aggregate output) — and finally re-project
+     * the parent columns in their original order (dropping {@code __row_id__}).
+     *
+     * <p>Applies ONLY when every projected expression is a bare parent-column field ref that resolves to
+     * a column at-or-before the pre-row_id width (i.e. an ORIGINAL column, never an exploded child). A
+     * projection that includes a child field ({@code fields title, comments.author}) is a genuine
+     * per-child flatten and must NOT be deduped — left unchanged.
+     */
+    private static Rel tryDocsDedup(Rel projRel) {
+        ProjectRel p = projRel.getProject();
+        if (p.hasInput() == false) return projRel;
+        // The projected outputs must be exactly bare field refs (isthmus `fields` shape with an emit).
+        if (p.hasCommon() == false || p.getCommon().hasEmit() == false) return projRel;
+
+        // Only dedup a PARENT-ONLY projection. A projection that reads an exploded-child column
+        // (`fields title, comments.author`) is a genuine per-child flatten — must NOT be deduped. The
+        // parent (scan) columns occupy indices [0, scanWidth) of the reshape input; exploded children are
+        // appended at scanWidth..W-1. So: dedup iff every projected column index is < scanWidth.
+        Integer scanWidth = scanColumnCount(p.getInput());
+        if (scanWidth == null) return projRel;
+        for (Expression e : p.getExpressionsList()) {
+            Integer idx = fieldIndexOf(e);
+            if (idx == null || idx >= scanWidth) return projRel;   // non-trivial or child ref → leave alone
+        }
+
+        RowIdChain chain = threadRowId(p.getInput());
+        if (chain == null) return projRel;   // no reshape beneath → not our shape
+        int w = chain.rowIdIndex;             // __row_id__ index in chain.rel's output (its tail)
+
+        java.util.List<Integer> projCols = new java.util.ArrayList<>();
+        for (Expression e : p.getExpressionsList()) {
+            int idx = fieldIndexOf(e);
+            projCols.add(idx >= w ? idx + 1 : idx);          // shift for the inserted __row_id__
+        }
+
+        // group by [projected cols..., __row_id__] over the row_id-carrying chain.
+        AggregateRel.Grouping.Builder grouping = AggregateRel.Grouping.newBuilder();
+        for (int c : projCols) grouping.addGroupingExpressions(fieldRef(c));
+        grouping.addGroupingExpressions(fieldRef(w));
+        AggregateRel dedupAgg = AggregateRel.newBuilder().setInput(chain.rel).addGroupings(grouping.build()).build();
+        Rel dedupAggRel = Rel.newBuilder().setAggregate(dedupAgg).build();
+
+        // Substrait Aggregate output = grouping columns in declared order = [projCol0..projColN-1, __row_id__].
+        // Re-project the parent columns (positions 0..N-1), dropping the trailing __row_id__, preserving order.
+        ProjectRel.Builder outProj = ProjectRel.newBuilder().setInput(dedupAggRel);
+        RelCommon.Emit.Builder emit = RelCommon.Emit.newBuilder();
+        int groupWidth = projCols.size() + 1;   // grouping cols emitted first, then (empty) measures
+        for (int i = 0; i < projCols.size(); i++) {
+            outProj.addExpressions(fieldRef(i));
+            emit.addOutputMapping(groupWidth + i);   // project appends its exprs after the agg's group cols
+        }
+        outProj.setCommon(RelCommon.newBuilder().setEmit(emit.build()).build());
+        LOGGER.info("[NESTED] parent-dedup(docs): group-by [{} parent cols + __row_id__@{}] then re-project", projCols.size(), w);
+        return Rel.newBuilder().setProject(outProj.build()).build();
     }
 
     /**
@@ -186,6 +256,31 @@ final class NestedParentDedupRewriter {
             }
         }
         return true;
+    }
+
+    /**
+     * The number of PARENT (scan) columns feeding the unnest chain = the top-level field count of the
+     * deepest {@code unnest_reshape} read's {@code base_schema}. Parent columns occupy indices
+     * {@code [0, scanWidth)} of the reshape input; exploded child columns are appended after. Returns
+     * {@code null} if no reshape read is found beneath {@code rel}.
+     */
+    private static Integer scanColumnCount(Rel rel) {
+        switch (rel.getRelTypeCase()) {
+            case FILTER:
+                return rel.getFilter().hasInput() ? scanColumnCount(rel.getFilter().getInput()) : null;
+            case PROJECT:
+                return rel.getProject().hasInput() ? scanColumnCount(rel.getProject().getInput()) : null;
+            case EXTENSION_SINGLE: {
+                if (rel.getExtensionSingle().hasInput() == false) return null;
+                Rel input = rel.getExtensionSingle().getInput();
+                if (input.getRelTypeCase() == Rel.RelTypeCase.READ) {
+                    return input.getRead().hasBaseSchema() ? input.getRead().getBaseSchema().getStruct().getTypesCount() : null;
+                }
+                return scanColumnCount(input);   // deeper reshape/read below
+            }
+            default:
+                return null;
+        }
     }
 
     /** Parses the {@code |w=<N>} width suffix from an {@code unnest_reshape:<path>|w=<N>} type_url. */
