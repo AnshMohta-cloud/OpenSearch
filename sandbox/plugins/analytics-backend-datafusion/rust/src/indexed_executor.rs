@@ -942,6 +942,7 @@ async unsafe fn execute_indexed_with_context_inner(
     }
 
     let emit_row_ids = requests_row_ids;
+    // marker-above-unnest / mixed-predicate delegation shapes. Grep: NESTED lucene-delegation-above-unnest.
     let filter_expr = extract_filter_expr(&logical_plan);
     let extraction = match filter_expr {
         None => None,
@@ -1324,7 +1325,13 @@ async unsafe fn execute_indexed_with_context_inner(
     ctx.register_table(&register_name, provider)?;
 
     let logical_plan = from_substrait_plan(&ctx.state(), &plan).await?;
-    log_debug!("DataFusion logical plan:\n{}", logical_plan.display_indent());
+    // [NESTED] Push any column-free delegated-predicate marker that sits in a Filter above the UNNEST
+    // down to just above the base scan, so the IndexedTableProvider claims it (via
+    // supports_filters_pushdown) and DataFusion drops that FilterExec — otherwise the marker's UDF body
+    // errors by design when a keyword-`=` on a PARENT field is delegated on a nested (expand) query.
+    // No-op for plans without a marker-above-unnest. Grep: NESTED lucene-delegation-above-unnest.
+    let logical_plan = crate::indexed_table::substrait_to_tree::push_delegated_marker_below_unnest(logical_plan)?;
+    log_debug!("[NESTED] indexed exec logical plan after marker-pushdown:\n{}", logical_plan.display_indent());
     let dataframe = ctx.execute_logical_plan(logical_plan).await?;
     let physical_plan = dataframe.create_physical_plan().await?;
     // Retag bit-compatible Int↔UInt output mismatches to match the substrait-declared

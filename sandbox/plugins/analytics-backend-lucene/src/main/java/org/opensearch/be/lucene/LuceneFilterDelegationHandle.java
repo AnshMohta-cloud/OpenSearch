@@ -15,6 +15,7 @@ import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
@@ -24,6 +25,7 @@ import org.apache.lucene.search.Weight;
 import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.analytics.spi.DelegatedExpression;
 import org.opensearch.analytics.spi.FilterDelegationHandle;
+import org.opensearch.be.lucene.index.LuceneDocumentInput;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -108,6 +110,17 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                 // has no doc_values/norms (they live in the parquet primary), so a FieldExistsQuery
                 // built from an _exists_ clause (PPL `search field!=value`) would throw at rewrite().
                 Query query = LuceneQueryConversionUtils.rewriteFieldExistsForSecondary(queryBuilder.toQuery(context));
+                // [NESTED] Trace the compiled delegated query. queryBuilder type tells us whether a nested
+                // predicate was wrapped as a NestedQueryBuilder (→ ToParentBlockJoinQuery, returns parents)
+                // or shipped as a flat term/range (returns child docs — the nested-delegation bug).
+                // Grep: NESTED lucene-delegation.
+                LOGGER.info(
+                    "[NESTED] compileQueries annotationId={} builder={} → luceneQuery={} ({})",
+                    expr.getAnnotationId(),
+                    queryBuilder.getClass().getSimpleName(),
+                    query.getClass().getSimpleName(),
+                    query
+                );
                 queries.put(expr.getAnnotationId(), query);
             } catch (IOException exception) {
                 throw new IllegalStateException(
@@ -170,30 +183,53 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             return -1;
         }
 
-        int leafMaxDoc = leaf.reader().maxDoc();
-        assert minDoc >= 0 && minDoc <= maxDoc && maxDoc <= leafMaxDoc : "createCollector(providerKey="
+        // Build the docId↔logical-row translator for this leaf. On a NESTED segment a logical document
+        // is a block of N+1 Lucene docs (children first, parent last), so Lucene docIds do NOT equal
+        // Parquet logical rows; the translator maps between the two spaces via the parent __row_id__
+        // doc-values. On a non-nested segment it is a pass-through (docId == row). See RowIdTranslator.
+        RowIdTranslator translator;
+        try {
+            translator = RowIdTranslator.forLeaf(leaf);
+        } catch (IOException exception) {
+            LOGGER.error(
+                "createCollector: failed building row-id translator for segment=" + segName + " (writerGeneration=" + writerGeneration + ")",
+                exception
+            );
+            return -1;
+        }
+
+        // [minDoc,maxDoc) is a LOGICAL-ROW window (a Parquet row-group slice), NOT a Lucene docId window
+        // (see indexed_executor stream.rs: min_doc = rg.first_row). Validate it against the logical-row
+        // count (== parent count on a nested leaf, == leaf.maxDoc() on a non-nested leaf).
+        int logicalRowCount = translator.logicalRowCount();
+        assert minDoc >= 0 && minDoc <= maxDoc && maxDoc <= logicalRowCount : "createCollector(providerKey="
             + providerKey
             + ", writerGeneration="
             + writerGeneration
             + " -> segment="
             + segName
-            + "): partition ["
+            + "): logical-row window ["
             + minDoc
             + ","
             + maxDoc
-            + ") exceeds leaf maxDoc="
-            + leafMaxDoc;
+            + ") exceeds logical-row count="
+            + logicalRowCount;
 
         try {
             Scorer scorer = weight.scorer(leaf);
             int collectorKey = nextCollectorKey.getAndIncrement();
-            scorersByCollectorKey.put(collectorKey, new ScorerHandle(scorer, minDoc, maxDoc));
-            LOGGER.debug(
-                "[scf] createCollector providerKey={} writerGeneration={} range=[{},{}) → collectorKey={}",
+            scorersByCollectorKey.put(collectorKey, new ScorerHandle(scorer, minDoc, maxDoc, translator));
+            // [NESTED] createCollector trace: rowWindow is a Parquet row-group slice (logical-row space);
+            // nested=true means the docId→row translation is active for this leaf. Grep: NESTED lucene-delegation.
+            LOGGER.info(
+                "[NESTED] createCollector providerKey={} writerGeneration={} rowWindow=[{},{}) nested={} logicalRows={} scorerNull={} → collectorKey={}",
                 providerKey,
                 writerGeneration,
                 minDoc,
                 maxDoc,
+                translator.isNested(),
+                logicalRowCount,
+                scorer == null,
                 collectorKey
             );
             return collectorKey;
@@ -220,29 +256,74 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         if (maxDoc <= minDoc) {
             return 0;
         }
-        int span = maxDoc - minDoc;
+        // [minDoc,maxDoc) is a LOGICAL-ROW window (a Parquet row-group slice). The returned bitset is
+        // indexed by logical-row offset (row - minDoc), which is the coordinate space the Rust indexed
+        // scan turns into a Parquet RowSelection. `span` is therefore a count of logical rows, correct
+        // for both nested and non-nested leaves.
+        int rowMin = minDoc;
+        int rowMax = maxDoc;
+        int span = rowMax - rowMin;
         FixedBitSet bits = new FixedBitSet(span);
 
         if (handle.scorer != null) {
-            int scanFrom = Math.max(minDoc, handle.partitionMinDoc);
-            int scanTo = Math.min(maxDoc, handle.partitionMaxDoc);
+            // Clamp the requested row window to the collector's partition, then translate it to the
+            // Lucene docId range to scan. On a non-nested leaf docId == row so this is identity; on a
+            // nested leaf the parent docs for rows [scanRowFrom,scanRowTo) live in a contiguous docId
+            // sub-range resolved by binary search over the (row-id sorted) parent docs.
+            int scanRowFrom = Math.max(rowMin, handle.partitionRowMin);
+            int scanRowTo = Math.min(rowMax, handle.partitionRowMax);
 
-            if (scanFrom < scanTo) {
+            if (scanRowFrom < scanRowTo) {
+                RowIdTranslator translator = handle.translator;
+                int docFrom = translator.firstDocIdForRow(scanRowFrom);
+                int docTo = translator.docIdScanBoundForRow(scanRowTo);
+                // [NESTED] Trace the row-window → docId-range translation. On a flat leaf docFrom/docTo
+                // equal the row bounds; on a nested leaf they span the block docId range. Any matched
+                // docId with no logical row (skippedNoRow) points at a bug in the delegated query shape.
+                int matchedDocs = 0;
+                int skippedNoRow = 0;
+                int skippedOutOfWindow = 0;
                 try {
                     DocIdSetIterator iterator = handle.scorer.iterator();
                     int docId = handle.currentDoc;
                     if (docId != DocIdSetIterator.NO_MORE_DOCS) {
-                        if (docId < scanFrom) {
-                            docId = iterator.advance(scanFrom);
+                        if (docId < docFrom) {
+                            docId = iterator.advance(docFrom);
                         }
-                        while (docId != DocIdSetIterator.NO_MORE_DOCS && docId < scanTo) {
-                            bits.set(docId - minDoc);
+                        while (docId != DocIdSetIterator.NO_MORE_DOCS && docId < docTo) {
+                            // Translate the matched Lucene docId to its logical row. A nested leaf's
+                            // block-join query returns PARENT docs, each of which carries __row_id__;
+                            // NO_ROW (-1) means the match had no logical row (e.g. a stray child doc on
+                            // a mis-shaped query) and is skipped rather than corrupting the bitset.
+                            matchedDocs++;
+                            long row = translator.rowForDocId(docId);
+                            if (row == RowIdTranslator.NO_ROW) {
+                                skippedNoRow++;
+                            } else if (row >= rowMin && row < rowMax) {
+                                bits.set((int) (row - rowMin));
+                            } else {
+                                skippedOutOfWindow++;
+                            }
                             docId = iterator.nextDoc();
                         }
                         handle.currentDoc = docId;
                     }
+                    LOGGER.info(
+                        "[NESTED] collectDocs collectorKey={} rowWindow=[{},{}) nested={} docScan=[{},{}) matchedDocs={} "
+                            + "skippedNoRow={} skippedOutOfWindow={} → cardinality={}",
+                        collectorKey,
+                        rowMin,
+                        rowMax,
+                        translator.isNested(),
+                        docFrom,
+                        docTo,
+                        matchedDocs,
+                        skippedNoRow,
+                        skippedOutOfWindow,
+                        bits.cardinality()
+                    );
                 } catch (IOException exception) {
-                    LOGGER.warn("IOException during collectDocs, returning partial bitset", exception);
+                    LOGGER.warn("[NESTED] IOException during collectDocs, returning partial bitset", exception);
                 }
             }
         }
@@ -250,16 +331,6 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         long[] words = bits.getBits();
         int wordCount = (span + 63) >>> 6;
         MemorySegment.copy(words, 0, out, ValueLayout.JAVA_LONG, 0, wordCount);
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug(
-                "[scf] collectDocs collectorKey={} range=[{},{}) → cardinality={} words={}",
-                collectorKey,
-                minDoc,
-                maxDoc,
-                bits.cardinality(),
-                wordCount
-            );
-        }
         return wordCount;
     }
 
@@ -289,14 +360,207 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
 
     private static final class ScorerHandle {
         final Scorer scorer;
-        final int partitionMinDoc;
-        final int partitionMaxDoc;
+        /** Partition bounds in LOGICAL-ROW space (Parquet row-group slice), inclusive-exclusive. */
+        final int partitionRowMin;
+        final int partitionRowMax;
+        /** docId↔row translator for the collector's leaf (pass-through on a non-nested leaf). */
+        final RowIdTranslator translator;
+        /** Forward cursor in Lucene docId space, monotonic across successive collectDocs calls. */
         int currentDoc = -1;
 
-        ScorerHandle(Scorer scorer, int partitionMinDoc, int partitionMaxDoc) {
+        ScorerHandle(Scorer scorer, int partitionRowMin, int partitionRowMax, RowIdTranslator translator) {
             this.scorer = scorer;
-            this.partitionMinDoc = partitionMinDoc;
-            this.partitionMaxDoc = partitionMaxDoc;
+            this.partitionRowMin = partitionRowMin;
+            this.partitionRowMax = partitionRowMax;
+            this.translator = translator;
+        }
+    }
+
+    /**
+     * Translates between Lucene docId space and Parquet logical-row space for one leaf.
+     *
+     * <p><b>Why this exists.</b> Under OpenSearch {@code nested} mapping a single logical document is
+     * indexed as a contiguous block of N+1 Lucene docs (N children, then the parent — see
+     * {@link LuceneDocumentInput}), while the Parquet primary stores exactly one row per logical
+     * document. So on a nested segment {@code luceneDocId != parquetRow}. The delegated-filter contract
+     * is expressed in logical-row space (the {@code [minDoc,maxDoc)} window is a Parquet row-group
+     * slice, and the returned bitset indexes logical rows), so a match found in Lucene docId space must
+     * be translated back to its logical row before it can restrict the Parquet scan.
+     *
+     * <p><b>The key.</b> Only parent docs carry the {@code __row_id__} {@link org.apache.lucene.index.NumericDocValues}
+     * (set in {@link LuceneDocumentInput#setRowId}); it equals the Parquet logical row. Children have no
+     * {@code __row_id__}. The segment is index-sorted by {@code __row_id__}, so the parent docs occur in
+     * ascending {@code __row_id__} (== ascending docId) order — which makes the row↔docId maps a simple
+     * ordered scan plus binary search.
+     *
+     * <p><b>Non-nested leaves.</b> When the leaf has no parent field, every doc is its own logical row
+     * and {@code docId == row}; the translator is a zero-overhead pass-through, so the non-nested
+     * delegation path is byte-for-byte unchanged.
+     */
+    static final class RowIdTranslator {
+        static final long NO_ROW = -1L;
+
+        /** True when the leaf is a nested segment (has a Lucene parent field). */
+        private final boolean nested;
+        /** Number of logical rows = parent count (nested) or leaf.maxDoc() (non-nested). */
+        private final int logicalRowCount;
+        /**
+         * Nested only: parent docIds in ascending order (index i is the parent whose ordinal is i), and
+         * the parallel {@code __row_id__} value for each. {@code parentDocIds[i]} ↔ {@code rowIds[i]}.
+         * Null on a non-nested (pass-through) leaf.
+         */
+        private final int[] parentDocIds;
+        private final long[] rowIds;
+
+        private RowIdTranslator(boolean nested, int logicalRowCount, int[] parentDocIds, long[] rowIds) {
+            this.nested = nested;
+            this.logicalRowCount = logicalRowCount;
+            this.parentDocIds = parentDocIds;
+            this.rowIds = rowIds;
+        }
+
+        /**
+         * Builds the translator for {@code leaf}. Detects nested via {@link org.apache.lucene.index.FieldInfos#getParentField()}
+         * (set to {@code __nested_parent} by the writer for nested indices). On a nested leaf, materializes
+         * the parent docId → {@code __row_id__} correspondence once by scanning the {@code __row_id__}
+         * doc-values (present only on parents).
+         */
+        static RowIdTranslator forLeaf(LeafReaderContext leafContext) throws IOException {
+            LeafReader reader = leafContext.reader();
+            int maxDoc = reader.maxDoc();
+            String parentField = reader.getFieldInfos().getParentField();
+            // __row_id__ is written as a SortedNumericDocValuesField (see LuceneDocumentInput.setRowId),
+            // so it MUST be read via getSortedNumericDocValues — getNumericDocValues returns null for it.
+            SortedNumericDocValues rowIdDV = reader.getSortedNumericDocValues(LuceneDocumentInput.ROW_ID_FIELD);
+
+            // Non-nested segment (no parent field, or no __row_id__ doc-values): pass-through, docId==row.
+            if (parentField == null || rowIdDV == null) {
+                // [NESTED] Trace which leaves are treated as flat (docId==row). On a nested index a null
+                // parentField here is the smoking gun that the block-join parent field isn't visible to
+                // the delegation reader. Grep: NESTED lucene-delegation.
+                LOGGER.info(
+                    "[NESTED] RowIdTranslator.forLeaf: FLAT leaf (docId==row) maxDoc={} parentField={} hasRowIdDV={}",
+                    maxDoc,
+                    parentField,
+                    rowIdDV != null
+                );
+                return new RowIdTranslator(false, maxDoc, null, null);
+            }
+
+            // Nested segment: collect (parentDocId, rowId) pairs in docId order. __row_id__ exists only on
+            // parents, so iterating the doc-values naturally visits parents in ascending docId order —
+            // and, because the segment is index-sorted by __row_id__, in ascending rowId order too.
+            int[] docIds = new int[maxDoc];
+            long[] rows = new long[maxDoc];
+            int n = 0;
+            for (int docId = rowIdDV.nextDoc(); docId != DocIdSetIterator.NO_MORE_DOCS; docId = rowIdDV.nextDoc()) {
+                docIds[n] = docId;
+                // Each parent carries exactly one __row_id__ value (docCount()==1); nextValue() reads it.
+                rows[n] = rowIdDV.nextValue();
+                n++;
+            }
+            // [NESTED] Trace the block layout the delegation reader sees: maxDoc (parents+children),
+            // parent count (== logical rows == Parquet rows), and the parent docId→row_id mapping. This is
+            // the correspondence that makes a Lucene block-join match restrict the right Parquet row.
+            LOGGER.info(
+                "[NESTED] RowIdTranslator.forLeaf: NESTED leaf parentField={} maxDoc={} parentCount={} firstParents={} firstRowIds={}",
+                parentField,
+                maxDoc,
+                n,
+                java.util.Arrays.toString(java.util.Arrays.copyOf(docIds, Math.min(n, 8))),
+                java.util.Arrays.toString(java.util.Arrays.copyOf(rows, Math.min(n, 8)))
+            );
+            if (n == docIds.length) {
+                return new RowIdTranslator(true, n, docIds, rows);
+            }
+            int[] trimmedDocIds = new int[n];
+            long[] trimmedRows = new long[n];
+            System.arraycopy(docIds, 0, trimmedDocIds, 0, n);
+            System.arraycopy(rows, 0, trimmedRows, 0, n);
+            return new RowIdTranslator(true, n, trimmedDocIds, trimmedRows);
+        }
+
+        boolean isNested() {
+            return nested;
+        }
+
+        int logicalRowCount() {
+            return logicalRowCount;
+        }
+
+        /**
+         * The logical row for a matched docId. Non-nested: identity. Nested: the docId must be a parent
+         * (block-join queries return parents); returns its {@code __row_id__}, or {@link #NO_ROW} if the
+         * docId is not a parent (defensive — a correctly block-joined query never yields a child).
+         */
+        long rowForDocId(int docId) {
+            if (nested == false) {
+                return docId;
+            }
+            int idx = java.util.Arrays.binarySearch(parentDocIds, docId);
+            return idx >= 0 ? rowIds[idx] : NO_ROW;
+        }
+
+        /**
+         * The first Lucene docId to start scanning from to cover logical row {@code row} (inclusive).
+         * Non-nested: {@code row}. Nested: the docId of the block that owns {@code row} starts just after
+         * the previous parent (children precede their parent), so scanning from the previous parent's
+         * docId+1 (or 0) covers this row's children and parent.
+         */
+        int firstDocIdForRow(int row) {
+            if (nested == false) {
+                return row;
+            }
+            int idx = rowOrdinalIndex(row);
+            if (idx >= 0) {
+                // `row` is a parent at ordinal idx; its block starts just after the previous parent.
+                return blockStart(idx);
+            }
+            // `row` isn't an exact parent rowId (defensive — rows are dense in practice): floor to the
+            // nearest parent ≤ row and start just after it; if none, start at docId 0.
+            int floor = rowOrdinalFloorIndex(row);
+            return floor < 0 ? 0 : parentDocIds[floor] + 1;
+        }
+
+        /**
+         * The exclusive Lucene docId bound to stop scanning at when covering logical rows up to
+         * {@code rowExclusive}. Non-nested: {@code rowExclusive}. Nested: one past the parent docId of
+         * the last row in range (a block ends at its parent, the highest docId in the block).
+         */
+        int docIdScanBoundForRow(int rowExclusive) {
+            if (nested == false) {
+                return rowExclusive;
+            }
+            if (rowExclusive <= 0) {
+                return 0;
+            }
+            // Last logical row in range is rowExclusive-1; its parent docId is the block's max docId.
+            int idx = rowOrdinalIndex(rowExclusive - 1);
+            if (idx < 0) {
+                // rowExclusive-1 beyond the last parent → scan to end of leaf.
+                return parentDocIds.length == 0 ? 0 : parentDocIds[parentDocIds.length - 1] + 1;
+            }
+            return parentDocIds[idx] + 1;
+        }
+
+        /** docId where the block of the parent at ordinal {@code idx} begins (just after the previous parent). */
+        private int blockStart(int idx) {
+            return idx == 0 ? 0 : parentDocIds[idx - 1] + 1;
+        }
+
+        /** The parent-array index whose rowId equals {@code row}, or -1. rowIds are ascending. */
+        private int rowOrdinalIndex(int row) {
+            return java.util.Arrays.binarySearch(rowIds, row);
+        }
+
+        /** The greatest parent-array index whose rowId is ≤ {@code row}, or -1 if row precedes all. */
+        private int rowOrdinalFloorIndex(int row) {
+            int idx = java.util.Arrays.binarySearch(rowIds, row);
+            if (idx >= 0) {
+                return idx;
+            }
+            // insertion point (-idx-1) is the first rowId > row; floor is one before it.
+            return (-idx - 1) - 1;
         }
     }
 }

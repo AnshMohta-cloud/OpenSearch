@@ -21,9 +21,16 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.FieldExistsQuery;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.Query;
 import org.opensearch.analytics.backend.EngineResultStream;
 import org.opensearch.analytics.backend.SearchExecEngine;
 import org.opensearch.analytics.backend.ShardScanExecutionContext;
+import org.opensearch.index.engine.dataformat.DocumentInput;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -68,11 +75,19 @@ final class LuceneSearchExecEngine implements SearchExecEngine<ShardScanExecutio
 
     @Override
     public EngineResultStream execute(ShardScanExecutionContext context) throws IOException {
-        long count = state.searcher().count(state.filterQuery());
-        LOGGER.debug(
-            "[lucene-count] shardId={} query={} count={} columns={}",
+        // [NESTED] count(*) must return LOGICAL-document count (== Parquet rows), not raw Lucene doc
+        // count. On a nested index a logical doc is a block of N+1 Lucene docs, so a plain
+        // count(MatchAll) over-counts by the children. Restrict the count to PARENT docs by AND-ing the
+        // filter with a parents filter (FieldExistsQuery on the block-join parent field). On a non-nested
+        // index there is no parent field, so the query is used unchanged and behaviour is identical.
+        // Grep: NESTED count-fastpath.
+        Query countQuery = parentScopedCountQuery(state.searcher(), state.filterQuery());
+        long count = state.searcher().count(countQuery);
+        LOGGER.info(
+            "[NESTED] lucene-count shardId={} originalQuery={} countQuery={} count={} columns={}",
             context.getShardId(),
             state.filterQuery(),
+            countQuery,
             count,
             state.outputColumnNames()
         );
@@ -95,6 +110,34 @@ final class LuceneSearchExecEngine implements SearchExecEngine<ShardScanExecutio
                 }
             }
         }
+    }
+
+    /**
+     * Returns a count query scoped to PARENT (logical) documents when the index uses nested block-join
+     * storage, else the original query unchanged.
+     *
+     * <p>A nested index stores each logical document as a block of N+1 Lucene docs (N children + parent),
+     * so raw {@code count(query)} over-counts by the children. Only parents carry the {@code __row_id__}
+     * doc-value, so {@code query AND FieldExists(__row_id__)} counts exactly the logical documents — which
+     * equals the Parquet primary's row count. We detect "nested index" via the Lucene parent field
+     * ({@code FieldInfos.getParentField()}, set to {@code __nested_parent} by the writer); when absent the
+     * index is flat and the original query is returned untouched (zero behaviour change for non-nested).
+     */
+    private static Query parentScopedCountQuery(IndexSearcher searcher, Query filterQuery) {
+        boolean nested = searcher.getIndexReader()
+            .leaves()
+            .stream()
+            .anyMatch(leaf -> leaf.reader().getFieldInfos().getParentField() != null);
+        if (nested == false) {
+            return filterQuery;
+        }
+        Query parents = new FieldExistsQuery(DocumentInput.ROW_ID_FIELD);
+        if (filterQuery instanceof MatchAllDocsQuery) {
+            return parents;
+        }
+        return new BooleanQuery.Builder().add(filterQuery, BooleanClause.Occur.MUST)
+            .add(parents, BooleanClause.Occur.FILTER)
+            .build();
     }
 
     private static Schema buildSchema(List<String> columnNames) {

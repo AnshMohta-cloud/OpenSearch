@@ -39,6 +39,7 @@ use datafusion::logical_expr::{
     ColumnarValue, Expr, LogicalPlan, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
     Signature, TypeSignature, Volatility,
 };
+use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 #[cfg(test)]
 use datafusion::physical_expr::PhysicalExpr;
 
@@ -100,8 +101,25 @@ pub struct ExtractionResult {
 pub fn extract_filter_expr(plan: &LogicalPlan) -> Option<Expr> {
     match plan {
         LogicalPlan::Filter(filter) => {
-            if has_aggregate_or_window_below(&filter.input) || has_unnest_below(&filter.input) {
+            if has_aggregate_or_window_below(&filter.input) {
                 extract_filter_expr(&filter.input)
+            } else if has_unnest_below(&filter.input) {
+                // [NESTED] A filter above an UNNEST usually references EXPLODED (child) columns, which
+                // aren't resolvable against the base scan and must run natively in DataFusion. Extract
+                // ONLY delegated-index markers (delegated_predicate / delegation_possible): those bind to
+                // Lucene by annotation id and are evaluated against the BASE-SCAN parent docs, independent
+                // of the unnest fan-out — matching the Java planner's FilterTreeShape=SingleCollector for
+                // this shape (extraction must be non-None or the executor asserts). A plain base-scan
+                // predicate (e.g. tier>=1) is NOT extracted here: it stays above the unnest and runs
+                // natively (extracting it would route it to the indexed evaluator, which only runs markers,
+                // silently dropping the filter). Mirrors DataFusion push_down_filter, narrowed to markers.
+                // Grep: NESTED lucene-delegation-above-unnest.
+                let marker_conjuncts: Vec<Expr> = split_conjunction(&filter.predicate)
+                    .into_iter()
+                    .filter(|conj| is_delegated_marker(conj))
+                    .cloned()
+                    .collect();
+                conjunction(marker_conjuncts).or_else(|| extract_filter_expr(&filter.input))
             } else {
                 Some(filter.predicate.clone())
             }
@@ -115,6 +133,77 @@ pub fn extract_filter_expr(plan: &LogicalPlan) -> Option<Expr> {
             None
         }
     }
+}
+
+/// [NESTED] Push a column-free delegated-predicate marker that sits in a Filter ABOVE an UNNEST down to
+/// just ABOVE the base scan (below the UNNEST), so the IndexedTableProvider claims it via
+/// `supports_filters_pushdown` and DataFusion removes that FilterExec. Without this the marker's
+/// FilterExec survives above the UNNEST and its UDF body errors by design at execution time.
+///
+/// Rewrite (per DataFusion's own push_down_filter, which pushes any conjunct referencing no exploded
+/// column below the Unnest):
+///   Filter(marker AND residual) -> Unnest -> input
+///     becomes
+///   Filter(residual) -> Unnest -> Filter(marker) -> input      (residual Filter dropped if empty)
+///
+/// Only column-free conjuncts (the delegated markers) are moved; any conjunct referencing a column stays
+/// above the UNNEST (it may reference an exploded child column and must run natively there). A no-op when
+/// there is no Filter-directly-above-Unnest carrying a marker. Grep: NESTED lucene-delegation-above-unnest.
+/// True if `expr` is a delegated-index marker: a `delegated_predicate(id)` (correctness) or
+/// `delegation_possible(orig, id)` (performance) scalar-UDF call. These are the only conjuncts the
+/// indexed scan evaluates against the base scan; only they may be pushed below an unnest.
+fn is_delegated_marker(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(f)
+        if f.name() == COLLECTOR_FUNCTION_NAME || f.name() == DELEGATION_POSSIBLE_FUNCTION_NAME)
+}
+
+pub fn push_delegated_marker_below_unnest(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    plan.transform_down(|node| {
+        // Match a Filter whose immediate input is an Unnest.
+        let LogicalPlan::Filter(filter) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        let LogicalPlan::Unnest(unnest) = filter.input.as_ref() else {
+            return Ok(Transformed::no(node));
+        };
+        // Push down ONLY delegated-index markers (delegated_predicate / delegation_possible UDF calls).
+        // These are the only conjuncts the IndexedTableProvider's indexed scan actually evaluates against
+        // the base scan (via Lucene by annotation id). A plain base-scan predicate (e.g. tier>=1) must NOT
+        // be pushed here: once directly above the indexed scan it would be claimed Exact by
+        // supports_filters_pushdown and dropped (the indexed evaluator only runs markers, not arbitrary
+        // predicates) — silently losing the filter. Such predicates stay above the unnest and run natively.
+        // A marker references only base-scan/parent columns (col-free, or wraps a parent-col predicate),
+        // so it never touches an exploded child column. Mirrors DataFusion push_down_filter's column test,
+        // narrowed to markers. Grep: NESTED lucene-delegation-above-unnest.
+        let conjuncts = split_conjunction(&filter.predicate);
+        let (markers, residual): (Vec<Expr>, Vec<Expr>) = conjuncts
+            .into_iter()
+            .cloned()
+            .partition(is_delegated_marker);
+        if markers.is_empty() {
+            return Ok(Transformed::no(node)); // no delegated marker above this unnest — leave the plan alone
+        }
+        // Build: Unnest( Filter(markers, unnest.input) ), then optionally wrap with Filter(residual).
+        let marker_pred = conjunction(markers).expect("markers non-empty");
+        let inner_filter = LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(
+            marker_pred,
+            unnest.input.clone(),
+        )?);
+        // Rebuild the Unnest over the new input, preserving all its schema-bearing fields.
+        let mut new_unnest = unnest.clone();
+        new_unnest.input = Arc::new(inner_filter);
+        let new_unnest_plan = LogicalPlan::Unnest(new_unnest);
+        let rebuilt = match conjunction(residual) {
+            Some(residual_pred) => LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(
+                residual_pred,
+                Arc::new(new_unnest_plan),
+            )?),
+            None => new_unnest_plan, // marker-only filter → replaced entirely by the pushed-down marker
+        };
+        Ok(Transformed::yes(rebuilt))
+    })
+    .map(|t| t.data)
 }
 
 /// [NESTED-POC] True if an UNNEST appears below `plan` before any row-reshaping

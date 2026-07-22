@@ -148,47 +148,83 @@ final class NestedParentDedupRewriter {
         ProjectRel p = projRel.getProject();
         if (p.hasInput() == false) return projRel;
         // The projected outputs must be exactly bare field refs (isthmus `fields` shape with an emit).
-        if (p.hasCommon() == false || p.getCommon().hasEmit() == false) return projRel;
+        if (p.hasCommon() == false || p.getCommon().hasEmit() == false) {
+            LOGGER.debug("[NESTED] tryDocsDedup skip: project has no emit (hasCommon={})", p.hasCommon());
+            return projRel;
+        }
 
         // Only dedup a PARENT-ONLY projection. A projection that reads an exploded-child column
         // (`fields title, comments.author`) is a genuine per-child flatten — must NOT be deduped. The
         // parent (scan) columns occupy indices [0, scanWidth) of the reshape input; exploded children are
         // appended at scanWidth..W-1. So: dedup iff every projected column index is < scanWidth.
         Integer scanWidth = scanColumnCount(p.getInput());
-        if (scanWidth == null) return projRel;
+        if (scanWidth == null) {
+            LOGGER.debug("[NESTED] tryDocsDedup skip: scanWidth null (no reshape read found beneath project)");
+            return projRel;
+        }
+        // Each projected output must be dedup-safe: either a bare PARENT field ref (idx < scanWidth) or a
+        // LITERAL. A literal arises when a keyword `=` predicate is constant-folded into the projection
+        // (e.g. `where title='x' | fields title` → project emits CAST('x') instead of a field ref); it is
+        // trivially parent-scalar (same value for every row of a parent), so it stays dedup-eligible.
+        // A field ref at idx >= scanWidth is an EXPLODED child column → genuine per-child flatten, no dedup.
         for (Expression e : p.getExpressionsList()) {
             Integer idx = fieldIndexOf(e);
-            if (idx == null || idx >= scanWidth) return projRel;   // non-trivial or child ref → leave alone
+            boolean constant = isConstantExpr(e);
+            if ((idx == null && constant == false) || (idx != null && idx >= scanWidth)) {
+                LOGGER.debug("[NESTED] tryDocsDedup skip: projected expr not parent-scalar (idx={} constant={} scanWidth={})", idx, constant, scanWidth);
+                return projRel;   // non-trivial or child ref → leave alone
+            }
         }
 
         RowIdChain chain = threadRowId(p.getInput());
-        if (chain == null) return projRel;   // no reshape beneath → not our shape
+        if (chain == null) {
+            LOGGER.debug("[NESTED] tryDocsDedup skip: threadRowId returned null (no reshape chain)");
+            return projRel;   // no reshape beneath → not our shape
+        }
         int w = chain.rowIdIndex;             // __row_id__ index in chain.rel's output (its tail)
 
-        java.util.List<Integer> projCols = new java.util.ArrayList<>();
-        for (Expression e : p.getExpressionsList()) {
-            int idx = fieldIndexOf(e);
-            projCols.add(idx >= w ? idx + 1 : idx);          // shift for the inserted __row_id__
-        }
-
-        // group by [projected cols..., __row_id__] over the row_id-carrying chain.
+        // Group by the field-ref parent columns (shifted for the inserted __row_id__) + __row_id__ itself.
+        // Literal projections carry no grouping column — they're constant per parent — and are re-emitted
+        // as literals in the output projection. Track, per output position, whether it's a grouped
+        // field-ref (and which grouping slot) or a literal (carried verbatim).
         AggregateRel.Grouping.Builder grouping = AggregateRel.Grouping.newBuilder();
-        for (int c : projCols) grouping.addGroupingExpressions(fieldRef(c));
+        java.util.List<Integer> groupSlotOfOutput = new java.util.ArrayList<>();  // grouping slot per output col, -1 if literal
+        int groupSlot = 0;
+        for (Expression e : p.getExpressionsList()) {
+            Integer idx = fieldIndexOf(e);
+            if (idx != null) {
+                int shifted = idx >= w ? idx + 1 : idx;      // shift for the inserted __row_id__
+                grouping.addGroupingExpressions(fieldRef(shifted));
+                groupSlotOfOutput.add(groupSlot++);
+            } else {
+                groupSlotOfOutput.add(-1);                    // literal — no grouping column
+            }
+        }
+        int rowIdSlot = groupSlot;                            // __row_id__ occupies the last grouping slot
         grouping.addGroupingExpressions(fieldRef(w));
         AggregateRel dedupAgg = AggregateRel.newBuilder().setInput(chain.rel).addGroupings(grouping.build()).build();
         Rel dedupAggRel = Rel.newBuilder().setAggregate(dedupAgg).build();
 
-        // Substrait Aggregate output = grouping columns in declared order = [projCol0..projColN-1, __row_id__].
-        // Re-project the parent columns (positions 0..N-1), dropping the trailing __row_id__, preserving order.
+        // Substrait Aggregate output = grouping columns in declared order = [fieldGroupCols..., __row_id__].
+        // Re-project each original output: a grouped field-ref maps to its grouping-slot position; a literal
+        // is re-emitted verbatim. Emit preserves the original output order and drops the trailing __row_id__.
         ProjectRel.Builder outProj = ProjectRel.newBuilder().setInput(dedupAggRel);
         RelCommon.Emit.Builder emit = RelCommon.Emit.newBuilder();
-        int groupWidth = projCols.size() + 1;   // grouping cols emitted first, then (empty) measures
-        for (int i = 0; i < projCols.size(); i++) {
-            outProj.addExpressions(fieldRef(i));
-            emit.addOutputMapping(groupWidth + i);   // project appends its exprs after the agg's group cols
+        int groupWidth = rowIdSlot + 1;                       // grouping cols (fields + __row_id__), then measures
+        int appended = 0;                                     // project appends its exprs after the agg's group cols
+        java.util.List<Expression> outputs = p.getExpressionsList();
+        for (int i = 0; i < outputs.size(); i++) {
+            int slot = groupSlotOfOutput.get(i);
+            if (slot >= 0) {
+                outProj.addExpressions(fieldRef(slot));       // read the grouped field from its agg slot
+            } else {
+                outProj.addExpressions(outputs.get(i));       // literal — carry verbatim
+            }
+            emit.addOutputMapping(groupWidth + appended++);
         }
         outProj.setCommon(RelCommon.newBuilder().setEmit(emit.build()).build());
-        LOGGER.info("[NESTED] parent-dedup(docs): group-by [{} parent cols + __row_id__@{}] then re-project", projCols.size(), w);
+        LOGGER.info("[NESTED] parent-dedup(docs): group-by [{} field cols + __row_id__@{}] ({} literal cols carried) then re-project",
+            groupSlot, w, outputs.size() - groupSlot);
         return Rel.newBuilder().setProject(outProj.build()).build();
     }
 
@@ -273,10 +309,98 @@ final class NestedParentDedupRewriter {
             case EXTENSION_SINGLE: {
                 if (rel.getExtensionSingle().hasInput() == false) return null;
                 Rel input = rel.getExtensionSingle().getInput();
-                if (input.getRelTypeCase() == Rel.RelTypeCase.READ) {
-                    return input.getRead().hasBaseSchema() ? input.getRead().getBaseSchema().getStruct().getTypesCount() : null;
+                // The reshape's parent-scan width = the READ's base_schema top-level field count. The READ
+                // may sit directly under the reshape, OR under a PRE-EXPAND parent Filter (e.g.
+                // `where title='x' | expand comments`: Filter is between reshape and scan). Descend through
+                // any Filter/Project to find that READ. If instead a deeper reshape is found, recurse into it.
+                Rel scan = input;
+                while (scan.getRelTypeCase() == Rel.RelTypeCase.FILTER || scan.getRelTypeCase() == Rel.RelTypeCase.PROJECT) {
+                    Rel next = scan.getRelTypeCase() == Rel.RelTypeCase.FILTER
+                        ? (scan.getFilter().hasInput() ? scan.getFilter().getInput() : null)
+                        : (scan.getProject().hasInput() ? scan.getProject().getInput() : null);
+                    if (next == null) return null;
+                    scan = next;
                 }
-                return scanColumnCount(input);   // deeper reshape/read below
+                if (scan.getRelTypeCase() == Rel.RelTypeCase.READ) {
+                    return scan.getRead().hasBaseSchema() ? scan.getRead().getBaseSchema().getStruct().getTypesCount() : null;
+                }
+                return scanColumnCount(scan);   // deeper reshape/read below
+            }
+            default:
+                return null;
+        }
+    }
+
+    /** True if a deeper {@code unnest_reshape} ExtensionSingle exists below {@code rel} (multi-level unnest),
+     *  descending through Filter/Project. Distinguishes "recurse into inner reshape" from "reached the scan". */
+    private static boolean containsReshapeBelow(Rel rel) {
+        switch (rel.getRelTypeCase()) {
+            case EXTENSION_SINGLE:
+                return rel.getExtensionSingle().getDetail().getTypeUrl().startsWith(UNNEST_RESHAPE_PREFIX)
+                    || (rel.getExtensionSingle().hasInput() && containsReshapeBelow(rel.getExtensionSingle().getInput()));
+            case FILTER:
+                return rel.getFilter().hasInput() && containsReshapeBelow(rel.getFilter().getInput());
+            case PROJECT:
+                return rel.getProject().hasInput() && containsReshapeBelow(rel.getProject().getInput());
+            default:
+                return false;
+        }
+    }
+
+    /** Descends through Filter/Project to the READ and returns its base_schema top-level width, or null. */
+    private static Integer readBaseSchemaWidth(Rel rel) {
+        ReadRel r = findRead(rel);
+        return (r != null && r.hasBaseSchema()) ? r.getBaseSchema().getStruct().getTypesCount() : null;
+    }
+
+    private static boolean readBaseSchemaHasRowId(Rel rel) {
+        ReadRel r = findRead(rel);
+        return r != null && r.hasBaseSchema() && r.getBaseSchema().getNamesList().contains(ROW_ID);
+    }
+
+    /** The READ at the bottom of a Filter/Project/ExtensionSingle chain, or null. */
+    private static ReadRel findRead(Rel rel) {
+        switch (rel.getRelTypeCase()) {
+            case READ: return rel.getRead();
+            case FILTER: return rel.getFilter().hasInput() ? findRead(rel.getFilter().getInput()) : null;
+            case PROJECT: return rel.getProject().hasInput() ? findRead(rel.getProject().getInput()) : null;
+            case EXTENSION_SINGLE: return rel.getExtensionSingle().hasInput() ? findRead(rel.getExtensionSingle().getInput()) : null;
+            default: return null;
+        }
+    }
+
+    /**
+     * Rebuilds {@code rel} (a READ, or a READ under a PRE-EXPAND Filter/Project) with {@code __row_id__}
+     * APPENDED to the READ's base_schema. Appending at the END leaves every existing column index
+     * undisturbed, so a pre-expand Filter's positional condition refs stay valid without shifting.
+     * Returns null if no READ is found. (Distinct from {@link #appendRowIdToRead}, which routes through
+     * {@code threadRowId} for the reshape-chain layout; this one handles the parent scan below the reshape.)
+     */
+    private static Rel appendRowIdThroughFilters(Rel rel) {
+        switch (rel.getRelTypeCase()) {
+            case READ: {
+                ReadRel read = rel.getRead();
+                if (read.hasBaseSchema() == false) return null;
+                NamedStruct bs = read.getBaseSchema();
+                if (bs.getNamesList().contains(ROW_ID)) return rel;   // idempotent
+                NamedStruct newBs = bs.toBuilder()
+                    .addNames(ROW_ID)
+                    .setStruct(bs.getStruct().toBuilder().addTypes(i64Nullable()).build())
+                    .build();
+                return rel.toBuilder().setRead(read.toBuilder().setBaseSchema(newBs).build()).build();
+            }
+            case FILTER: {
+                if (rel.getFilter().hasInput() == false) return null;
+                Rel ni = appendRowIdThroughFilters(rel.getFilter().getInput());
+                if (ni == null) return null;
+                // __row_id__ appended at the tail → the filter's existing column refs are unchanged.
+                return rel.toBuilder().setFilter(rel.getFilter().toBuilder().setInput(ni).build()).build();
+            }
+            case PROJECT: {
+                if (rel.getProject().hasInput() == false) return null;
+                Rel ni = appendRowIdThroughFilters(rel.getProject().getInput());
+                if (ni == null) return null;
+                return rel.toBuilder().setProject(rel.getProject().toBuilder().setInput(ni).build()).build();
             }
             default:
                 return null;
@@ -355,37 +479,32 @@ final class NestedParentDedupRewriter {
                 if (rel.getExtensionSingle().hasInput() == false) return null;
                 Rel input = rel.getExtensionSingle().getInput();
                 boolean isReshape = rel.getExtensionSingle().getDetail().getTypeUrl().startsWith(UNNEST_RESHAPE_PREFIX);
-                if (input.getRelTypeCase() != Rel.RelTypeCase.READ) {
-                    // Nested unnest chain (deeper ExtensionSingle/read below); recurse.
+                // The reshape's input is the parent scan — either a READ directly, a READ under a PRE-EXPAND
+                // parent Filter (`where title='x' | expand comments`), or a deeper reshape (multi-level).
+                // If a deeper reshape is below, recurse into it. Otherwise append __row_id__ to the READ's
+                // base_schema (descending through any pre-expand Filter/Project), so the reshape carries it.
+                if (containsReshapeBelow(input)) {
                     RowIdChain in = threadRowId(input);
                     if (in == null) return null;
                     Rel newRel = rel.toBuilder()
                         .setExtensionSingle(rel.getExtensionSingle().toBuilder().setInput(in.rel).build())
                         .build();
-                    // This reshape reorders __row_id__ to ITS tail = its stamped width Wi.
                     Integer wi = parseWidth(rel.getExtensionSingle().getDetail().getTypeUrl());
                     return new RowIdChain(newRel, wi != null ? wi : in.rowIdIndex);
                 }
                 if (isReshape == false) return null;
-                ReadRel read = input.getRead();
-                if (read.hasBaseSchema() == false) return null;
-                NamedStruct bs = read.getBaseSchema();
-                // Idempotence: do not append twice if a __row_id__ is already present.
-                if (bs.getNamesList().contains(ROW_ID)) {
-                    Integer wi = parseWidth(rel.getExtensionSingle().getDetail().getTypeUrl());
-                    return new RowIdChain(rel, wi != null ? wi : bs.getNamesCount() - 1);
-                }
-                NamedStruct newBs = bs.toBuilder()
-                    .addNames(ROW_ID)
-                    .setStruct(bs.getStruct().toBuilder().addTypes(i64Nullable()).build())
-                    .build();
-                Rel newRead = input.toBuilder().setRead(read.toBuilder().setBaseSchema(newBs).build()).build();
+                // Find the READ (through pre-expand filters), append __row_id__ there, rebuild the chain.
+                Integer readWidth = readBaseSchemaWidth(input);
+                if (readWidth == null) return null;
+                boolean alreadyPresent = readBaseSchemaHasRowId(input);
+                Rel newInput = alreadyPresent ? input : appendRowIdThroughFilters(input);
+                if (newInput == null) return null;
                 Rel newRel = rel.toBuilder()
-                    .setExtensionSingle(rel.getExtensionSingle().toBuilder().setInput(newRead).build())
+                    .setExtensionSingle(rel.getExtensionSingle().toBuilder().setInput(newInput).build())
                     .build();
                 // This reshape reorders __row_id__ to its tail = its stamped width Wi.
                 Integer wi = parseWidth(rel.getExtensionSingle().getDetail().getTypeUrl());
-                return new RowIdChain(newRel, wi != null ? wi : bs.getStruct().getTypesCount());
+                return new RowIdChain(newRel, wi != null ? wi : readWidth);
             }
             default:
                 return null;
@@ -486,6 +605,19 @@ final class NestedParentDedupRewriter {
     }
 
     /** Extracts the index of a bare top-level struct-field reference, or {@code null} if {@code e} is not one. */
+    /**
+     * True if {@code e} is a parent-scalar CONSTANT: a bare {@code Literal}, or a {@code Cast} whose
+     * (recursively unwrapped) input is a literal. Such an expression arises when a keyword-equality
+     * predicate is constant-folded into the projection (isthmus emits {@code CAST('x')} in place of the
+     * {@code field='x'} column). It references no column, so it is trivially the same for every row of a
+     * parent and stays dedup-eligible; it is carried verbatim into the post-dedup re-projection.
+     */
+    private static boolean isConstantExpr(Expression e) {
+        if (e.hasLiteral()) return true;
+        if (e.hasCast() && e.getCast().hasInput()) return isConstantExpr(e.getCast().getInput());
+        return false;
+    }
+
     private static Integer fieldIndexOf(Expression e) {
         if (e.hasSelection() == false) return null;
         Expression.FieldReference fr = e.getSelection();

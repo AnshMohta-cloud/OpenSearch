@@ -19,7 +19,9 @@ import org.apache.lucene.index.MergeIndexWriter;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.misc.store.HardlinkCopyDirectoryWrapper;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.MMapDirectory;
@@ -375,7 +377,14 @@ public class LuceneIndexingExecutionEngine implements IndexingExecutionEngine<Lu
                             if (!writerGenerations.contains(writerGen)) {
                                 continue;
                             }
-                            long numDocs = segReader.maxDoc();
+                            // numRows is the segment's LOGICAL-row count — it must equal the Parquet
+                            // primary's row count for cross-format correspondence (I2) and to serve the
+                            // count(*) fast path. On a NESTED segment a logical document is a block of
+                            // N+1 Lucene docs (children + parent), so maxDoc() over-counts; the logical
+                            // row count is the number of PARENT docs, which is exactly the number of docs
+                            // carrying __row_id__ (children don't). On a non-nested segment every doc is a
+                            // logical row, so this equals maxDoc().
+                            long numDocs = logicalRowCount(segReader);
 
                             WriterFileSet.Builder wfsBuilder = WriterFileSet.builder()
                                 .directory(sharedDir)
@@ -539,6 +548,44 @@ public class LuceneIndexingExecutionEngine implements IndexingExecutionEngine<Lu
         } catch (IOException e) {
             logger.warn("Failed to delete lucene temp directory [{}]: {}", dir, e.getMessage());
         }
+    }
+
+    /**
+     * The number of LOGICAL rows (documents) in a segment — the count that must match the Parquet
+     * primary and serve the count(*) fast path.
+     *
+     * <p>On a segment with no nested fields every Lucene doc is a logical row, so this is
+     * {@code maxDoc()}. On a NESTED segment a logical document is indexed as a block of N+1 Lucene docs
+     * (N children followed by the parent — see {@link LuceneDocumentInput}); only the parent carries the
+     * {@code __row_id__} doc-value, and the Parquet primary stores exactly one row per parent. So the
+     * logical row count is the number of docs carrying {@code __row_id__}, which we read as the value
+     * count of that {@link SortedNumericDocValues} field. A segment is detected as nested via its Lucene
+     * parent field ({@code FieldInfos.getParentField()}, set to {@code __nested_parent} by the writer).
+     */
+    private static long logicalRowCount(SegmentReader segReader) throws IOException {
+        String parentField = segReader.getFieldInfos().getParentField();
+        if (parentField == null) {
+            // [NESTED] Non-nested segment: logical rows == Lucene docs. Grep: NESTED count-fastpath.
+            logger.info("[NESTED] logicalRowCount: FLAT segment maxDoc={} (no parent field)", segReader.maxDoc());
+            return segReader.maxDoc();
+        }
+        // __row_id__ is a SortedNumericDocValuesField (see LuceneDocumentInput.setRowId) → read it via
+        // getSortedNumericDocValues; getNumericDocValues returns null for it.
+        SortedNumericDocValues rowIdDV = segReader.getSortedNumericDocValues(DocumentInput.ROW_ID_FIELD);
+        if (rowIdDV == null) {
+            // No __row_id__ doc-values (e.g. an all-child or empty segment shape) — fall back to maxDoc.
+            logger.info("[NESTED] logicalRowCount: NESTED segment parentField={} but no __row_id__ DV; falling back to maxDoc={}",
+                parentField, segReader.maxDoc());
+            return segReader.maxDoc();
+        }
+        long parents = 0;
+        for (int docId = rowIdDV.nextDoc(); docId != DocIdSetIterator.NO_MORE_DOCS; docId = rowIdDV.nextDoc()) {
+            parents++;
+        }
+        // [NESTED] Nested segment: logical rows == parent count (== Parquet rows). maxDoc counts children too.
+        logger.info("[NESTED] logicalRowCount: NESTED segment parentField={} maxDoc={} → logicalRows(parents)={}",
+            parentField, segReader.maxDoc(), parents);
+        return parents;
     }
 
     /**
