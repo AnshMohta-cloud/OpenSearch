@@ -62,6 +62,8 @@ public class RustBridge {
     private static final MethodHandle TIMING_SNAPSHOT;
     private static final MethodHandle READ_VALUE_AT_ROW;
     private static final MethodHandle READ_REPEATED_AT_ROW;
+    private static final MethodHandle READ_LEAF_LEVELS_AT_ROW;
+    private static final MethodHandle LEAF_LEVEL_THRESHOLDS;
     private static final MethodHandle GET_COLUMN_NUM_PAGES;
     private static final MethodHandle GET_COLUMN_PAGE_INDEX;
     private static final MethodHandle DECODE_PAGE_AT_ROW;
@@ -384,6 +386,35 @@ public class RustBridge {
                 ValueLayout.ADDRESS,    // out_byte_buf
                 ValueLayout.ADDRESS,    // out_byte_offsets
                 ValueLayout.JAVA_LONG   // out_byte_buf_cap
+            )
+        );
+        READ_LEAF_LEVELS_AT_ROW = linker.downcallHandle(
+            lib.find("parquet_read_leaf_levels_at_row").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,  // handle
+                ValueLayout.JAVA_LONG,  // row
+                ValueLayout.ADDRESS,    // out_level_count
+                ValueLayout.ADDRESS,    // out_value_count
+                ValueLayout.ADDRESS,    // out_max_def
+                ValueLayout.ADDRESS,    // out_rep (i32[])
+                ValueLayout.ADDRESS,    // out_def (i32[])
+                ValueLayout.JAVA_LONG,  // out_level_cap
+                ValueLayout.ADDRESS,    // out_longs
+                ValueLayout.JAVA_LONG,  // out_long_cap
+                ValueLayout.ADDRESS,    // out_byte_buf
+                ValueLayout.ADDRESS,    // out_byte_offsets
+                ValueLayout.JAVA_LONG   // out_byte_buf_cap
+            )
+        );
+        LEAF_LEVEL_THRESHOLDS = linker.downcallHandle(
+            lib.find("parquet_leaf_level_thresholds").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,  // handle
+                ValueLayout.ADDRESS,    // out_count
+                ValueLayout.ADDRESS,    // out (i32[])
+                ValueLayout.JAVA_LONG   // out_cap
             )
         );
         GET_COLUMN_NUM_PAGES = linker.downcallHandle(
@@ -1001,6 +1032,45 @@ public class RustBridge {
         long outByteBufCap
     ) throws IOException {
         return invokeChecked(READ_REPEATED_AT_ROW, handle, row, outCount, outLongs, outLongCap, outByteBuf, outByteOffsets, outByteBufCap);
+    }
+
+    /**
+     * Reads one row's leaf entries WITH Dremel repetition + definition levels (for arbitrary-depth nested
+     * reconstruction). Returns {@code 0} on success, {@link #RC_OVERFLOW} when a buffer was too small — the
+     * required {@code outLevelCount}/{@code outValueCount} (and {@code outByteOffsets[valueCount]} byte size
+     * for BYTE_ARRAY) are written so the caller can size a single retry. See
+     * {@code parquet_read_leaf_levels_at_row} for the full output contract.
+     */
+    static long readLeafLevelsAtRow(
+        long handle,
+        long row,
+        MemorySegment outLevelCount,
+        MemorySegment outValueCount,
+        MemorySegment outMaxDef,
+        MemorySegment outRep,
+        MemorySegment outDef,
+        long outLevelCap,
+        MemorySegment outLongs,
+        long outLongCap,
+        MemorySegment outByteBuf,
+        MemorySegment outByteOffsets,
+        long outByteBufCap
+    ) throws IOException {
+        return invokeChecked(
+            READ_LEAF_LEVELS_AT_ROW, handle, row,
+            outLevelCount, outValueCount, outMaxDef, outRep, outDef, outLevelCap,
+            outLongs, outLongCap, outByteBuf, outByteOffsets, outByteBufCap
+        );
+    }
+
+    /**
+     * Fetches the leaf column's per-nesting-level element-exists definition thresholds (see
+     * {@code parquet_leaf_level_thresholds}). {@code out} receives one {@code i32} per level; {@code outCount}
+     * receives the level count. Returns {@code RC_OVERFLOW} if {@code outCap} is too small (retry with the
+     * reported count).
+     */
+    static long leafLevelThresholds(long handle, MemorySegment outCount, MemorySegment out, long outCap) throws IOException {
+        return invokeChecked(LEAF_LEVEL_THRESHOLDS, handle, outCount, out, outCap);
     }
 
     /** Returns the number of pages in the column (used to pre-size the page-index arrays). */

@@ -8,6 +8,8 @@
 
 package org.opensearch.common.lucene.index;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.StoredFieldsReader;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
@@ -29,6 +31,9 @@ import java.util.Collections;
  * derives the source.
  */
 public class DerivedSourceStoredFieldsReader extends StoredFieldsReader {
+
+    // [FALLBACK-DBG] traces the DSL fallback derived-source path (docId -> reconstructed _source).
+    private static final Logger FALLBACK_LOG = LogManager.getLogger(DerivedSourceStoredFieldsReader.class);
 
     private final StoredFieldsReader delegate;
     private final CheckedFunction<Integer, BytesReference, IOException> sourceProvider;
@@ -103,7 +108,20 @@ public class DerivedSourceStoredFieldsReader extends StoredFieldsReader {
         @Override
         public void document(int docId, StoredFieldVisitor visitor) throws IOException {
             if (visitor.needsField(FAKE_SOURCE_FIELD) == StoredFieldVisitor.Status.YES) {
-                visitor.binaryField(FAKE_SOURCE_FIELD, sourceProvider.apply(docId).toBytesRef().bytes);
+                BytesReference derived = sourceProvider.apply(docId);
+                // [FALLBACK-DBG] the moment _source is reconstructed from (parquet-backed) doc-values at fetch.
+                if (FALLBACK_LOG.isDebugEnabled()) {
+                    FALLBACK_LOG.debug(
+                        "[FALLBACK-DBG] derived _source for docId={} ({} bytes): {}",
+                        docId,
+                        derived.length(),
+                        derived.utf8ToString()
+                    );
+                }
+                visitor.binaryField(FAKE_SOURCE_FIELD, derived.toBytesRef().bytes);
+            } else {
+                delegate.document(docId, visitor);
+                return;
             }
             delegate.document(docId, visitor);
         }

@@ -15,12 +15,19 @@ import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeStampMilliVector;
+import org.apache.arrow.vector.TimeStampNanoVector;
+import org.apache.arrow.vector.TinyIntVector;
+import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.lucene.document.InetAddressPoint;
+import org.apache.lucene.util.BytesRef;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
@@ -43,6 +50,7 @@ import org.opensearch.parquet.writer.ParquetDocumentInput;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -324,23 +332,53 @@ public class VSRManager implements AutoCloseable {
         listVector.endValue(rowIndex, children.size());
     }
 
-    /** Writes a single scalar into a struct-child vector at the given element index (POC types only). */
+    /**
+     * Writes a single already-parsed scalar into a struct-child vector at the given element index. The value is
+     * the SAME parsed form the flat (top-level) writer receives for each type (see the per-type {@code
+     * ParquetField} implementations in {@code parquet.fields.core.data}), so the branches mirror those exactly:
+     * numbers are widened/narrowed to the target width, dates arrive as epoch {@code long}, {@code ip} arrives
+     * as an {@link InetAddress} (encoded to its fixed-length byte form here, matching {@code IpParquetField}),
+     * and {@code binary} arrives as raw {@code byte[]}. This keeps the nested struct-leaf type coverage in lockstep
+     * with the flat field set.
+     */
     private static void setLeafValue(FieldVector vector, int index, Object value) {
         if (value == null) {
             return; // leave null
         }
         if (vector instanceof VarCharVector v) {
             v.setSafe(index, value.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        } else if (vector instanceof IntVector v) {
+        } else if (vector instanceof TinyIntVector v) {          // byte
+            v.setSafe(index, ((Number) value).byteValue());
+        } else if (vector instanceof SmallIntVector v) {          // short
+            v.setSafe(index, ((Number) value).shortValue());
+        } else if (vector instanceof IntVector v) {               // integer
             v.setSafe(index, ((Number) value).intValue());
-        } else if (vector instanceof BigIntVector v) {
+        } else if (vector instanceof BigIntVector v) {            // long
             v.setSafe(index, ((Number) value).longValue());
-        } else if (vector instanceof Float8Vector v) {
+        } else if (vector instanceof Float8Vector v) {            // double
             v.setSafe(index, ((Number) value).doubleValue());
-        } else if (vector instanceof Float4Vector v) {
+        } else if (vector instanceof Float4Vector v) {            // float
             v.setSafe(index, ((Number) value).floatValue());
-        } else if (vector instanceof BitVector v) {
+        } else if (vector instanceof BitVector v) {               // boolean
             v.setSafe(index, Boolean.TRUE.equals(value) || "true".equals(value) ? 1 : 0);
+        } else if (vector instanceof TimeStampMilliVector v) {    // date (epoch millis)
+            v.setSafe(index, ((Number) value).longValue());
+        } else if (vector instanceof TimeStampNanoVector v) {     // date_nanos (epoch nanos)
+            v.setSafe(index, ((Number) value).longValue());
+        } else if (vector instanceof VarBinaryVector v) {         // ip (InetAddress) or binary (byte[])
+            byte[] bytes;
+            if (value instanceof InetAddress inet) {
+                bytes = InetAddressPoint.encode(inet); // fixed 16-byte form, matching IpParquetField
+            } else if (value instanceof byte[] raw) {
+                bytes = raw;
+            } else if (value instanceof BytesRef ref) {
+                bytes = java.util.Arrays.copyOfRange(ref.bytes, ref.offset, ref.offset + ref.length);
+            } else {
+                throw new IllegalArgumentException(
+                    "POC nested: unsupported value type [" + value.getClass().getSimpleName() + "] for VarBinary struct leaf"
+                );
+            }
+            v.setSafe(index, bytes);
         } else {
             throw new IllegalArgumentException(
                 "POC nested: unsupported struct-leaf vector type [" + vector.getClass().getSimpleName() + "]"

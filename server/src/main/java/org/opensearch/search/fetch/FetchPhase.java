@@ -356,7 +356,13 @@ public class FetchPhase {
 
     private int findRootDocumentIfNested(SearchContext context, LeafReaderContext subReaderContext, int subDocId) throws IOException {
         if (context.mapperService().hasNested()) {
+            // newNonNestedFilter() matches root (parent) docs on both classic (_primary_term) and composite
+            // (Lucene parent field) indexes. getBitSet may still be null for a segment with no root docs.
             BitSet bits = context.bitsetFilterCache().getBitSetProducer(Queries.newNonNestedFilter()).getBitSet(subReaderContext);
+            if (bits == null) {
+                // No parent doc in this leaf → treat as a non-nested root (nothing to lift).
+                return -1;
+            }
             if (!bits.get(subDocId)) {
                 return bits.nextSetBit(subDocId);
             }

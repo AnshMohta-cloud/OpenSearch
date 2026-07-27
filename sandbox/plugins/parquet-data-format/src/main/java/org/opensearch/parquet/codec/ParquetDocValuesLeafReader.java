@@ -8,6 +8,8 @@
 
 package org.opensearch.parquet.codec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesSkipIndexType;
@@ -27,7 +29,10 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.lucene.Lucene;
+import org.opensearch.common.lucene.index.NestedSourceProvider;
+import org.opensearch.parquet.bridge.ParquetColumnReader;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
@@ -39,6 +44,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * A {@link FilterLeafReader} that serves doc values for Parquet-resident fields from a
@@ -66,7 +72,11 @@ import java.util.Map;
  * <p>One producer is built lazily per segment and closed when this reader closes. Not shared
  * across segments.
  */
-public final class ParquetDocValuesLeafReader extends FilterLeafReader {
+public final class ParquetDocValuesLeafReader extends FilterLeafReader implements NestedSourceProvider {
+
+    // [NESTED-TRACE] Verbose step-by-step tracing of the nested query/fetch pipeline for teaching/debugging.
+    // Enable with: PUT /_cluster/settings {"transient":{"logger.org.opensearch.parquet.codec":"TRACE"}}
+    private static final Logger TRACE = LogManager.getLogger(ParquetDocValuesLeafReader.class);
 
     private final MapperService mapperService;
 
@@ -86,11 +96,48 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
     /** Per-query stats accumulator shared across all leaves of one search; may be null in tests. */
     private final QueryParquetStats queryStats;
 
+    /** Cached docId==__row_id__ determination for this segment (null until first computed). A flat
+     *  segment is identity; a nested block-join segment is not (child docs shift parent docIds). */
+    private Boolean identitySegment;
+
+    /**
+     * Nested-child leaf fields served from the primary format's {@code LIST<STRUCT>} column, keyed by the
+     * flat mapping field name (e.g. {@code comments.score}). These are NOT in {@link #parquetFields}: their
+     * values are addressed by CHILD Lucene docId (block-join hidden docs), not by parent row, so they use a
+     * distinct read path ({@link ChildFieldColumn}). Empty on a non-nested / classic index.
+     */
+    private final Map<String, ChildFieldInfo> childFields;
+
+    /**
+     * Cached materialized values per child field name; built lazily on first DV access. OpenSearch searches a
+     * given segment on a single thread (leaf partitions are created per whole segment — see
+     * {@code ContextIndexSearcher}), so a leaf-reader instance is not accessed concurrently today; the
+     * {@link java.util.concurrent.ConcurrentHashMap} is defensive insurance so lazy population stays safe if
+     * intra-segment slicing is ever enabled. Builds are pure functions of the segment, so a double-build under
+     * a future race would be wasteful but not incorrect.
+     */
+    private final Map<String, ChildFieldColumn> childFieldColumns = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * The parquet element leaf column path + physical type for a nested-child field, plus its owning nested
+     * path ({@code owningPath}, e.g. {@code orgs.divisions.teams.members}) and that path's nesting depth
+     * ({@code listLevel}, 1-based: the Dremel list-level at which this field's elements repeat). The owning
+     * path selects the per-path child-doc offset map; the list level drives multi-level Dremel expansion.
+     */
+    private record ChildFieldInfo(
+        FieldInfo fieldInfo,
+        String leafColumnPath,
+        ParquetPhysicalType physical,
+        String owningPath,
+        int listLevel
+    ) {}
+
     private ParquetDocValuesLeafReader(
         LeafReader in,
         MapperService mapperService,
         SegmentReadState segmentReadState,
         Map<String, FieldInfo> parquetFields,
+        Map<String, ChildFieldInfo> childFields,
         FieldInfos mergedFieldInfos,
         QueryParquetStats queryStats
     ) {
@@ -98,6 +145,7 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
         this.mapperService = mapperService;
         this.segmentReadState = segmentReadState;
         this.parquetFields = parquetFields;
+        this.childFields = childFields;
         this.mergedFieldInfos = mergedFieldInfos;
         this.queryStats = queryStats;
     }
@@ -131,12 +179,18 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
 
         FieldInfos existing = in.getFieldInfos();
         Map<String, FieldInfo> parquetFields = new LinkedHashMap<>();
+        Map<String, ChildFieldInfo> childFields = new LinkedHashMap<>();
         List<FieldInfo> merged = new ArrayList<>();
         int maxNumber = -1;
         for (FieldInfo fi : existing) {
             merged.add(fi);
             maxNumber = Math.max(maxNumber, fi.number);
         }
+
+        // The set of nested-object paths in this mapping (e.g. {"comments"}). Used to classify a leaf
+        // field as a nested child and to build its columnar leaf path. Derived from the mapper, not
+        // hardcoded, so it generalizes to any nested field(s).
+        Set<String> nestedPaths = nestedObjectPaths(mapperService);
 
         // Walk the mapping. For each field the Parquet codec supports whose doc values are NOT
         // already present in the Lucene segment, synthesize a FieldInfo with the mapped DV type.
@@ -156,6 +210,30 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
             FieldTypeMapping.Mapping mapping = FieldTypeMapping.forType(mft.typeName());
             DocValuesType dvType = mapping.singleValued();
             FieldInfo synthetic = newDocValuesFieldInfo(name, ++maxNumber, dvType, skipIndexTypeFor(mapping));
+
+            // Nested-child leaf? Its values live in the LIST<STRUCT> column and are addressed by CHILD
+            // docId, not parent row — route it to childFields with its element leaf column path. Only a
+            // DIRECT leaf of a single nested level is handled here (deeper nesting is a follow-up); such a
+            // field is left unexposed rather than mis-served.
+            String owning = owningNestedPath(name, nestedPaths);
+            if (owning != null) {
+                // Nested-child leaf at ANY depth. Its Parquet column path inserts ".list.element." at EVERY
+                // nested-path boundary between the root and the leaf (the standard 3-level LIST<STRUCT> encoding
+                // nests one list per nested level), e.g. orgs.divisions.teams.members.age ->
+                // orgs.list.element.divisions.list.element.teams.list.element.members.list.element.age. Building
+                // it from the nested-path hierarchy (not a single owning+".list.element."+remainder hop)
+                // generalizes to arbitrary nesting depth.
+                String leafColumnPath = parquetChildLeafColumnPath(name, nestedPaths);
+                // The list level is the number of nested-path boundaries between the root and this field —
+                // i.e. how many LIST<STRUCT> levels its elements sit under (owning path's own depth in nested
+                // paths). This is the Dremel list-level at which the field's elements repeat.
+                int listLevel = nestedDepthOf(owning, nestedPaths);
+                childFields.put(name, new ChildFieldInfo(synthetic, leafColumnPath, mapping.physical(), owning, listLevel));
+                merged.removeIf(fi -> fi.name.equals(name));
+                merged.add(synthetic);
+                continue;
+            }
+
             parquetFields.put(name, synthetic);
             // If a DV-less FieldInfo already exists for this field, replace it with the synthetic
             // one carrying the DV type; otherwise append.
@@ -165,13 +243,109 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
             merged.add(synthetic);
         }
 
-        if (parquetFields.isEmpty()) {
+        if (parquetFields.isEmpty() && childFields.isEmpty()) {
             // Nothing for us to serve — don't wrap.
             return in;
         }
 
         FieldInfos mergedInfos = new FieldInfos(merged.toArray(new FieldInfo[0]));
-        return new ParquetDocValuesLeafReader(in, mapperService, state, parquetFields, mergedInfos, queryStats);
+        return new ParquetDocValuesLeafReader(in, mapperService, state, parquetFields, childFields, mergedInfos, queryStats);
+    }
+
+    /**
+     * The set of nested-object field paths declared in the mapping (each a path whose object mapper is
+     * {@code nested}). Derived from the mapper — generalizes to any number of nested fields at any path.
+     */
+    private static Set<String> nestedObjectPaths(MapperService mapperService) {
+        Set<String> paths = new java.util.HashSet<>();
+        for (org.opensearch.index.mapper.MappedFieldType mft : mapperService.fieldTypes()) {
+            String name = mft.name();
+            // Walk every dotted prefix of the field name; a prefix that resolves to a nested object mapper
+            // is a nested path owning this field. (getObjectMapper returns null for non-object prefixes.)
+            for (int dot = name.indexOf('.'); dot >= 0; dot = name.indexOf('.', dot + 1)) {
+                String prefix = name.substring(0, dot);
+                org.opensearch.index.mapper.ObjectMapper om = mapperService.getObjectMapper(prefix);
+                if (om != null && om.nested().isNested()) {
+                    paths.add(prefix);
+                }
+            }
+        }
+        return paths;
+    }
+
+    /**
+     * The deepest nested path that strictly contains {@code name} (i.e. {@code name} starts with
+     * {@code path + "."}), or {@code null} if none. Mirrors {@code ArrowSchemaBuilder.owningNestedPath}
+     * so read-side child-field classification matches the write-side {@code LIST<STRUCT>} layout.
+     */
+    // package-private for unit testing (pure function of name + nested paths)
+    static String owningNestedPath(String name, Set<String> nestedPaths) {
+        String best = null;
+        for (String path : nestedPaths) {
+            if (name.length() > path.length() && name.startsWith(path) && name.charAt(path.length()) == '.') {
+                if (best == null || path.length() > best.length()) {
+                    best = path;
+                }
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Builds the physical Parquet column path for a nested-child leaf {@code name} at any depth, inserting
+     * {@code ".list.element."} at every nested-path boundary between the root and the leaf. Mirrors the
+     * write-side {@code ArrowSchemaBuilder.buildNestedListField}, which emits one {@code LIST<STRUCT>} level
+     * per nested mapper and stores each field under its owning nested path's {@code element}.
+     *
+     * <p>Example: {@code orgs.divisions.teams.members.age} with nested paths {@code {orgs, orgs.divisions,
+     * orgs.divisions.teams, orgs.divisions.teams.members}} →
+     * {@code orgs.list.element.divisions.list.element.teams.list.element.members.list.element.age}.
+     *
+     * <p>Algorithm: collect every nested-path prefix of {@code name} in increasing length order (the chain of
+     * list levels), then emit each successive segment joined by {@code ".list.element."}, with the leaf's own
+     * name (the tail after the deepest nested path) appended last.
+     */
+    // package-private for unit testing (pure function of name + nested paths)
+    static String parquetChildLeafColumnPath(String name, Set<String> nestedPaths) {
+        // Ordered chain of nested-path prefixes of `name` (e.g. [orgs, orgs.divisions, ...]).
+        List<String> chain = new ArrayList<>();
+        for (String path : nestedPaths) {
+            if (name.length() > path.length() && name.startsWith(path) && name.charAt(path.length()) == '.') {
+                chain.add(path);
+            }
+        }
+        chain.sort(java.util.Comparator.comparingInt(String::length));
+        StringBuilder col = new StringBuilder();
+        int consumed = 0; // characters of `name` already emitted (excluding the trailing dot)
+        for (String path : chain) {
+            // The segment of this nested level is the part of `path` after the previous level.
+            String segment = path.substring(consumed == 0 ? 0 : consumed + 1);
+            if (col.length() > 0) {
+                col.append(".list.element.");
+            }
+            col.append(segment);
+            consumed = path.length();
+        }
+        // The leaf field itself lives under the deepest nested path's element.
+        String leaf = name.substring(consumed + 1);
+        col.append(".list.element.").append(leaf);
+        return col.toString();
+    }
+
+    /**
+     * The nesting depth of a nested path {@code path} — the number of nested-path prefixes it has, inclusive
+     * (e.g. {@code orgs} → 1, {@code orgs.divisions.teams.members} → 4). This is the Dremel list-level at which
+     * that path's elements repeat.
+     */
+    // package-private for unit testing (pure function of path + nested paths)
+    static int nestedDepthOf(String path, Set<String> nestedPaths) {
+        int depth = 0;
+        for (String p : nestedPaths) {
+            if (path.equals(p) || (path.length() > p.length() && path.startsWith(p) && path.charAt(p.length()) == '.')) {
+                depth++;
+            }
+        }
+        return depth;
     }
 
     /**
@@ -229,35 +403,475 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
      * Builds a {@link RowIdResolver} that translates this segment's {@code docId}s to Parquet row
      * positions by reading the underlying leaf's {@code __row_id__} doc values. Each codec iterator
      * needs its own resolver (its own {@code __row_id__} iterator), so this is called per DV accessor.
-     * Falls back to identity when the segment has no {@code __row_id__} field.
+     *
+     * <p>For a FLAT (non-nested) segment the write path guarantees {@code rowId == docId} — row ids are
+     * rewritten to sequential 0..maxDoc-1 after any sort/merge (SequentialRowIdProducer) — so the
+     * {@link RowIdResolver#IDENTITY} no-op is correct and the per-doc {@code __row_id__} lookup is skipped.
+     *
+     * <p>For a NESTED segment this invariant does NOT hold: the Lucene secondary block-adds N child docs
+     * before each parent (children first, parent last), so a parent's {@code docId} is shifted past its
+     * children while {@code __row_id__} stays the dense parent row index (parent docId 2 → __row_id__ 0
+     * when it has 2 children). {@code docId != __row_id__}, so IDENTITY would read the WRONG Parquet row.
+     * We therefore detect the non-identity case and return a doc-values-backed resolver that reads the
+     * real {@code __row_id__} per doc. (Previously an {@code -ea} assert here crashed the node on any
+     * nested segment reaching the read path.)
      */
     private RowIdResolver newRowIdResolver() throws IOException {
-        // The write path GUARANTEES rowId == docId in every finished segment: row ids are rewritten to
-        // sequential 0..maxDoc-1 after any sort/merge (SequentialRowIdProducer) and verified by
-        // LuceneWriter.assertRowIdsSequential. So the per-doc __row_id__ lookup is pure waste here — it
-        // re-reads a value that always equals the docId. Skip it: use the no-op IDENTITY resolver.
-        //
-        // Backed by an -ea assert that mirrors the writer's invariant; if a future write path ever
-        // produced a non-identity segment, this trips in dev/test. (Costs nothing in prod.)
-        assert assertRowIdsAreIdentity() : "non-identity __row_id__ segment reached read path; IDENTITY shortcut is unsafe here";
-        return RowIdResolver.IDENTITY;
+        if (isIdentitySegment()) {
+            return RowIdResolver.IDENTITY; // flat segment (or no row-id field): docId == __row_id__, skip the lookup
+        }
+        // Non-identity (e.g. nested block-join) segment: translate docId → __row_id__ via doc values.
+        // A fresh __row_id__ iterator per resolver (one resolver is bound to one codec DV iterator).
+        // Forward-only and stateful, matching the codec iterators' ascending access (see RowIdResolver).
+        final SortedNumericDocValues rowId = in.getSortedNumericDocValues(DocumentInput.ROW_ID_FIELD);
+        return docId -> {
+            if (rowId.advanceExact(docId) == false) {
+                throw new IllegalStateException("document [" + docId + "] has no " + DocumentInput.ROW_ID_FIELD + " value");
+            }
+            return rowId.nextValue();
+        };
     }
 
-    /** -ea-only check mirroring {@code LuceneWriter.assertRowIdsSequential}: every doc's __row_id__ == docId. */
-    private boolean assertRowIdsAreIdentity() throws IOException {
+    /**
+     * Per-nested-path child-doc → (root parquet row, element offset) mapping. Keyed by nested path (e.g.
+     * {@code orgs.divisions.teams.members}). For a docId that is a child at that path, {@code parquetRow[d]} is
+     * its ROOT's parquet row and {@code offset[d]} is that element's index within the root's flattened
+     * {@code LIST<STRUCT>} column for the path (document/ingest order — the same order the Parquet column stores
+     * its elements). {@code parquetRow[d] == -1} for any doc that is not a child at this path.
+     *
+     * <p>Why per-path: on deep nesting a root block interleaves child docs from ALL nested levels in post-order,
+     * so a single flat block offset does not identify an element within a specific level's list. Grouping by the
+     * child doc's {@code _nested_path} and counting in doc order within the root yields the correct per-level
+     * element index that lines up with the Parquet column for that path.
+     */
+    // package-private for unit testing (see buildPathChildMaps)
+    record PathChildMap(int[] parquetRow, int[] offset) {}
+
+    /** Cached per-path child-doc maps for this segment; null until first built. */
+    private Map<String, PathChildMap> pathChildMaps;
+
+    /**
+     * Builds (once, cached) a {@link PathChildMap} for every nested path present in the mapping, by walking the
+     * block structure via {@code __row_id__} (root markers) and reading each child doc's {@code _nested_path}
+     * term. Within each root block, child docs sharing a path are numbered 0,1,2,… in ascending docId (= ingest
+     * post-order) order — matching the Parquet flattened-element order for that path.
+     */
+    private Map<String, PathChildMap> pathChildMaps() throws IOException {
+        if (pathChildMaps != null) {
+            return pathChildMaps;
+        }
+        int max = maxDoc();
+        Set<String> paths = new java.util.HashSet<>();
+        for (ChildFieldInfo info : childFields.values()) {
+            paths.add(info.owningPath());
+        }
+        // Per-docId nested path (null = root/parent doc, which carries __row_id__).
+        String[] docPath = readNestedPathPerDoc(max);
+        // Per-docId root parquet row for parent docs, -1 for non-parents (children carry no __row_id__).
+        long[] rootRowId = new long[max];
+        java.util.Arrays.fill(rootRowId, -1L);
         SortedNumericDocValues rowId = in.getSortedNumericDocValues(DocumentInput.ROW_ID_FIELD);
-        if (rowId == null) {
-            return true; // no row-id field => identity by definition
-        }
-        for (int docId = 0; docId < maxDoc(); docId++) {
-            if (rowId.advanceExact(docId) == false) {
-                return false;
-            }
-            if (rowId.nextValue() != docId) {
-                return false;
+        if (rowId != null) {
+            for (int docId = 0; docId < max; docId++) {
+                if (rowId.advanceExact(docId)) {
+                    rootRowId[docId] = rowId.nextValue();
+                }
             }
         }
-        return true;
+        TRACE.trace("[NESTED-TRACE] pathChildMaps(): maxDoc={} paths={} — per-docId _nested_path={} , per-docId __row_id__(parents)={}",
+            max, paths, java.util.Arrays.toString(docPath), java.util.Arrays.toString(rootRowId));
+        pathChildMaps = buildPathChildMaps(max, docPath, rootRowId, paths);
+        for (var e : pathChildMaps.entrySet()) {
+            TRACE.trace("[NESTED-TRACE]   path '{}': docId->row {} , docId->elementOffset {}",
+                e.getKey(), java.util.Arrays.toString(e.getValue().parquetRow()), java.util.Arrays.toString(e.getValue().offset()));
+        }
+        return pathChildMaps;
+    }
+
+    /**
+     * Pure block-structure → per-path child map assignment (extracted for unit testing). For each root block
+     * (a maximal run of child docs ending at a parent doc, identified by {@code rootRowId[docId] >= 0}), assigns
+     * every child doc — grouped by its {@code _nested_path} — an ascending 0-based element offset within that
+     * path's children of the block, and records the block's root parquet row. Child docs whose path is not in
+     * {@code paths} (no exposed child field at that level) are skipped. This offset equals the Parquet flattened
+     * element index for the path, because Lucene emits child docs in the same ingest (post-order) order Parquet
+     * flattens elements.
+     *
+     * @param maxDoc     segment doc count
+     * @param docPath    per-docId nested path ({@code null} for root/parent docs)
+     * @param rootRowId  per-docId root parquet row for parent docs; {@code -1} for child (non-parent) docs
+     * @param paths      the nested paths that have an exposed child field
+     */
+    static Map<String, PathChildMap> buildPathChildMaps(int maxDoc, String[] docPath, long[] rootRowId, Set<String> paths) {
+        Map<String, int[]> rowByPath = new HashMap<>();
+        Map<String, int[]> offByPath = new HashMap<>();
+        for (String p : paths) {
+            int[] rows = new int[maxDoc];
+            int[] offs = new int[maxDoc];
+            java.util.Arrays.fill(rows, -1);
+            rowByPath.put(p, rows);
+            offByPath.put(p, offs);
+        }
+        int prevParent = -1;
+        for (int docId = 0; docId < maxDoc; docId++) {
+            if (rootRowId[docId] < 0) {
+                continue; // a child doc — handled when its enclosing parent is reached
+            }
+            int root = (int) rootRowId[docId];
+            // Children of this root are docs (prevParent, docId), ascending (post-order). Count per path so each
+            // path's k-th child in this block gets element offset k.
+            Map<String, Integer> counter = new HashMap<>();
+            for (int child = prevParent + 1; child < docId; child++) {
+                String p = docPath[child];
+                if (p == null || rowByPath.containsKey(p) == false) {
+                    continue; // a level with no exposed child field — skip
+                }
+                int k = counter.merge(p, 1, Integer::sum) - 1;
+                rowByPath.get(p)[child] = root;
+                offByPath.get(p)[child] = k;
+            }
+            prevParent = docId;
+        }
+        Map<String, PathChildMap> maps = new HashMap<>();
+        for (String p : paths) {
+            maps.put(p, new PathChildMap(rowByPath.get(p), offByPath.get(p)));
+        }
+        return maps;
+    }
+
+    /**
+     * Reads the {@code _nested_path} term of every doc in the segment (postings-only field written by the
+     * engine on each nested child doc). Returns an array indexed by docId; entries are {@code null} for docs
+     * with no {@code _nested_path} (root/parent docs). Uses the inverted index (the field is indexed, not stored
+     * or doc-valued), iterating each term's postings once.
+     */
+    private String[] readNestedPathPerDoc(int max) throws IOException {
+        String[] out = new String[max];
+        org.apache.lucene.index.Terms terms = in.terms(org.opensearch.index.mapper.NestedPathFieldMapper.NAME);
+        if (terms == null) {
+            return out;
+        }
+        org.apache.lucene.index.TermsEnum te = terms.iterator();
+        org.apache.lucene.index.PostingsEnum pe = null;
+        org.apache.lucene.util.BytesRef term;
+        while ((term = te.next()) != null) {
+            String path = term.utf8ToString();
+            pe = te.postings(pe, org.apache.lucene.index.PostingsEnum.NONE);
+            for (int d = pe.nextDoc(); d != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS; d = pe.nextDoc()) {
+                out[d] = path;
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Materialized values of one nested-child field, keyed by child Lucene docId. Numeric fields populate
+     * {@code longs} (raw per {@code ParquetPhysicalType}); {@code BYTE_ARRAY} fields populate {@code bytes}.
+     * {@code present[d]} is true only on child docIds that have a value for this field.
+     */
+    private static final class ChildFieldColumn {
+        final long[] longs;        // numeric values by docId (null for BYTE_ARRAY fields)
+        final BytesRef[] bytes;    // string values by docId (null for numeric fields)
+        final boolean[] present;   // has-value by docId
+
+        ChildFieldColumn(long[] longs, BytesRef[] bytes, boolean[] present) {
+            this.longs = longs;
+            this.bytes = bytes;
+            this.present = present;
+        }
+    }
+
+    /**
+     * Builds (once per field, cached) the {@link ChildFieldColumn} for a nested-child field: reads each
+     * needed parent's repeated leaf column once and scatters element values to the child docIds of that
+     * block. Numeric values are decoded per physical type; strings are kept as {@link BytesRef}.
+     */
+    private ChildFieldColumn childFieldColumn(String field) throws IOException {
+        ChildFieldColumn cached = childFieldColumns.get(field);
+        if (cached != null) {
+            return cached;
+        }
+        ChildFieldInfo info = childFields.get(field);
+        TRACE.trace("[NESTED-TRACE] childFieldColumn(field='{}'): owningPath='{}', parquetColumn='{}', listLevel={} — "
+            + "building per-CHILD-docId value array from Parquet", field, info.owningPath(), info.leafColumnPath(), info.listLevel());
+        PathChildMap map = pathChildMaps().get(info.owningPath());
+        int max = maxDoc();
+        boolean[] present = new boolean[max];
+        boolean isBytes = info.physical() == ParquetPhysicalType.BYTE_ARRAY;
+        long[] longs = isBytes ? null : new long[max];
+        BytesRef[] bytes = isBytes ? new BytesRef[max] : null;
+        if (map == null) {
+            // No child docs at this path in the segment — leave everything absent.
+            ChildFieldColumn empty = new ChildFieldColumn(longs, bytes, present);
+            childFieldColumns.put(field, empty);
+            return empty;
+        }
+
+        ParquetColumnReader reader = producer().repeatedReaderFor(info.leafColumnPath(), info.physical());
+        // The "element exists at this field's owning level" definition threshold, read from the actual schema
+        // (no hardcoded per-level increment). thresholds[k-1] is the min def level at which a level-k element is
+        // present; the field's owning level is info.listLevel().
+        int[] thresholds = reader.levelDefThresholds();
+        int existThreshold = info.listLevel() >= 1 && info.listLevel() <= thresholds.length
+            ? thresholds[info.listLevel() - 1]
+            : Integer.MAX_VALUE; // no such level in schema → no elements (defensive; shouldn't happen)
+        // Read each root row's leaf ONCE with its Dremel levels and expand to a per-ELEMENT view at the field's
+        // OWNING nesting level (info.listLevel): element k is the k-th element of the root's flattened path list,
+        // counting ALL elements (including those whose leaf value is null) so the per-path element offset from the
+        // child-doc map lines up exactly. A small per-row cache avoids re-reading when consecutive child docIds
+        // share a root (they always do within a block).
+        long lastRow = -1;
+        long[] rowElemLongs = null;      // per-element value bits (numeric), index = element offset
+        BytesRef[] rowElemBytes = null;  // per-element value (bytes), index = element offset
+        boolean[] rowElemPresent = null; // per-element presence, index = element offset
+        for (int docId = 0; docId < max; docId++) {
+            int row = map.parquetRow()[docId];
+            if (row < 0) {
+                continue; // not a child doc at this path
+            }
+            if (row != lastRow) {
+                ParquetColumnReader.LeafLevels levels = reader.readLeafLevelsAtRow(row, isBytes);
+                int valueCount = isBytes ? (levels.bytes() == null ? 0 : levels.bytes().length) : levels.longs().length;
+                Object[] values = new Object[valueCount];
+                for (int i = 0; i < valueCount; i++) {
+                    values[i] = isBytes ? levels.bytes()[i] : Long.valueOf(levels.longs()[i]);
+                }
+                TRACE.trace("[NESTED-TRACE]   read Parquet leaf at row {}: rep={} def={} maxDef={} presentValues={}",
+                    row, java.util.Arrays.toString(levels.rep()), java.util.Arrays.toString(levels.def()), levels.maxDef(),
+                    isBytes ? valueCount + " bytes" : java.util.Arrays.toString(levels.longs()));
+                NestedDremel.ElementValues ev = NestedDremel.expandElementsAtLevel(
+                    levels.rep(),
+                    levels.def(),
+                    levels.maxDef(),
+                    info.listLevel(),
+                    existThreshold,
+                    values,
+                    isBytes,
+                    info.physical()
+                );
+                rowElemPresent = ev.present();
+                rowElemLongs = ev.longs();
+                rowElemBytes = ev.bytes();
+                TRACE.trace("[NESTED-TRACE]   expandElementsAtLevel(level={}, existThreshold={}) -> per-element present={} "
+                    + "(each element = one child doc of row {})", info.listLevel(), existThreshold,
+                    java.util.Arrays.toString(rowElemPresent), row);
+                lastRow = row;
+            }
+            int off = map.offset()[docId];
+            if (off < rowElemPresent.length && rowElemPresent[off]) {
+                if (isBytes) {
+                    bytes[docId] = rowElemBytes[off];
+                } else {
+                    longs[docId] = rowElemLongs[off];
+                }
+                present[docId] = true;
+                // Guard on isTraceEnabled(): the value renderer must not run when trace is off, because method
+                // arguments are evaluated eagerly. bytes[] can hold non-UTF-8 payloads (ip = 16-byte
+                // InetAddressPoint encoding, binary = arbitrary bytes), and utf8ToString() asserts valid UTF-8
+                // (fatal under -ea). Use a byte-safe renderer so enabling trace on an ip/binary field is also safe.
+                if (TRACE.isTraceEnabled()) {
+                    TRACE.trace("[NESTED-TRACE]     docId {} (child) -> row {} element[{}] = {}", docId, row, off,
+                        isBytes ? renderBytesRef(bytes[docId]) : Long.toString(longs[docId]));
+                }
+            }
+        }
+        ChildFieldColumn col = new ChildFieldColumn(longs, bytes, present);
+        TRACE.trace("[NESTED-TRACE] childFieldColumn(field='{}') built: present child docIds={}", field, presentDocIds(present));
+        childFieldColumns.put(field, col);
+        return col;
+    }
+
+    /**
+     * [NESTED-TRACE] helper: render a {@link BytesRef} for logging WITHOUT asserting UTF-8 validity. A child
+     * field's bytes may be an ip (16-byte {@code InetAddressPoint} encoding) or arbitrary binary, neither of
+     * which is valid UTF-8; {@link BytesRef#utf8ToString()} asserts and would be fatal under {@code -ea}. If the
+     * bytes happen to be valid UTF-8 (keyword/text) we show the string; otherwise we fall back to the safe
+     * hex-style {@link BytesRef#toString()}.
+     */
+    private static String renderBytesRef(BytesRef b) {
+        if (b == null) {
+            return "null";
+        }
+        try {
+            return b.utf8ToString();
+        } catch (AssertionError | RuntimeException notUtf8) {
+            return b.toString(); // [xx xx ...] hex form — never asserts
+        }
+    }
+
+    /** [NESTED-TRACE] helper: list the docIds where {@code present[d]} is true (for readable trace output). */
+    private static String presentDocIds(boolean[] present) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int d = 0; d < present.length; d++) {
+            if (present[d]) {
+                if (sb.length() > 1) sb.append(", ");
+                sb.append(d);
+            }
+        }
+        return sb.append("]").toString();
+    }
+
+    /** A single-valued {@link NumericDocValues} over a child field's per-docId {@code long} values. */
+    private static NumericDocValues childNumericDocValues(ChildFieldColumn col, int maxDoc) {
+        return new NumericDocValues() {
+            private int doc = -1;
+
+            @Override
+            public long longValue() {
+                return col.longs[doc];
+            }
+
+            @Override
+            public boolean advanceExact(int target) {
+                doc = target;
+                return target < maxDoc && col.present[target];
+            }
+
+            @Override
+            public int docID() {
+                return doc;
+            }
+
+            @Override
+            public int nextDoc() {
+                return advance(doc + 1);
+            }
+
+            @Override
+            public int advance(int target) {
+                for (int d = target; d < maxDoc; d++) {
+                    if (col.present[d]) {
+                        doc = d;
+                        return d;
+                    }
+                }
+                doc = NO_MORE_DOCS;
+                return NO_MORE_DOCS;
+            }
+
+            @Override
+            public long cost() {
+                return maxDoc;
+            }
+        };
+    }
+
+    /**
+     * A single-valued {@link SortedDocValues} over a child (keyword/ip) field's per-docId byte values.
+     * Builds a per-field ordinal table (distinct terms sorted lexicographically) so term/prefix/range
+     * queries over the child field resolve exactly as they would for a native keyword DV.
+     */
+    private static SortedDocValues childSortedDocValues(ChildFieldColumn col, int maxDoc) {
+        // Distinct terms in sorted order → ordinal; per-doc ordinal (-1 = no value).
+        java.util.TreeMap<BytesRef, Integer> termToOrd = new java.util.TreeMap<>();
+        for (int d = 0; d < maxDoc; d++) {
+            if (col.present[d]) {
+                termToOrd.put(col.bytes[d], null);
+            }
+        }
+        BytesRef[] ordToTerm = new BytesRef[termToOrd.size()];
+        int ord = 0;
+        for (Map.Entry<BytesRef, Integer> e : termToOrd.entrySet()) {
+            e.setValue(ord);
+            ordToTerm[ord] = e.getKey();
+            ord++;
+        }
+        int[] docToOrd = new int[maxDoc];
+        java.util.Arrays.fill(docToOrd, -1);
+        for (int d = 0; d < maxDoc; d++) {
+            if (col.present[d]) {
+                docToOrd[d] = termToOrd.get(col.bytes[d]);
+            }
+        }
+        final int valueCount = ordToTerm.length;
+        return new SortedDocValues() {
+            private int doc = -1;
+
+            @Override
+            public int ordValue() {
+                return docToOrd[doc];
+            }
+
+            @Override
+            public BytesRef lookupOrd(int o) {
+                return ordToTerm[o];
+            }
+
+            @Override
+            public int getValueCount() {
+                return valueCount;
+            }
+
+            @Override
+            public boolean advanceExact(int target) {
+                doc = target;
+                return target < maxDoc && docToOrd[target] >= 0;
+            }
+
+            @Override
+            public int docID() {
+                return doc;
+            }
+
+            @Override
+            public int nextDoc() {
+                return advance(doc + 1);
+            }
+
+            @Override
+            public int advance(int target) {
+                for (int d = target; d < maxDoc; d++) {
+                    if (docToOrd[d] >= 0) {
+                        doc = d;
+                        return d;
+                    }
+                }
+                doc = NO_MORE_DOCS;
+                return NO_MORE_DOCS;
+            }
+
+            @Override
+            public long cost() {
+                return maxDoc;
+            }
+        };
+    }
+
+    /**
+     * {@link NestedSourceProvider} — reconstructs a nested {@code LIST<STRUCT>} array for derived source.
+     * Resolves the parent's {@code docId} to its Parquet row (via {@code __row_id__}, same as every other
+     * codec read) and delegates the columnar read + array assembly to {@link ParquetDocValuesProducer}.
+     */
+    @Override
+    public List<Map<String, Object>> readNestedArray(String path, int docId) throws IOException {
+        long parquetRow = newRowIdResolver().toRowId(docId);
+        TRACE.trace("[NESTED-TRACE] readNestedArray(path='{}', parentDocId={}) -> resolved __row_id__/Parquet row={}"
+            + " ; reconstructing the full nested array for _source/inner_hits", path, docId, parquetRow);
+        List<Map<String, Object>> out = producer().readNestedArray(path, parquetRow);
+        TRACE.trace("[NESTED-TRACE] readNestedArray(path='{}', row={}) -> reconstructed {} element(s): {}", path, parquetRow,
+            out.size(), out);
+        return out;
+    }
+
+    /** True if {@code __row_id__ == docId} for every doc (flat segment). A nested block-join segment
+     *  returns false because child docs shift parent docIds past their dense __row_id__. Computed once
+     *  per reader (a single O(maxDoc) scan) and cached, since it's checked per DV accessor. */
+    private boolean isIdentitySegment() throws IOException {
+        if (identitySegment != null) {
+            return identitySegment;
+        }
+        boolean identity = true;
+        SortedNumericDocValues rowId = in.getSortedNumericDocValues(DocumentInput.ROW_ID_FIELD);
+        if (rowId != null) {
+            for (int docId = 0; docId < maxDoc(); docId++) {
+                if (rowId.advanceExact(docId) == false || rowId.nextValue() != docId) {
+                    identity = false;
+                    break;
+                }
+            }
+        }
+        identitySegment = identity;
+        return identity;
     }
 
     @Override
@@ -267,6 +881,10 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
 
     @Override
     public NumericDocValues getNumericDocValues(String field) throws IOException {
+        if (childFields.containsKey(field)) {
+            // Nested-child numeric field: values keyed by CHILD docId (block-join hidden docs).
+            return childNumericDocValues(childFieldColumn(field), maxDoc());
+        }
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.NUMERIC) {
             RowIdResolver resolver = newRowIdResolver();
@@ -280,6 +898,13 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
 
     @Override
     public SortedNumericDocValues getSortedNumericDocValues(String field) throws IOException {
+        if (childFields.containsKey(field)) {
+            // Nested-child numeric field: single-valued per child doc, wrapped as SortedNumeric so the
+            // range/term query's unwrapSingleton fast path applies. Keyed by CHILD docId.
+            TRACE.trace("[NESTED-TRACE] getSortedNumericDocValues(child field='{}') -> serving numeric DV from Parquet"
+                + " (this is the RANGE/agg path; e.g. range on comments.score)", field);
+            return DocValues.singleton(childNumericDocValues(childFieldColumn(field), maxDoc()));
+        }
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {
             // OpenSearch numeric value sources request SORTED_NUMERIC even for single-valued fields,
@@ -322,6 +947,9 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
 
     @Override
     public SortedDocValues getSortedDocValues(String field) throws IOException {
+        if (childFields.containsKey(field)) {
+            return childSortedDocValues(childFieldColumn(field), maxDoc());
+        }
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.SORTED) {
             RowIdResolver resolver = newRowIdResolver();
@@ -333,6 +961,13 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
 
     @Override
     public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
+        if (childFields.containsKey(field)) {
+            // Nested-child keyword field: single-valued per child doc, wrapped as SortedSet so the term
+            // query's unwrapSingleton fast path applies. Keyed by CHILD docId.
+            TRACE.trace("[NESTED-TRACE] getSortedSetDocValues(child field='{}') -> serving keyword DV from Parquet"
+                + " (doc-values path; used by keyword AGG/sort — NOT by an exact term query, which uses Lucene postings)", field);
+            return DocValues.singleton(childSortedDocValues(childFieldColumn(field), maxDoc()));
+        }
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {
             // Mirror getSortedNumericDocValues: keyword value sources request SORTED_SET even for
@@ -360,13 +995,27 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
 
     @Override
     public DocValuesSkipper getDocValuesSkipper(String field) throws IOException {
+        if (childFields.containsKey(field)) {
+            // Nested-child fields have no skip index: the parquet page min/max are per parent row, not per
+            // child docId, so they can't bound a child-docId interval. Returning null makes the range query
+            // fall back to a DocValues TwoPhaseIterator over childNumericDocValues — correct, no skip accel.
+            return null;
+        }
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {
             if (fi.docValuesSkipIndexType() == DocValuesSkipIndexType.NONE) {
                 return null;
             }
-            // Doc IDs and Parquet rows coincide (IDENTITY resolver — see newRowIdResolver), so
-            // page row ranges are directly valid as skipper doc ID intervals.
+            // The skip index's intervals are Parquet PAGE row ranges, and ParquetDocValuesSkipper.advance
+            // treats the incoming target as a Parquet row (pageIndex.pageForRow(target)). That is only valid
+            // when doc ID == Parquet row, i.e. on an IDENTITY (flat) segment. On a nested segment parent doc
+            // IDs are shifted past their child docs (docId != row), so feeding a docId into row-space page
+            // lookups would skip the wrong pages and drop matching parents. Return null there so the range
+            // query falls back to a DocValues TwoPhaseIterator over the docId→row-remapped numeric DV
+            // (correct, just without skip acceleration) — mirroring the child-field branch above.
+            if (isIdentitySegment() == false) {
+                return null;
+            }
             return producer().getSkipper(fi);
         }
         return in.getDocValuesSkipper(field);

@@ -879,6 +879,13 @@ struct ColumnReaderState {
     repeated: bool,
     /// Max definition level of the column (0 = required; >0 = optional/nested).
     max_def_level: i16,
+    /// Per-nesting-level "element exists" definition-level thresholds, one entry per REPEATED ancestor of
+    /// the leaf (outermost first). Element at nesting level k (1-based) exists in a slot iff that slot's
+    /// definition level `>= level_def_thresholds[k-1]`. Derived by walking the leaf's schema path and
+    /// accumulating +1 per OPTIONAL/REPEATED node, taking the value just past each REPEATED node's `element`
+    /// (its OPTIONAL wrapper) — i.e. NO assumption that a level contributes a fixed number of def levels;
+    /// it is read from the actual schema so it generalizes to any Parquet LIST encoding.
+    level_def_thresholds: Vec<i16>,
     /// Total number of rows (records) in the file.
     row_count: i64,
     /// Global row index of the first row in each row group.
@@ -1031,6 +1038,56 @@ fn get_or_build_file_metadata(filename: &str) -> Result<std::sync::Arc<FileMetad
     Ok(entry)
 }
 
+/// Computes, for the leaf column at `leaf_idx`, the "element exists" definition-level threshold at each
+/// nesting (REPEATED) level, outermost first. Walks the leaf's schema path from the root `Type` tree,
+/// accumulating +1 for every OPTIONAL or REPEATED node (REQUIRED contributes 0 to the definition level).
+/// The threshold recorded for a level is the accumulated definition level immediately AFTER that level's
+/// REPEATED node and its following OPTIONAL `element` wrapper — i.e. the smallest definition level at which
+/// an element at that level is present. Reading it from the actual schema (rather than assuming a fixed
+/// per-level increment) makes downstream nested assembly correct for ANY Parquet LIST encoding.
+fn compute_level_def_thresholds(
+    schema: &parquet::schema::types::SchemaDescriptor,
+    leaf_idx: usize,
+) -> Vec<i16> {
+    use parquet::basic::Repetition;
+    use parquet::schema::types::Type;
+
+    let descr = schema.column(leaf_idx);
+    let parts = descr.path().parts();
+    let mut thresholds: Vec<i16> = Vec::new();
+    let mut node: &Type = schema.root_schema();
+    let mut cum_def: i16 = 0;
+    let mut pending_repeated = false; // a REPEATED node was just seen; the next OPTIONAL is its `element`
+    for part in parts {
+        let child = match node {
+            Type::GroupType { fields, .. } => fields.iter().find(|f| f.name() == part).map(|b| b.as_ref()),
+            _ => None,
+        };
+        let child = match child {
+            Some(c) => c,
+            None => break, // path diverged from the tree (shouldn't happen for a valid leaf) — stop safely
+        };
+        match child.get_basic_info().repetition() {
+            Repetition::REQUIRED => {}
+            Repetition::OPTIONAL => {
+                cum_def += 1;
+                if pending_repeated {
+                    // This OPTIONAL is the `element` wrapper of the list level just opened: its def level is
+                    // the "element exists" threshold for that level.
+                    thresholds.push(cum_def);
+                    pending_repeated = false;
+                }
+            }
+            Repetition::REPEATED => {
+                cum_def += 1;
+                pending_repeated = true;
+            }
+        }
+        node = child;
+    }
+    thresholds
+}
+
 impl ColumnReaderState {
     fn open(filename: &str, column: &str, expected_type: i32) -> Result<ColumnReaderState, String> {
         // Use the node-level metadata cache — first call parses; subsequent calls are O(1).
@@ -1048,6 +1105,9 @@ impl ColumnReaderState {
         let (leaf_idx, phys, max_rep, max_def) = found.ok_or_else(|| {
             format!("Column '{}' not found in parquet file '{}'", column, filename)
         })?;
+
+        // Per-level element-exists definition thresholds, walking the leaf's schema path (see field docs).
+        let level_def_thresholds = compute_level_def_thresholds(&fmc.schema, leaf_idx);
 
         let actual = physical_type_code(phys);
         if actual != expected_type {
@@ -1080,6 +1140,7 @@ impl ColumnReaderState {
             physical_type: phys,
             repeated: max_rep > 0,
             max_def_level: max_def,
+            level_def_thresholds,
             row_count: fmc.row_count,
             rg_first_row: fmc.rg_first_row.clone(),
             rg_num_rows: fmc.rg_num_rows.clone(),
@@ -1275,6 +1336,34 @@ fn read_record_values<T: ParquetDataType>(
     r.read_records(1, Some(&mut def_levels), Some(&mut rep_levels), &mut values)
         .map_err(|e| e.to_string())?;
     Ok(values)
+}
+
+/// Reads one top-level record's leaf entries WITH their Dremel repetition + definition levels.
+///
+/// Unlike [`read_record_values`] (which discards the levels and returns only the present values), this
+/// returns the full per-slot `def_levels`/`rep_levels` streams — required to reconstruct arbitrarily-deep
+/// nested structure: `def` distinguishes null / empty-list / present at each ancestor level, and `rep`
+/// marks where each new element begins at each nesting level. The number of level entries can EXCEED the
+/// number of `values` (a null or empty-list slot has a level entry but no value); callers align values to
+/// slots where `def == max_def_level` (a fully-present leaf value). Values are returned as raw `i64` bits
+/// (INT32 sign-extended, INT64 verbatim, FLOAT/DOUBLE via `to_bits`, BOOL 0/1) mirroring the single-value
+/// read contract; BYTE_ARRAY payloads are returned separately by the caller via `slices`.
+fn read_record_levels<T: ParquetDataType>(
+    r: &mut ColumnReaderImpl<T>,
+    skip: usize,
+) -> Result<(Vec<T::T>, Vec<i16>, Vec<i16>), String> {
+    if skip > 0 {
+        let skipped = r.skip_records(skip).map_err(|e| e.to_string())?;
+        if skipped < skip {
+            return Err(format!("requested skip of {} records but only {} available", skip, skipped));
+        }
+    }
+    let mut def_levels: Vec<i16> = Vec::new();
+    let mut rep_levels: Vec<i16> = Vec::new();
+    let mut values: Vec<T::T> = Vec::new();
+    r.read_records(1, Some(&mut def_levels), Some(&mut rep_levels), &mut values)
+        .map_err(|e| e.to_string())?;
+    Ok((values, def_levels, rep_levels))
 }
 
 /// Cached per-file metadata: footer + page-index parse results shared across all column readers
@@ -1710,6 +1799,243 @@ pub unsafe extern "C" fn parquet_read_repeated_at_row(
             Err("parquet_read_repeated_at_row: INT96 columns are not supported".to_string())
         }
     }
+}
+
+/// Reads one top-level record's leaf with its Dremel repetition + definition levels — the primitive that
+/// enables arbitrary-depth nested reconstruction. Whereas `parquet_read_repeated_at_row` returns a flat
+/// list of present values (sufficient only for single-level nesting), this returns the full per-slot
+/// `rep`/`def` level streams so the caller can regroup values into the correct (possibly deeply-nested,
+/// possibly empty) elements.
+///
+/// Outputs (all caller-allocated; grow-and-retry on `RC_OVERFLOW`):
+///   - `out_level_count` = number of level slots for this row (== rep.len == def.len). This is the
+///     authoritative element/slot count and may exceed the number of present values (null/empty slots).
+///   - `out_rep[i]`, `out_def[i]` = the repetition + definition level of slot `i` (each `i32`), for
+///     `i in [0, level_count)`. Capacity for both is `out_level_cap`.
+///   - `out_max_def` = the column's max definition level (a fully-present leaf value has `def == max_def`).
+///   - numeric columns: `out_longs[j]` = the j-th PRESENT value's raw bits (INT32 sign-extended, INT64
+///     verbatim, FLOAT/DOUBLE `to_bits`, BOOL 0/1), `j in [0, value_count)`, capacity `out_long_cap`;
+///     `out_value_count` = number of present values.
+///   - BYTE_ARRAY columns: present values' bytes concatenated in `out_byte_buf` with CSR offsets (length
+///     `value_count + 1`) in `out_byte_offsets`; `out_value_count` = number of present values.
+///
+/// On `RC_OVERFLOW`, `out_level_count`/`out_value_count` hold the required counts and (for BYTE_ARRAY)
+/// `out_byte_offsets[value_count]` the required byte size, enabling a single sized retry.
+#[ffm_safe]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn parquet_read_leaf_levels_at_row(
+    handle: i64,
+    row: i64,
+    out_level_count: *mut i64,
+    out_value_count: *mut i64,
+    out_max_def: *mut i64,
+    out_rep: *mut i32,
+    out_def: *mut i32,
+    out_level_cap: i64,
+    out_longs: *mut i64,
+    out_long_cap: i64,
+    out_byte_buf: *mut u8,
+    out_byte_offsets: *mut i64,
+    out_byte_buf_cap: i64,
+) -> i64 {
+    let mut guard = lock_readers()?;
+    let state = guard
+        .get_mut(&handle)
+        .ok_or_else(|| format!("parquet_read_leaf_levels_at_row: unknown handle {}", handle))?;
+
+    if row < 0 {
+        return Err(format!("parquet_read_leaf_levels_at_row: negative row {}", row));
+    }
+    if row >= state.row_count {
+        return Err(format!(
+            "parquet_read_leaf_levels_at_row: row {} out of range (row count {})",
+            row, state.row_count
+        ));
+    }
+
+    if !out_level_count.is_null() {
+        *out_level_count = 0;
+    }
+    if !out_value_count.is_null() {
+        *out_value_count = 0;
+    }
+    if !out_max_def.is_null() {
+        *out_max_def = state.max_def_level as i64;
+    }
+
+    let (rg_idx, local) = state.locate(row)?;
+    let rg = state.reader.get_row_group(rg_idx).map_err(|e| e.to_string())?;
+    let col = rg.get_column_reader(state.leaf_idx).map_err(|e| e.to_string())?;
+    let local = local as usize;
+
+    // Reads the levels for one row and writes them; delegates the value payload to the caller-supplied
+    // writer (numeric or byte). Returns RC_OVERFLOW if any buffer was too small (sizes reported).
+    macro_rules! emit_numeric {
+        ($reader:expr, $map:expr) => {{
+            let (vals, def_levels, rep_levels) = read_record_levels(&mut $reader, local)?;
+            let mapped: Vec<i64> = vals.iter().map($map).collect();
+            write_levels_and_values(
+                &rep_levels, &def_levels,
+                out_level_count, out_value_count, out_rep, out_def, out_level_cap,
+                &mapped, out_longs, out_long_cap,
+            )
+        }};
+    }
+
+    match col {
+        ColumnReader::Int32ColumnReader(mut r) => emit_numeric!(r, |v| *v as i64),
+        ColumnReader::Int64ColumnReader(mut r) => emit_numeric!(r, |v| *v),
+        ColumnReader::FloatColumnReader(mut r) => emit_numeric!(r, |v| v.to_bits() as i64),
+        ColumnReader::DoubleColumnReader(mut r) => emit_numeric!(r, |v| v.to_bits() as i64),
+        ColumnReader::BoolColumnReader(mut r) => emit_numeric!(r, |v| if *v { 1i64 } else { 0i64 }),
+        ColumnReader::ByteArrayColumnReader(mut r) => {
+            let (vals, def_levels, rep_levels) = read_record_levels(&mut r, local)?;
+            let slices: Vec<&[u8]> = vals.iter().map(|v| v.data()).collect();
+            write_levels_and_bytes(
+                &rep_levels, &def_levels,
+                out_level_count, out_value_count, out_rep, out_def, out_level_cap,
+                &slices, out_byte_buf, out_byte_offsets, out_byte_buf_cap,
+            )
+        }
+        ColumnReader::FixedLenByteArrayColumnReader(mut r) => {
+            let (vals, def_levels, rep_levels) = read_record_levels(&mut r, local)?;
+            let slices: Vec<&[u8]> = vals.iter().map(|v| v.data()).collect();
+            write_levels_and_bytes(
+                &rep_levels, &def_levels,
+                out_level_count, out_value_count, out_rep, out_def, out_level_cap,
+                &slices, out_byte_buf, out_byte_offsets, out_byte_buf_cap,
+            )
+        }
+        ColumnReader::Int96ColumnReader(_) => {
+            Err("parquet_read_leaf_levels_at_row: INT96 columns are not supported".to_string())
+        }
+    }
+}
+
+/// Returns the leaf's per-nesting-level "element exists" definition thresholds (see
+/// [`ColumnReaderState::level_def_thresholds`]) into `out` (capacity `out_cap`, one `i32` per level,
+/// outermost first). Writes the level count to `out_count`. If `out_cap` is too small returns `RC_OVERFLOW`
+/// with the required count in `out_count` so the caller can size a retry. Computed once at column open, so
+/// this is a cheap copy. This lets the Java side drive nested assembly from the ACTUAL schema encoding
+/// instead of assuming a fixed definition-level increment per nesting level.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_leaf_level_thresholds(
+    handle: i64,
+    out_count: *mut i64,
+    out: *mut i32,
+    out_cap: i64,
+) -> i64 {
+    let guard = lock_readers()?;
+    let state = guard
+        .get(&handle)
+        .ok_or_else(|| format!("parquet_leaf_level_thresholds: unknown handle {}", handle))?;
+    let n = state.level_def_thresholds.len();
+    if !out_count.is_null() {
+        *out_count = n as i64;
+    }
+    if (n as i64) > out_cap || out.is_null() {
+        return Ok(RC_OVERFLOW);
+    }
+    for (i, t) in state.level_def_thresholds.iter().enumerate() {
+        *out.add(i) = *t as i32;
+    }
+    Ok(RC_OK)
+}
+
+/// Writes the rep/def level streams (always) and the present numeric values, or reports overflow with the
+/// required counts. `RC_OVERFLOW` when either the level buffers (cap `out_level_cap`) or the value buffer
+/// (cap `out_long_cap`) is too small; counts are always written so a single sized retry succeeds.
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_levels_and_values(
+    rep: &[i16],
+    def: &[i16],
+    out_level_count: *mut i64,
+    out_value_count: *mut i64,
+    out_rep: *mut i32,
+    out_def: *mut i32,
+    out_level_cap: i64,
+    values: &[i64],
+    out_longs: *mut i64,
+    out_long_cap: i64,
+) -> Result<i64, String> {
+    let level_count = rep.len();
+    let value_count = values.len();
+    if !out_level_count.is_null() {
+        *out_level_count = level_count as i64;
+    }
+    if !out_value_count.is_null() {
+        *out_value_count = value_count as i64;
+    }
+    if (level_count as i64) > out_level_cap || (value_count as i64) > out_long_cap {
+        return Ok(RC_OVERFLOW);
+    }
+    if out_rep.is_null() || out_def.is_null() || (value_count > 0 && out_longs.is_null()) {
+        return Ok(RC_OVERFLOW);
+    }
+    for i in 0..level_count {
+        *out_rep.add(i) = rep[i] as i32;
+        *out_def.add(i) = def[i] as i32;
+    }
+    for (j, v) in values.iter().enumerate() {
+        *out_longs.add(j) = *v;
+    }
+    Ok(RC_OK)
+}
+
+/// Like [`write_levels_and_values`] but for BYTE_ARRAY payloads: present values are written as concatenated
+/// bytes + CSR offsets (length `value_count + 1`). `RC_OVERFLOW` on any buffer shortfall, with sizes set.
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_levels_and_bytes(
+    rep: &[i16],
+    def: &[i16],
+    out_level_count: *mut i64,
+    out_value_count: *mut i64,
+    out_rep: *mut i32,
+    out_def: *mut i32,
+    out_level_cap: i64,
+    slices: &[&[u8]],
+    out_byte_buf: *mut u8,
+    out_byte_offsets: *mut i64,
+    out_byte_buf_cap: i64,
+) -> Result<i64, String> {
+    let level_count = rep.len();
+    let value_count = slices.len();
+    let total_bytes: usize = slices.iter().map(|s| s.len()).sum();
+    if !out_level_count.is_null() {
+        *out_level_count = level_count as i64;
+    }
+    if !out_value_count.is_null() {
+        *out_value_count = value_count as i64;
+    }
+    // Level-buffer or element-count overflow: cannot safely write levels/offsets.
+    if (level_count as i64) > out_level_cap || out_rep.is_null() || out_def.is_null() {
+        return Ok(RC_OVERFLOW);
+    }
+    // Write CSR offsets when they fit (cap is value_count+1) so a byte overflow still reports the size.
+    if !out_byte_offsets.is_null() {
+        let mut acc = 0i64;
+        for (i, s) in slices.iter().enumerate() {
+            *out_byte_offsets.add(i) = acc;
+            acc += s.len() as i64;
+        }
+        *out_byte_offsets.add(value_count) = acc;
+    }
+    if (total_bytes as i64) > out_byte_buf_cap || (total_bytes > 0 && out_byte_buf.is_null()) {
+        return Ok(RC_OVERFLOW);
+    }
+    // Levels fit and bytes fit: write both.
+    for i in 0..level_count {
+        *out_rep.add(i) = rep[i] as i32;
+        *out_def.add(i) = def[i] as i32;
+    }
+    let mut acc = 0usize;
+    for s in slices {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), out_byte_buf.add(acc), s.len());
+        acc += s.len();
+    }
+    Ok(RC_OK)
 }
 
 /// Writes repeated primitive values to `out_longs`, or reports overflow.

@@ -105,8 +105,15 @@ public class StoredFieldsPrefetch implements SearchOperationListener {
 
     private int findRootDocumentIfNested(SearchContext context, LeafReaderContext subReaderContext, int subDocId) throws IOException {
         if (context.mapperService().hasNested()) {
+            // newNonNestedFilter() matches root (parent) docs on both classic (_primary_term) and composite
+            // (Lucene parent field) indexes. getBitSet may still be null for a segment with no root docs (e.g.
+            // a composite segment where _primary_term is stored columnar and absent from the Lucene reader);
+            // guard against it exactly as FetchPhase.findRootDocumentIfNested does, else this NPEs.
             BitSet bits = context.bitsetFilterCache().getBitSetProducer(Queries.newNonNestedFilter()).getBitSet(subReaderContext);
-            if (!bits.get(subDocId)) {
+            if (bits == null) {
+                return -1;
+            }
+            if (bits.get(subDocId) == false) {
                 return bits.nextSetBit(subDocId);
             }
         }

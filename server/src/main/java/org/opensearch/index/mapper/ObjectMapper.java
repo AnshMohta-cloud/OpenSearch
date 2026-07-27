@@ -42,6 +42,7 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.collect.CopyOnWriteHashMap;
 import org.opensearch.common.logging.DeprecationLogger;
+import org.opensearch.common.lucene.index.NestedSourceProvider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.xcontent.ToXContent;
@@ -1099,6 +1100,37 @@ public class ObjectMapper extends Mapper implements Cloneable {
 
     @Override
     public void deriveSource(XContentBuilder builder, LeafReader leafReader, int docId) throws IOException {
+        // Nested field: the child-object values are not per-field doc values on this document (on a
+        // composite index the child fields are indexed terms only; their values live in the primary
+        // format's columnar LIST<STRUCT> column). Reconstruct the ordered array via the engine's
+        // NestedSourceProvider (order + duplicates preserved for nested inner_hits offsets). Fall back
+        // to the object shape below only when no provider is present (classic Lucene indexes, which
+        // don't yet support nested derived source — see canDeriveSource).
+        if (this.nested.isNested()) {
+            // A nested field is always serialized as a JSON ARRAY of objects (never a bare object). Reconstruct
+            // the ordered elements from the engine's NestedSourceProvider when one is present (composite index).
+            NestedSourceProvider provider = NestedSourceProvider.unwrap(leafReader);
+            if (provider != null) {
+                List<Map<String, Object>> elements = provider.readNestedArray(name(), docId);
+                if (elements != null) {
+                    if (elements.isEmpty() == false) {
+                        builder.field(simpleName());
+                        builder.startArray();
+                        for (Map<String, Object> element : elements) {
+                            builder.map(element);
+                        }
+                        builder.endArray();
+                    }
+                    return;
+                }
+            }
+            // No provider (e.g. a classic Lucene index whose derived-source support for nested is not yet
+            // implemented) or the provider could not reconstruct this field: OMIT it rather than fall through
+            // to the object-shaped branch below. Emitting `field: { ... }` for a nested field would produce a
+            // shape the fetch layer rejects ("extracted source isn't an object or an array"); omission yields a
+            // valid document (the field is simply absent), matching how an empty nested array is handled above.
+            return;
+        }
         builder.startObject(simpleName());
         for (final Mapper mapper : this.mappers.values()) {
             mapper.deriveSource(builder, leafReader, docId);

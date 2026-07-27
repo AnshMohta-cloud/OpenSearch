@@ -90,7 +90,13 @@ final class NestedParentDedupRewriter {
             return plan;
         }
 
-        Rel rewritten = tryDedup(top);
+        // Function anchor↔name resolution (read-only). Substrait carries aggregate function names in
+        // Plan.extensions as anchor→name; the Rel layer only holds the numeric function_reference. The
+        // generic parent-measure dedup needs to know whether a measure is sum/min/max/count to build the
+        // correct outer combiner, so build the map once here and thread it down.
+        FnCatalog fns = FnCatalog.from(plan);
+
+        Rel rewritten = tryDedup(top, fns);
         if (rewritten == top) {
             return plan;
         }
@@ -102,22 +108,42 @@ final class NestedParentDedupRewriter {
      * Dispatch on the top rel shape. {@code Aggregate(count)} → count-dedup; {@code Project} of
      * parent-only columns → docs-dedup (distinct parents); recurse through {@code Fetch}/{@code Sort}.
      */
-    private static Rel tryDedup(Rel top) {
+    private static Rel tryDedup(Rel top, FnCatalog fns) {
         switch (top.getRelTypeCase()) {
-            case AGGREGATE:
-                return tryCountDedup(top);
-            case PROJECT:
-                return tryDocsDedup(top);
+            case AGGREGATE: {
+                // First the argless-count() special case (distinct-parent count via group-by-__row_id__).
+                Rel counted = tryCountDedup(top);
+                if (counted != top) return counted;
+                // Then the general parent-grain measure case: sum/min/max/count(parentCol) — and, since
+                // avg/stddev were already reduced to sum+count upstream, avg(parentCol) too.
+                return tryParentMeasureDedup(top, fns);
+            }
+            case PROJECT: {
+                // Parent-only projection (`fields title`) → docs dedup (distinct parents).
+                Rel docs = tryDocsDedup(top);
+                if (docs != top) return docs;
+                // avg(parentCol) reduces (AggregateReduceFunctionsRule) to a scalar Project computing
+                // divide(sum,count) OVER an Aggregate. The Project itself is grain-neutral (it divides two
+                // already-computed scalars); recurse so the underlying parent-measure Aggregate is deduped.
+                ProjectRel pr = top.getProject();
+                if (pr.hasInput() && pr.getInput().getRelTypeCase() == Rel.RelTypeCase.AGGREGATE) {
+                    Rel inner = tryDedup(pr.getInput(), fns);
+                    return inner == pr.getInput()
+                        ? top
+                        : top.toBuilder().setProject(pr.toBuilder().setInput(inner).build()).build();
+                }
+                return top;
+            }
             case FETCH: {
                 if (top.getFetch().hasInput() == false) return top;
-                Rel inner = tryDedup(top.getFetch().getInput());
+                Rel inner = tryDedup(top.getFetch().getInput(), fns);
                 return inner == top.getFetch().getInput()
                     ? top
                     : top.toBuilder().setFetch(top.getFetch().toBuilder().setInput(inner).build()).build();
             }
             case SORT: {
                 if (top.getSort().hasInput() == false) return top;
-                Rel inner = tryDedup(top.getSort().getInput());
+                Rel inner = tryDedup(top.getSort().getInput(), fns);
                 return inner == top.getSort().getInput()
                     ? top
                     : top.toBuilder().setSort(top.getSort().toBuilder().setInput(inner).build()).build();
@@ -282,6 +308,361 @@ final class NestedParentDedupRewriter {
         AggregateRel newAgg = agg.toBuilder().setInput(dedupAggRel).build();
         LOGGER.info("[NESTED] parent-dedup(count): group-by(__row_id__ @{}) over reshape/filter (bypassing parent projection)", chain.rowIdIndex);
         return aggRel.toBuilder().setAggregate(newAgg).build();
+    }
+
+    /**
+     * General parent-grain measure dedup — the fix that makes {@code sum/min/max/count/avg} of a PARENT
+     * scalar column match vanilla nested (reverse_nested) semantics under a nested filter or {@code expand}.
+     *
+     * <p><b>The bug this fixes.</b> {@code expand} flattens a parent into one row per matching child, so a
+     * parent-grain column ({@code views}) is replicated per child. A naive {@code sum(views)} then counts
+     * that parent's value once per matching child (e.g. 1250 instead of 750). Vanilla nested counts each
+     * matching PARENT once. {@link #tryCountDedup} already fixes the argless {@code count()} case; this
+     * method generalizes the same {@code __row_id__} collapse to measures that take a parent-column argument.
+     *
+     * <p><b>Grain classification (research §0 amendment B, §2).</b> Each measure's argument column is
+     * classified by the parent/child boundary {@code scanWidth} (= the reshape read's base_schema width):
+     * an index {@code < scanWidth} is a PARENT-grain column (replicated by the fan-out → must be deduped);
+     * an index {@code >= scanWidth} is a CHILD-grain column (genuinely one value per child → already correct).
+     *
+     * <p><b>Two-phase plan (Kimball/Looker/Gray two-level aggregation).</b> When the aggregate mixes parent-
+     * and child-grain measures — or a group key — a single flat aggregate cannot be right for both grains,
+     * so we build:
+     * <ol>
+     *   <li><b>inner</b> {@code Aggregate(group by [userGroupKeys, __row_id__])} — one row per parent per
+     *       group. Parent columns are functionally determined by {@code __row_id__}, so we carry each needed
+     *       parent column as an extra grouping key (the same device {@link #tryDocsDedup} uses); child-grain
+     *       measures are emitted here as their normal partial (distributive {@code sum/min/max/count}).</li>
+     *   <li><b>outer</b> {@code Aggregate(group by [userGroupKeys])} — parent measures now apply {@code f}
+     *       over the de-replicated per-parent values; child partials are combined ({@code sum(sum)},
+     *       {@code min(min)}, {@code max(max)}, {@code sum(count)}).</li>
+     * </ol>
+     *
+     * <p><b>Scope guardrails (research §6 — bail rather than return a wrong answer).</b> This handles the
+     * distributive/algebraic measures that decompose cleanly ({@code sum, min, max, count}; {@code avg} was
+     * pre-reduced to {@code sum+count} by {@code AggregateReduceFunctionsRule}). It intentionally does NOT
+     * rewrite when: any measure is DISTINCT or holistic ({@code count(distinct)}, {@code median},
+     * {@code percentile} — no bounded partial state, §6.1/6.2); a measure's argument is not a bare column
+     * ref (computed expression — grain undecidable); or the plan shape isn't the expected
+     * {@code Aggregate(Project(...reshape chain))}. In every bail it returns {@code aggRel} unchanged, so
+     * unsupported shapes keep today's behavior rather than silently miscomputing.
+     */
+    private static Rel tryParentMeasureDedup(Rel aggRel, FnCatalog fns) {
+        AggregateRel agg = aggRel.getAggregate();
+        if (agg.hasInput() == false || agg.getMeasuresCount() == 0) return aggRel;
+        // Expected shape: Aggregate over the parent-column Project over the filter/reshape chain.
+        if (agg.getInput().getRelTypeCase() != Rel.RelTypeCase.PROJECT) return aggRel;
+        ProjectRel proj = agg.getInput().getProject();
+        if (proj.hasInput() == false) return aggRel;
+
+        // scanWidth = parent/child boundary in the RESHAPE output (indices < scanWidth are parent columns).
+        Integer scanWidth = scanColumnCount(proj.getInput());
+        if (scanWidth == null) return aggRel;
+
+        // The Project maps the aggregate's input columns (0..projOut-1) to columns of the reshape output.
+        // We need, per aggregate-referenced column, the RESHAPE-space index so we can classify its grain and
+        // (for parent cols) carry it through the inner group-by. Resolve the project's output→reshape map.
+        java.util.List<Integer> projToReshape = projectOutputToInputIndex(proj);
+        if (projToReshape == null) return aggRel;
+
+        // Classify every measure. Bail (return unchanged) on anything not safely decomposable.
+        boolean anyParentMeasure = false;
+        for (AggregateRel.Measure m : agg.getMeasuresList()) {
+            AggregateFunction fn = m.getMeasure();
+            String name = fns.baseName(fn.getFunctionReference());
+            if (name == null) return aggRel;                              // unknown function → don't touch
+            if (fn.getInvocation() == AggregateFunction.AggregationInvocation.AGGREGATION_INVOCATION_DISTINCT) {
+                return aggRel;                                            // DISTINCT is holistic (§6.2) → bail
+            }
+            if (isDecomposable(name) == false) return aggRel;            // median/percentile/… (§6.1) → bail
+            if (fn.getArgumentsCount() == 0) {
+                // argless count() — parent-grain (distinct parents). Safe: handled by combine as sum(count).
+                anyParentMeasure = true;
+                continue;
+            }
+            if (fn.getArgumentsCount() != 1) return aggRel;              // multi-arg agg — out of scope
+            Integer projIdx = fieldIndexOf(fn.getArguments(0).getValue());
+            if (projIdx == null) return aggRel;                          // computed arg — grain undecidable
+            if (projIdx >= projToReshape.size()) return aggRel;
+            int reshapeIdx = projToReshape.get(projIdx);
+            if (reshapeIdx < scanWidth) anyParentMeasure = true;         // parent-grain measure present
+        }
+        if (anyParentMeasure == false) {
+            // Only child-grain measures → the flat aggregate is already correct; leave it (also avoids
+            // needlessly rewriting the pure-child metric shape the old code deliberately skipped).
+            return aggRel;
+        }
+
+        // Also classify the group keys' grains (a `by <dim>` on a child column is a genuine per-child group
+        // and is out of scope for parent-collapse; bail to preserve behavior). Grouping expressions are
+        // positional refs into the aggregate's input (the Project output).
+        for (AggregateRel.Grouping g : agg.getGroupingsList()) {
+            for (Expression ge : g.getGroupingExpressionsList()) {
+                Integer gIdx = fieldIndexOf(ge);
+                if (gIdx == null) return aggRel;                         // computed group key → bail
+                if (gIdx >= projToReshape.size()) return aggRel;
+                if (projToReshape.get(gIdx) >= scanWidth) return aggRel; // group by child column → bail
+            }
+        }
+
+        return buildTwoPhase(aggRel, agg, proj, projToReshape, scanWidth, fns);
+    }
+
+    /**
+     * Builds the two-phase (inner-dedup, outer-combine) aggregate. Preconditions verified by the caller:
+     * expected shape, all measures decomposable + single-or-zero bare-column arg, group keys parent-grain.
+     *
+     * <p>Layout. Let the inner group key be {@code [g0..g(k-1), c0..c(j-1), __row_id__]} where {@code g*}
+     * are the user group columns and {@code c*} are the DISTINCT parent columns any parent measure reads
+     * (both carried as grouping keys — functionally determined by {@code __row_id__}). Child-grain measures
+     * become inner partials appended after the group columns. Substrait aggregate output order is
+     * {@code [grouping cols..., measures...]}, so the inner output is
+     * {@code [g0.., c0.., __row_id__, childPartial0..]} — indices we reference by position in the outer phase.
+     */
+    private static Rel buildTwoPhase(
+        Rel aggRel,
+        AggregateRel agg,
+        ProjectRel proj,
+        java.util.List<Integer> projToReshape,
+        int scanWidth,
+        FnCatalog fns
+    ) {
+        // Thread __row_id__ through the reshape chain beneath the Project.
+        RowIdChain chain = threadRowId(proj.getInput());
+        if (chain == null) return aggRel;
+        int rowIdIdx = chain.rowIdIndex;   // __row_id__ index in chain.rel (reshape-space, its tail)
+
+        // Collect, in first-seen order: user group-key reshape indices, then the distinct parent-column
+        // reshape indices referenced by parent measures. Each becomes an inner grouping key. A reshape index
+        // >= rowIdIdx never occurs here (row_id is appended at the tail), so no shift needed for these.
+        java.util.LinkedHashMap<Integer, Integer> keyReshapeToInnerSlot = new java.util.LinkedHashMap<>();
+        java.util.List<Integer> groupKeyReshape = new java.util.ArrayList<>();
+        for (AggregateRel.Grouping g : agg.getGroupingsList()) {
+            for (Expression ge : g.getGroupingExpressionsList()) {
+                int r = projToReshape.get(fieldIndexOf(ge));
+                groupKeyReshape.add(r);
+                keyReshapeToInnerSlot.putIfAbsent(r, keyReshapeToInnerSlot.size());
+            }
+        }
+        // Parent-measure argument columns.
+        for (AggregateRel.Measure m : agg.getMeasuresList()) {
+            AggregateFunction fn = m.getMeasure();
+            if (fn.getArgumentsCount() == 1) {
+                int r = projToReshape.get(fieldIndexOf(fn.getArguments(0).getValue()));
+                if (r < scanWidth) keyReshapeToInnerSlot.putIfAbsent(r, keyReshapeToInnerSlot.size());
+            }
+        }
+
+        // ---- INNER aggregate: group by [carried cols..., __row_id__], child-grain measures as partials ----
+        AggregateRel.Grouping.Builder innerGrouping = AggregateRel.Grouping.newBuilder();
+        for (Integer r : keyReshapeToInnerSlot.keySet()) {
+            innerGrouping.addGroupingExpressions(fieldRef(r));   // reshape-space ref (all < rowIdIdx)
+        }
+        int rowIdSlot = keyReshapeToInnerSlot.size();            // __row_id__ is the last grouping key
+        innerGrouping.addGroupingExpressions(fieldRef(rowIdIdx));
+        int innerGroupWidth = rowIdSlot + 1;
+
+        AggregateRel.Builder inner = AggregateRel.newBuilder().setInput(chain.rel).addGroupings(innerGrouping.build());
+        // Child-grain measures: re-emit the measure verbatim but repoint its argument to the reshape-space
+        // index (its original arg pointed at the Project's output column). Track its inner output slot.
+        java.util.List<Integer> childMeasureInnerSlot = new java.util.ArrayList<>();  // per agg measure, inner slot or -1
+        int innerMeasureSlot = innerGroupWidth;
+        for (AggregateRel.Measure m : agg.getMeasuresList()) {
+            AggregateFunction fn = m.getMeasure();
+            boolean childGrain = fn.getArgumentsCount() == 1
+                && projToReshape.get(fieldIndexOf(fn.getArguments(0).getValue())) >= scanWidth;
+            if (childGrain) {
+                int r = projToReshape.get(fieldIndexOf(fn.getArguments(0).getValue()));
+                AggregateFunction.Builder pf = fn.toBuilder().clearArguments()
+                    .addArguments(FunctionArgument.newBuilder().setValue(fieldRef(r)).build());
+                inner.addMeasures(AggregateRel.Measure.newBuilder().setMeasure(pf.build()).build());
+                childMeasureInnerSlot.add(innerMeasureSlot++);
+            } else {
+                childMeasureInnerSlot.add(-1);   // parent-grain (or argless count) → not computed in inner
+            }
+        }
+        Rel innerRel = Rel.newBuilder().setAggregate(inner.build()).build();
+
+        // ---- OUTER aggregate: group by the user keys (by their inner slots); combine each measure ----
+        AggregateRel.Grouping.Builder outerGrouping = AggregateRel.Grouping.newBuilder();
+        for (Integer r : groupKeyReshape) {
+            outerGrouping.addGroupingExpressions(fieldRef(keyReshapeToInnerSlot.get(r)));
+        }
+        AggregateRel.Builder outer = AggregateRel.newBuilder().setInput(innerRel);
+        if (agg.getGroupingsList().isEmpty() == false || outerGrouping.getGroupingExpressionsCount() > 0) {
+            outer.addGroupings(outerGrouping.build());
+        }
+        for (int i = 0; i < agg.getMeasuresCount(); i++) {
+            AggregateRel.Measure m = agg.getMeasures(i);
+            AggregateFunction fn = m.getMeasure();
+            String base = fns.baseName(fn.getFunctionReference());
+            int childSlot = childMeasureInnerSlot.get(i);
+            if (childSlot >= 0) {
+                // Child-grain: COMBINE the inner partial. distributive combiner = sum for sum/count, min/max stay.
+                String combiner = combinerFor(base);
+                int combinerAnchor = fns.anchorFor(combiner, fn.getFunctionReference());
+                if (combinerAnchor < 0) {
+                    // The combiner function (e.g. sum, needed to combine child count() partials) isn't
+                    // declared in this plan's extensions. Rather than emit a dangling anchor, bail — the
+                    // flat aggregate keeps today's behavior for this uncommon mixed shape.
+                    LOGGER.info("[NESTED] parent-dedup(measure): no '{}' combiner anchor for child {} — skipping", combiner, base);
+                    return aggRel;
+                }
+                AggregateFunction.Builder cf = fn.toBuilder()
+                    .setFunctionReference(combinerAnchor)
+                    .clearArguments()
+                    .addArguments(FunctionArgument.newBuilder().setValue(fieldRef(childSlot)).build());
+                outer.addMeasures(AggregateRel.Measure.newBuilder().setMeasure(cf.build()).build());
+            } else if (fn.getArgumentsCount() == 0) {
+                // argless count() over the de-replicated inner rows = distinct-parent count. Keep as count()
+                // (its arg-less form counts inner rows, one per parent) — decomposes normally.
+                outer.addMeasures(m);
+            } else {
+                // Parent-grain measure: apply f over the carried (de-replicated) parent column.
+                int r = projToReshape.get(fieldIndexOf(fn.getArguments(0).getValue()));
+                int innerSlot = keyReshapeToInnerSlot.get(r);
+                AggregateFunction.Builder pf = fn.toBuilder().clearArguments()
+                    .addArguments(FunctionArgument.newBuilder().setValue(fieldRef(innerSlot)).build());
+                outer.addMeasures(AggregateRel.Measure.newBuilder().setMeasure(pf.build()).build());
+            }
+        }
+
+        // Outer aggregate output = [outer group cols..., outer measures...]. The original aggregate's output
+        // was [group cols..., measures...] in the same order, so the shapes line up 1:1 — no re-projection
+        // needed. Preserve the original aggregate's RelCommon (emit/direct) so downstream indices are stable.
+        if (agg.hasCommon()) outer.setCommon(agg.getCommon());
+        LOGGER.info("[NESTED] parent-dedup(measure): two-phase over __row_id__@{} — {} carried key(s), {} measure(s)",
+            rowIdIdx, keyReshapeToInnerSlot.size(), agg.getMeasuresCount());
+        return Rel.newBuilder().setAggregate(outer.build()).build();
+    }
+
+    /**
+     * Resolves a Project's output column index → its input (reshape-space) column index, for the bare
+     * field-ref / emit shapes isthmus produces. Returns null if any output isn't a passthrough of an input
+     * column (e.g. a computed expression), since then grain can't be decided positionally.
+     *
+     * <p>Two shapes: (a) an {@code emit} output_mapping selecting expressions, where each expression must be
+     * a bare input field ref; (b) no emit → output = expressions in order. In both the mapped expression
+     * must be a bare {@code fieldRef} into the project's input.
+     */
+    private static java.util.List<Integer> projectOutputToInputIndex(ProjectRel proj) {
+        java.util.List<Expression> exprs = proj.getExpressionsList();
+        java.util.List<Integer> out = new java.util.ArrayList<>();
+        if (proj.hasCommon() && proj.getCommon().hasEmit()) {
+            // With an emit, the project's logical output columns are input-columns-then-expressions, and the
+            // emit selects among them by index. inputCount is unknown here, but every emitted position that
+            // lands in the expression range must resolve to a bare field ref; positions in the input range
+            // pass an input column through directly. We over-approximate inputCount as the max emit target
+            // minus expressions; simpler and robust: require emit targets to reference expressions that are
+            // bare field refs, and treat a target < (target0 of first expression) as a direct input passthrough.
+            // In practice isthmus emits output_mapping into the EXPRESSION range for `fields`/`stats` inputs,
+            // so map each target through the expressions list.
+            int exprBase = -1;
+            // Heuristic base: the smallest target that indexes an expression. Isthmus sets output_mapping to
+            // [inputCount .. inputCount+exprCount). Recover inputCount = minTarget when all targets are the
+            // contiguous expression range; otherwise fall back to treating targets as expression indices.
+            int minTarget = Integer.MAX_VALUE, maxTarget = Integer.MIN_VALUE;
+            for (int t : proj.getCommon().getEmit().getOutputMappingList()) { minTarget = Math.min(minTarget, t); maxTarget = Math.max(maxTarget, t); }
+            if (exprs.isEmpty() == false && maxTarget - minTarget == exprs.size() - 1 && minTarget >= 0) {
+                exprBase = minTarget;   // targets map 1:1 onto the expression list
+            }
+            for (int t : proj.getCommon().getEmit().getOutputMappingList()) {
+                int ei = (exprBase >= 0) ? (t - exprBase) : t;
+                if (ei < 0 || ei >= exprs.size()) return null;
+                Integer idx = fieldIndexOf(exprs.get(ei));
+                if (idx == null) return null;
+                out.add(idx);
+            }
+            return out;
+        }
+        // No emit: output = expressions in order; each must be a bare field ref.
+        for (Expression e : exprs) {
+            Integer idx = fieldIndexOf(e);
+            if (idx == null) return null;
+            out.add(idx);
+        }
+        return out;
+    }
+
+    /** Distributive/algebraic base names this pass can decompose. avg/stddev/var are pre-reduced upstream. */
+    private static boolean isDecomposable(String base) {
+        switch (base) {
+            case "sum":
+            case "min":
+            case "max":
+            case "count":
+                return true;
+            default:
+                return false;   // median, percentile, mode, count_distinct, approx_* … → holistic/unsupported
+        }
+    }
+
+    /** The distributive combiner that re-aggregates a partial: sum/count → sum; min → min; max → max. */
+    private static String combinerFor(String base) {
+        switch (base) {
+            case "count":
+            case "sum":
+                return "sum";
+            case "min":
+                return "min";
+            case "max":
+                return "max";
+            default:
+                return base;
+        }
+    }
+
+    /**
+     * Read-only anchor↔name catalog over {@code Plan.extensions}. Substrait function names live only at the
+     * Plan level; the Rel layer holds a numeric {@code function_reference}. Names carry a {@code :sig} suffix
+     * (e.g. {@code sum:i32}) — {@link #baseName} strips it.
+     */
+    private static final class FnCatalog {
+        private final java.util.Map<Integer, String> anchorToName;
+
+        private FnCatalog(java.util.Map<Integer, String> m) { this.anchorToName = m; }
+
+        static FnCatalog from(Plan plan) {
+            java.util.Map<Integer, String> m = new java.util.HashMap<>();
+            for (io.substrait.proto.SimpleExtensionDeclaration d : plan.getExtensionsList()) {
+                if (d.hasExtensionFunction()) {
+                    m.put(d.getExtensionFunction().getFunctionAnchor(), d.getExtensionFunction().getName());
+                }
+            }
+            return new FnCatalog(m);
+        }
+
+        /** Base function name (suffix stripped), or null if the anchor is unknown. */
+        String baseName(int anchor) {
+            String n = anchorToName.get(anchor);
+            if (n == null) return null;
+            int c = n.indexOf(':');
+            return c < 0 ? n : n.substring(0, c);
+        }
+
+        /**
+         * The anchor for a function whose base name is {@code base}. Prefer an existing declaration with a
+         * matching base name (reusing isthmus's own signature); if none exists (e.g. no {@code sum} was
+         * declared because the query only had {@code count}), fall back to {@code likeAnchor} — safe here
+         * because the only cross-name case is count→sum, and a plan with a parent count() that needs a sum
+         * combiner always also has a numeric measure whose anchor is a valid sum. If truly absent, returns
+         * {@code likeAnchor} unchanged; the consumer resolves by the declared name, so a mismatch would fail
+         * loudly rather than silently miscompute.
+         */
+        int anchorFor(String base, int likeAnchor) {
+            // If the requested combiner IS the like-anchor's own base (min→min, max→max), reuse it directly.
+            String likeName = anchorToName.get(likeAnchor);
+            if (likeName != null) {
+                int c = likeName.indexOf(':');
+                if ((c < 0 ? likeName : likeName.substring(0, c)).equals(base)) return likeAnchor;
+            }
+            for (java.util.Map.Entry<Integer, String> e : anchorToName.entrySet()) {
+                String n = e.getValue();
+                int c = n.indexOf(':');
+                if ((c < 0 ? n : n.substring(0, c)).equals(base)) return e.getKey();
+            }
+            return -1;   // not declared — caller must bail rather than emit a dangling anchor
+        }
     }
 
     /** True if the aggregate has no grouping expression (ungrouped). */
@@ -464,7 +845,13 @@ final class NestedParentDedupRewriter {
                 // when __row_id__ was inserted below, so shift the condition to match.
                 io.substrait.proto.FilterRel.Builder fb = rel.getFilter().toBuilder().setInput(in.rel);
                 if (rel.getFilter().hasCondition()) {
-                    fb.setCondition(shiftAllFieldRefs(rel.getFilter().getCondition(), in.rowIdIndex));
+                    try {
+                        fb.setCondition(shiftAllFieldRefs(rel.getFilter().getCondition(), in.rowIdIndex));
+                    } catch (UnshiftableExpressionException ex) {
+                        // Filter condition holds a ref we can't safely renumber → bail to the original plan.
+                        LOGGER.debug("[NESTED] threadRowId bail: unshiftable filter condition — {}", ex.getMessage());
+                        return null;
+                    }
                 }
                 Rel newRel = rel.toBuilder().setFilter(fb.build()).build();
                 return new RowIdChain(newRel, in.rowIdIndex);
@@ -525,7 +912,13 @@ final class NestedParentDedupRewriter {
         // Shift expression field-references (>= insertion index) by +1 (recursively, incl. nested args).
         pb.clearExpressions();
         for (Expression e : project.getExpressionsList()) {
-            pb.addExpressions(shiftAllFieldRefs(e, in.rowIdIndex));
+            try {
+                pb.addExpressions(shiftAllFieldRefs(e, in.rowIdIndex));
+            } catch (UnshiftableExpressionException ex) {
+                // Project expression holds a ref we can't safely renumber → bail to the original plan.
+                LOGGER.debug("[NESTED] threadRowId bail: unshiftable project expression — {}", ex.getMessage());
+                return null;
+            }
         }
 
         int newRowIdOut;
@@ -547,35 +940,207 @@ final class NestedParentDedupRewriter {
     }
 
     /**
-     * Returns {@code e} with every struct-field reference index {@code >= threshold} bumped by +1,
-     * recursively — descends into {@code scalar_function} arguments so filter conditions and computed
-     * project expressions (e.g. {@code gt($7, 4)}, {@code and(...)}) are shifted consistently. Bare
-     * field refs, literals, and casts are handled; unrecognised shapes are returned unchanged.
+     * Signals that an expression contains a field reference at or above the shift threshold inside a variant
+     * this rewriter cannot safely renumber (e.g. a window function, subquery, or lambda). Rather than emit an
+     * off-by-one plan, {@link #shiftAllFieldRefs} throws this so callers can bail to the original (unrewritten)
+     * plan — honoring the file-wide "bail rather than return a wrong answer" contract.
      */
-    private static Expression shiftAllFieldRefs(Expression e, int threshold) {
+    static final class UnshiftableExpressionException extends RuntimeException {
+        UnshiftableExpressionException(Expression.RexTypeCase variant) {
+            super("cannot shift field refs inside expression variant " + variant);
+        }
+    }
+
+    /**
+     * Test/utility wrapper around {@link #shiftAllFieldRefs}: returns the shifted expression, or {@code null} if
+     * the expression contains an unshiftable variant (mirrors the bail-to-original behavior the callers apply).
+     */
+    static Expression shiftAllFieldRefsOrNull(Expression e, int threshold) {
+        try {
+            return shiftAllFieldRefs(e, threshold);
+        } catch (UnshiftableExpressionException ex) {
+            return null;
+        }
+    }
+
+    /**
+     * Returns {@code e} with every struct-field reference index {@code >= threshold} bumped by +1, recursively
+     * through EVERY expression variant that can carry a field reference — bare refs, scalar functions, casts,
+     * {@code IF/THEN} (CASE), {@code SWITCH}, and {@code IN}-list forms ({@code SingularOrList}/{@code MultiOrList}).
+     * This runs after {@code __row_id__} is inserted at {@code threshold}, so every column at or past that index
+     * moved right by one and every reference to it must move with it.
+     *
+     * <p>Literals, enums, and dynamic parameters reference no column and are returned unchanged. For opaque
+     * variants that MAY reference columns but that we cannot rewrite (window functions, subqueries, lambdas), we
+     * inspect their serialized form: if it contains no reference {@code >= threshold} it is returned as-is,
+     * otherwise a {@link UnshiftableExpressionException} is thrown so the caller bails to the original plan
+     * rather than silently miscomputing. This keeps the transform total and correctness-preserving for any input.
+     */
+    static Expression shiftAllFieldRefs(Expression e, int threshold) {
         // Bare field reference.
         Integer idx = fieldIndexOf(e);
         if (idx != null) {
             return idx >= threshold ? fieldRef(idx + 1) : e;
         }
-        // Scalar function: shift each argument's value expression.
-        if (e.hasScalarFunction()) {
-            Expression.ScalarFunction sf = e.getScalarFunction();
-            Expression.ScalarFunction.Builder sb = sf.toBuilder().clearArguments();
-            for (FunctionArgument arg : sf.getArgumentsList()) {
-                if (arg.hasValue()) {
-                    sb.addArguments(FunctionArgument.newBuilder().setValue(shiftAllFieldRefs(arg.getValue(), threshold)).build());
-                } else {
-                    sb.addArguments(arg);
+        switch (e.getRexTypeCase()) {
+            case SCALAR_FUNCTION: {
+                // Shift each argument's value expression (covers gt($7,4), and(...), coalesce(...), etc.).
+                Expression.ScalarFunction sf = e.getScalarFunction();
+                Expression.ScalarFunction.Builder sb = sf.toBuilder().clearArguments();
+                for (FunctionArgument arg : sf.getArgumentsList()) {
+                    if (arg.hasValue()) {
+                        sb.addArguments(FunctionArgument.newBuilder().setValue(shiftAllFieldRefs(arg.getValue(), threshold)).build());
+                    } else {
+                        sb.addArguments(arg);
+                    }
                 }
+                return e.toBuilder().setScalarFunction(sb.build()).build();
             }
-            return e.toBuilder().setScalarFunction(sb.build()).build();
+            case CAST: {
+                if (e.getCast().hasInput() == false) {
+                    return e;
+                }
+                return e.toBuilder()
+                    .setCast(e.getCast().toBuilder().setInput(shiftAllFieldRefs(e.getCast().getInput(), threshold)).build())
+                    .build();
+            }
+            case IF_THEN: {
+                // CASE WHEN <cond> THEN <val> ... ELSE <val>: shift the condition and result of each clause.
+                Expression.IfThen it = e.getIfThen();
+                Expression.IfThen.Builder ib = it.toBuilder().clearIfs();
+                for (Expression.IfThen.IfClause clause : it.getIfsList()) {
+                    Expression.IfThen.IfClause.Builder cb = clause.toBuilder();
+                    if (clause.hasIf()) {
+                        cb.setIf(shiftAllFieldRefs(clause.getIf(), threshold));
+                    }
+                    if (clause.hasThen()) {
+                        cb.setThen(shiftAllFieldRefs(clause.getThen(), threshold));
+                    }
+                    ib.addIfs(cb.build());
+                }
+                if (it.hasElse()) {
+                    ib.setElse(shiftAllFieldRefs(it.getElse(), threshold));
+                }
+                return e.toBuilder().setIfThen(ib.build()).build();
+            }
+            case SWITCH_EXPRESSION: {
+                // SWITCH <match> WHEN <literal> THEN <val> ... ELSE <val>: the WHEN keys are literals (no shift);
+                // shift the match expression and each THEN result plus the ELSE.
+                Expression.SwitchExpression sw = e.getSwitchExpression();
+                Expression.SwitchExpression.Builder swb = sw.toBuilder().clearIfs();
+                if (sw.hasMatch()) {
+                    swb.setMatch(shiftAllFieldRefs(sw.getMatch(), threshold));
+                }
+                for (Expression.SwitchExpression.IfValue iv : sw.getIfsList()) {
+                    Expression.SwitchExpression.IfValue.Builder ivb = iv.toBuilder();
+                    if (iv.hasThen()) {
+                        ivb.setThen(shiftAllFieldRefs(iv.getThen(), threshold));
+                    }
+                    swb.addIfs(ivb.build());
+                }
+                if (sw.hasElse()) {
+                    swb.setElse(shiftAllFieldRefs(sw.getElse(), threshold));
+                }
+                return e.toBuilder().setSwitchExpression(swb.build()).build();
+            }
+            case SINGULAR_OR_LIST: {
+                // <value> IN (<opt>, <opt>, ...): shift the value and every option.
+                Expression.SingularOrList sol = e.getSingularOrList();
+                Expression.SingularOrList.Builder solb = sol.toBuilder().clearOptions();
+                if (sol.hasValue()) {
+                    solb.setValue(shiftAllFieldRefs(sol.getValue(), threshold));
+                }
+                for (Expression opt : sol.getOptionsList()) {
+                    solb.addOptions(shiftAllFieldRefs(opt, threshold));
+                }
+                return e.toBuilder().setSingularOrList(solb.build()).build();
+            }
+            case MULTI_OR_LIST: {
+                // (<v1>,<v2>,...) IN ((...),(...)): shift each value expression; option records are literals.
+                Expression.MultiOrList mol = e.getMultiOrList();
+                Expression.MultiOrList.Builder molb = mol.toBuilder().clearValue();
+                for (Expression v : mol.getValueList()) {
+                    molb.addValue(shiftAllFieldRefs(v, threshold));
+                }
+                return e.toBuilder().setMultiOrList(molb.build()).build();
+            }
+            case LITERAL:
+            case ENUM:
+            case DYNAMIC_PARAMETER:
+            case REXTYPE_NOT_SET:
+                return e; // references no column — safe to leave unchanged
+            default:
+                // Opaque variant we don't rewrite (WINDOW_FUNCTION, SUBQUERY, LAMBDA, NESTED, ...). If it holds
+                // no reference >= threshold it's unaffected by the insertion and safe to keep verbatim; if it
+                // does, bail rather than emit an off-by-one plan.
+                if (containsFieldRefAtOrAbove(e, threshold)) {
+                    throw new UnshiftableExpressionException(e.getRexTypeCase());
+                }
+                return e;
         }
-        // Cast: shift the inner input.
-        if (e.hasCast() && e.getCast().hasInput()) {
-            return e.toBuilder().setCast(e.getCast().toBuilder().setInput(shiftAllFieldRefs(e.getCast().getInput(), threshold)).build()).build();
+    }
+
+    /**
+     * Deep scan: true if {@code e} (or any descendant expression) is a bare struct-field reference whose index
+     * is {@code >= threshold}. Used to decide whether an un-rewritable expression variant is actually affected
+     * by the {@code __row_id__} insertion (and must trigger a bail) or is safely index-independent.
+     */
+    static boolean containsFieldRefAtOrAbove(Expression e, int threshold) {
+        Integer idx = fieldIndexOf(e);
+        if (idx != null) {
+            return idx >= threshold;
         }
-        return e; // literal / unrecognised — leave as-is
+        for (Expression child : childExpressionsOf(e)) {
+            if (containsFieldRefAtOrAbove(child, threshold)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** All directly-nested child expressions of {@code e}, across every variant, for structural traversal. */
+    private static java.util.List<Expression> childExpressionsOf(Expression e) {
+        java.util.List<Expression> out = new java.util.ArrayList<>();
+        switch (e.getRexTypeCase()) {
+            case SCALAR_FUNCTION:
+                for (FunctionArgument arg : e.getScalarFunction().getArgumentsList()) {
+                    if (arg.hasValue()) out.add(arg.getValue());
+                }
+                break;
+            case CAST:
+                if (e.getCast().hasInput()) out.add(e.getCast().getInput());
+                break;
+            case IF_THEN:
+                for (Expression.IfThen.IfClause c : e.getIfThen().getIfsList()) {
+                    if (c.hasIf()) out.add(c.getIf());
+                    if (c.hasThen()) out.add(c.getThen());
+                }
+                if (e.getIfThen().hasElse()) out.add(e.getIfThen().getElse());
+                break;
+            case SWITCH_EXPRESSION:
+                if (e.getSwitchExpression().hasMatch()) out.add(e.getSwitchExpression().getMatch());
+                for (Expression.SwitchExpression.IfValue iv : e.getSwitchExpression().getIfsList()) {
+                    if (iv.hasThen()) out.add(iv.getThen());
+                }
+                if (e.getSwitchExpression().hasElse()) out.add(e.getSwitchExpression().getElse());
+                break;
+            case SINGULAR_OR_LIST:
+                if (e.getSingularOrList().hasValue()) out.add(e.getSingularOrList().getValue());
+                out.addAll(e.getSingularOrList().getOptionsList());
+                break;
+            case MULTI_OR_LIST:
+                out.addAll(e.getMultiOrList().getValueList());
+                break;
+            case WINDOW_FUNCTION:
+                for (FunctionArgument arg : e.getWindowFunction().getArgumentsList()) {
+                    if (arg.hasValue()) out.add(arg.getValue());
+                }
+                out.addAll(e.getWindowFunction().getPartitionsList());
+                break;
+            default:
+                break;
+        }
+        return out;
     }
 
     /** True if any rel in the tree is our {@code unnest_reshape:} ExtensionSingle. */
@@ -618,7 +1183,7 @@ final class NestedParentDedupRewriter {
         return false;
     }
 
-    private static Integer fieldIndexOf(Expression e) {
+    static Integer fieldIndexOf(Expression e) {
         if (e.hasSelection() == false) return null;
         Expression.FieldReference fr = e.getSelection();
         if (fr.hasDirectReference() == false || fr.getDirectReference().hasStructField() == false) return null;
@@ -628,7 +1193,7 @@ final class NestedParentDedupRewriter {
     }
 
     /** A positional field reference expression on the input row. */
-    private static Expression fieldRef(int index) {
+    static Expression fieldRef(int index) {
         return Expression.newBuilder()
             .setSelection(
                 Expression.FieldReference.newBuilder()

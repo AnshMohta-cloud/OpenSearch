@@ -48,6 +48,7 @@ import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
 import org.opensearch.OpenSearchException;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.lucene.queries.ExtendedCommonTermsQuery;
 
@@ -88,10 +89,25 @@ public class Queries {
     }
 
     /**
-     * Creates a new non-nested docs query
+     * Creates a new non-nested docs query — a filter matching root (parent) documents, used to exclude
+     * hidden nested child docs from root searches and to build the parent {@code BitSet} for block joins.
+     *
+     * <p>Classic Lucene indexes stamp {@code _primary_term} on every root doc, so a {@code FieldExistsQuery}
+     * on it selects roots. Composite (pluggable data format) indexes store {@code _primary_term} columnar
+     * (absent from the Lucene secondary) and instead mark the block join with a Lucene parent field
+     * ({@link Lucene#PARENT_FIELD}, set via {@code IndexWriterConfig.setParentField}); a
+     * {@code FieldExistsQuery} on that field selects roots there. Matching EITHER field makes this filter
+     * correct for both index types. The two field-exists clauses always mark the same set of root docs: where
+     * both fields are present (e.g. a classic index that also sets a Lucene parent field when index-sorted),
+     * the disjunction still selects exactly the roots; where only one is present (classic without a parent
+     * field → only {@code _primary_term}; composite → only {@link Lucene#PARENT_FIELD}), the other clause
+     * simply matches nothing. A doc is a root iff it has at least one of the two.
      */
     public static Query newNonNestedFilter() {
-        return new FieldExistsQuery(SeqNoFieldMapper.PRIMARY_TERM_NAME);
+        return new BooleanQuery.Builder().add(new FieldExistsQuery(SeqNoFieldMapper.PRIMARY_TERM_NAME), Occur.SHOULD)
+            .add(new FieldExistsQuery(Lucene.PARENT_FIELD), Occur.SHOULD)
+            .setMinimumNumberShouldMatch(1)
+            .build();
     }
 
     public static BooleanQuery filtered(@Nullable Query query, @Nullable Query filter) {

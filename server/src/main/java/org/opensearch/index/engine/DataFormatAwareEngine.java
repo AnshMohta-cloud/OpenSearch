@@ -2166,7 +2166,8 @@ public class DataFormatAwareEngine implements Indexer {
             return searchable.directoryReader();
         }
         throw new IllegalStateException(
-            "Lucene format reader " + luceneReaderObj.getClass().getName()
+            "Lucene format reader "
+                + luceneReaderObj.getClass().getName()
                 + " does not implement SearchableDirectoryReaderProvider; cannot build searcher"
         );
     }

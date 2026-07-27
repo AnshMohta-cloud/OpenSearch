@@ -37,8 +37,10 @@ import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
 import org.opensearch.Version;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.VersionUtils;
@@ -47,10 +49,17 @@ public class QueriesTests extends OpenSearchTestCase {
 
     public void testNonNestedQuery() {
         for (Version version : VersionUtils.allVersions()) {
-            // This is a custom query that extends AutomatonQuery and want to make sure the equals method works
+            // newNonNestedFilter selects root docs by matching EITHER the classic _primary_term field OR the
+            // composite-index block-join parent field. Assert it builds that exact disjunction (SHOULD over both,
+            // minShouldMatch=1) so a regression to a single-field filter is caught. This also exercises the
+            // BooleanQuery equals/hashCode contract across versions.
+            Query expected = new BooleanQuery.Builder().add(new FieldExistsQuery(SeqNoFieldMapper.PRIMARY_TERM_NAME), Occur.SHOULD)
+                .add(new FieldExistsQuery(Lucene.PARENT_FIELD), Occur.SHOULD)
+                .setMinimumNumberShouldMatch(1)
+                .build();
             assertEquals(Queries.newNonNestedFilter(), Queries.newNonNestedFilter());
             assertEquals(Queries.newNonNestedFilter().hashCode(), Queries.newNonNestedFilter().hashCode());
-            assertEquals(Queries.newNonNestedFilter(), new FieldExistsQuery(SeqNoFieldMapper.PRIMARY_TERM_NAME));
+            assertEquals(expected, Queries.newNonNestedFilter());
         }
     }
 

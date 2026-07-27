@@ -468,6 +468,8 @@ final class DefaultSearchContext extends SearchContext {
         if (mapperService().hasNested()
             && new NestedHelper(mapperService()).mightMatchNestedDocs(query)
             && (aliasFilter == null || new NestedHelper(mapperService()).mightMatchNestedDocs(aliasFilter))) {
+            // Exclude nested child docs so a root query returns only parent (root) docs. newNonNestedFilter()
+            // matches roots on both classic (_primary_term) and composite (Lucene parent field) indexes.
             filters.add(Queries.newNonNestedFilter());
         }
 

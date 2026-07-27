@@ -287,6 +287,126 @@ public final class ParquetColumnReader implements Closeable {
         return out;
     }
 
+    /**
+     * One row's leaf entries with their Dremel repetition + definition levels — the primitive for
+     * arbitrary-depth nested reconstruction. {@code rep}/{@code def} have one entry per slot (length
+     * {@code rep.length == def.length}, including null/empty-list slots); {@code maxDef} is the leaf's max
+     * definition level (a fully-present value has {@code def == maxDef}). Exactly one of {@code longs}
+     * (numeric leaf, raw bits) / {@code bytes} (BYTE_ARRAY leaf) is non-null, holding only the PRESENT
+     * values in slot order. Callers walk the levels to regroup values into (possibly deeply-nested,
+     * possibly empty) elements.
+     */
+    public record LeafLevels(int[] rep, int[] def, int maxDef, long[] longs, byte[][] bytes) {}
+
+    /**
+     * Reads one row's leaf entries with Dremel rep/def levels. {@code byteArray} selects the value payload
+     * form: {@code true} for a {@code BYTE_ARRAY} (keyword/text) leaf (values in {@link LeafLevels#bytes}),
+     * {@code false} for a numeric leaf (raw bits in {@link LeafLevels#longs}). Follows the grow-and-retry
+     * overflow protocol on the level buffers, the numeric buffer, and the byte payload.
+     */
+    public LeafLevels readLeafLevelsAtRow(long row, boolean byteArray) throws IOException {
+        ensureOpen();
+        stats.slowRepeatedRead();
+        MemorySegment levelCount = bufferPool.longOut("levelCount");
+        MemorySegment valueCount = bufferPool.longOut("valueCount");
+        MemorySegment maxDefOut = bufferPool.longOut("maxDef");
+
+        long levelCap = 8;
+        long longCap = byteArray ? 0 : 8;
+        long byteCap = byteArray ? 256 : 0;
+        MemorySegment rep = bufferPool.ints("rep", levelCap);
+        MemorySegment def = bufferPool.ints("def", levelCap);
+        MemorySegment longs = byteArray ? MemorySegment.NULL : bufferPool.longs("levelLongs", longCap);
+        // The native writer emits value_count+1 CSR offsets whenever the LEVELS fit (it bounds-checks levels,
+        // not offsets). Because present values are a subset of level slots, value_count <= level_count <=
+        // levelCap always holds on any call that writes offsets, so size the offsets buffer to levelCap+1
+        // (NOT longCap+1 — longCap starts at 0 for byte columns, which under-sized the buffer and caused an
+        // out-of-bounds read of offsets[value_count]).
+        MemorySegment offsets = byteArray ? bufferPool.longs("levelOffsets", levelCap + 1) : MemorySegment.NULL;
+        MemorySegment bytes = byteArray ? bufferPool.bytes("levelBytes", byteCap) : MemorySegment.NULL;
+
+        long rc = RustBridge.readLeafLevelsAtRow(handle, row, levelCount, valueCount, maxDefOut, rep, def,
+            levelCap, longs, longCap, bytes, offsets, byteCap);
+        if (rc == RustBridge.RC_OVERFLOW) {
+            int reqLevels = (int) levelCount.get(ValueLayout.JAVA_LONG, 0);
+            int reqValues = (int) valueCount.get(ValueLayout.JAVA_LONG, 0);
+            levelCap = Math.max(reqLevels, 1);
+            rep = bufferPool.ints("rep", levelCap);
+            def = bufferPool.ints("def", levelCap);
+            if (byteArray) {
+                longCap = Math.max(reqValues, 1);
+                // Keep offsets sized to levelCap+1 (>= value_count+1) so the offsets write can never overflow.
+                offsets = bufferPool.longs("levelOffsets", levelCap + 1);
+                // First re-read to establish offsets (levels+offsets now fit) → learn required byte size.
+                rc = RustBridge.readLeafLevelsAtRow(handle, row, levelCount, valueCount, maxDefOut, rep, def,
+                    levelCap, MemorySegment.NULL, longCap, bytes, offsets, byteCap);
+                int cnt = (int) valueCount.get(ValueLayout.JAVA_LONG, 0);
+                long reqBytes = cnt == 0 ? 0 : offsets.getAtIndex(ValueLayout.JAVA_LONG, cnt);
+                byteCap = Math.max(reqBytes, 1);
+                bytes = bufferPool.bytes("levelBytes", byteCap);
+                rc = RustBridge.readLeafLevelsAtRow(handle, row, levelCount, valueCount, maxDefOut, rep, def,
+                    levelCap, MemorySegment.NULL, longCap, bytes, offsets, byteCap);
+            } else {
+                longCap = Math.max(reqValues, 1);
+                longs = bufferPool.longs("levelLongs", longCap);
+                rc = RustBridge.readLeafLevelsAtRow(handle, row, levelCount, valueCount, maxDefOut, rep, def,
+                    levelCap, longs, longCap, MemorySegment.NULL, MemorySegment.NULL, 0L);
+            }
+            if (rc == RustBridge.RC_OVERFLOW) {
+                throw new IOException("readLeafLevelsAtRow: overflow persisted after retry at row " + row);
+            }
+        }
+
+        int levels = (int) levelCount.get(ValueLayout.JAVA_LONG, 0);
+        int values = (int) valueCount.get(ValueLayout.JAVA_LONG, 0);
+        int maxDef = (int) maxDefOut.get(ValueLayout.JAVA_LONG, 0);
+        int[] repArr = levels == 0 ? new int[0] : rep.asSlice(0, (long) levels * Integer.BYTES).toArray(ValueLayout.JAVA_INT);
+        int[] defArr = levels == 0 ? new int[0] : def.asSlice(0, (long) levels * Integer.BYTES).toArray(ValueLayout.JAVA_INT);
+        if (byteArray) {
+            byte[][] bv = new byte[values][];
+            for (int i = 0; i < values; i++) {
+                long start = offsets.getAtIndex(ValueLayout.JAVA_LONG, i);
+                long end = offsets.getAtIndex(ValueLayout.JAVA_LONG, i + 1);
+                bv[i] = bytes.asSlice(start, end - start).toArray(ValueLayout.JAVA_BYTE);
+            }
+            return new LeafLevels(repArr, defArr, maxDef, null, bv);
+        }
+        long[] lv = values == 0 ? new long[0] : longs.asSlice(0, (long) values * Long.BYTES).toArray(ValueLayout.JAVA_LONG);
+        return new LeafLevels(repArr, defArr, maxDef, lv, null);
+    }
+
+    /** Cached per-level element-exists definition thresholds (see {@link #levelDefThresholds()}). */
+    private int[] levelDefThresholds;
+
+    /**
+     * The leaf's per-nesting-level "element exists" definition thresholds (outermost level first), read from
+     * the Parquet schema by the native reader. An element at nesting level {@code k} (1-based) exists in a slot
+     * iff that slot's definition level {@code >= levelDefThresholds()[k-1]}. Derived from the actual schema —
+     * no assumption about how many definition levels a nesting level contributes — so nested assembly is correct
+     * for any LIST encoding. Computed once at column open on the native side; cached here after first fetch.
+     */
+    public int[] levelDefThresholds() throws IOException {
+        if (levelDefThresholds != null) {
+            return levelDefThresholds;
+        }
+        ensureOpen();
+        long cap = 8;
+        MemorySegment count = bufferPool.longOut("thrCount");
+        MemorySegment out = bufferPool.ints("thr", cap);
+        long rc = RustBridge.leafLevelThresholds(handle, count, out, cap);
+        if (rc == RustBridge.RC_OVERFLOW) {
+            cap = Math.max(count.get(ValueLayout.JAVA_LONG, 0), 1);
+            out = bufferPool.ints("thr", cap);
+            rc = RustBridge.leafLevelThresholds(handle, count, out, cap);
+            if (rc == RustBridge.RC_OVERFLOW) {
+                throw new IOException("leafLevelThresholds: overflow persisted after retry");
+            }
+        }
+        int n = (int) count.get(ValueLayout.JAVA_LONG, 0);
+        levelDefThresholds = n == 0 ? new int[0] : out.asSlice(0, (long) n * Integer.BYTES).toArray(ValueLayout.JAVA_INT);
+        return levelDefThresholds;
+    }
+
     // ── Page index + page decode (Layer 1-4 hot path) ──
 
     /**

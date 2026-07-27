@@ -13,6 +13,7 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -67,9 +68,12 @@ public final class ArrowValues {
     }
 
     /**
-     * Reads an Arrow cell as a JSON-friendly scalar: numerics coerced to
-     * {@code long}/{@code double}, timestamps rendered as ISO-8601 UTC strings. Binary and
-     * complex (list/struct/decimal) types are not yet supported and return {@code null}.
+     * Reads an Arrow cell as a JSON-friendly value: numerics coerced to {@code long}/{@code double},
+     * timestamps rendered as ISO-8601 UTC strings, a {@code LIST} as a {@link List}, and a {@code STRUCT}
+     * as an ordered {@code Map<String,Object>}. This drives derived-source reconstruction, so a nested
+     * field stored as a Parquet {@code LIST<STRUCT>} column round-trips back into a JSON array of objects
+     * (element order and cardinality preserved by the column's Dremel repetition/definition levels).
+     * Binary and decimal types are not yet supported and return {@code null}.
      */
     public static Object toSourceValue(FieldVector vec, int idx) {
         if (vec == null || vec.isNull(idx)) return null;
@@ -83,6 +87,14 @@ public final class ArrowValues {
                 return null;
             default:
                 break;
+        }
+        // Complex types: recurse on the child vectors so nested arrays/objects rebuild by position.
+        // (StructVector and MapVector both extend ListVector, so match Struct/List explicitly.)
+        if (id == ArrowType.ArrowTypeID.Struct && vec instanceof StructVector sv) {
+            return structToMap(sv, idx);
+        }
+        if (id == ArrowType.ArrowTypeID.List && vec instanceof ListVector lv) {
+            return listToValues(lv, idx);
         }
         Object raw = vec.getObject(idx);
         switch (id) {
@@ -103,9 +115,43 @@ public final class ArrowValues {
                 }
                 return raw == null ? null : raw.toString();
             default:
-                // TODO type coverage (list, struct, decimal)
+                // TODO type coverage (decimal)
                 return null;
         }
+    }
+
+    /**
+     * Converts one row of a {@link ListVector} to a {@code List<Object>} by reading each element of the
+     * backing data vector over this row's {@code [start, end)} offset window (offsets give order +
+     * cardinality). For a {@code LIST<STRUCT>} column each element is itself converted via
+     * {@link #structToMap}, yielding a {@code List<Map<String,Object>>} — the shape a nested field's
+     * {@code _source} array needs.
+     */
+    private static List<Object> listToValues(ListVector listVector, int row) {
+        int start = listVector.getElementStartIndex(row);
+        int end = listVector.getElementEndIndex(row);
+        FieldVector data = listVector.getDataVector();
+        List<Object> out = new ArrayList<>(end - start);
+        for (int i = start; i < end; i++) {
+            out.add(toSourceValue(data, i));
+        }
+        return out;
+    }
+
+    /**
+     * Converts one row of a {@link StructVector} to an ordered {@code Map<String,Object>} (field name →
+     * JSON-friendly value), recursing through {@link #toSourceValue} so nested structs/lists rebuild too.
+     * Null child cells are omitted (mirrors the leaf-field behavior where an absent value is dropped).
+     */
+    private static Map<String, Object> structToMap(StructVector structVector, int idx) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        for (FieldVector child : structVector.getChildrenFromFields()) {
+            Object v = toSourceValue(child, idx);
+            if (v != null) {
+                map.put(child.getField().getName(), v);
+            }
+        }
+        return map;
     }
 
     private static Instant toInstant(long v, TimeUnit unit) {
