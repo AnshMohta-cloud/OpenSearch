@@ -68,6 +68,16 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     // [NESTED-TRACE] see ParquetDocValuesLeafReader — enable logger.org.opensearch.parquet.codec=TRACE.
     private static final Logger TRACE = LogManager.getLogger(ParquetDocValuesProducer.class);
 
+    /**
+     * Node-level kill switch for routing nested {@code _source} reconstruction through a registered
+     * {@link org.opensearch.index.mapper.NestedSourceReconstructor} (DataFusion) instead of the FFI + Dremel path.
+     * Default off; enable with {@code -Dopensearch.parquet.nested_source.datafusion_fetch=true}. Read once at class
+     * load — a static toggle is sufficient because selection is per-call and the fallback is safe.
+     */
+    private static final boolean DATAFUSION_FETCH_ENABLED = Boolean.getBoolean(
+        "opensearch.parquet.nested_source.datafusion_fetch"
+    );
+
     private final Path parquetFile;
     private final MapperService mapperService;
     private final int maxDoc;
@@ -147,6 +157,16 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
                 reader.setQueryStats(queryStats);
             }
         }
+    }
+
+    /** Absolute path of the Parquet file backing this segment (bound to the search's pinned snapshot). */
+    public String parquetFilePath() {
+        return parquetFile.toString();
+    }
+
+    /** Number of Parquet rows (parents) in this segment's file. */
+    public int parquetRowCount() {
+        return Math.toIntExact(parquetRowCount);
     }
 
     // ── DocValuesProducer API ──
@@ -351,6 +371,33 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         if (leaves.isEmpty()) {
             return List.of();
         }
+        // Optional DataFusion-backed reconstruction: when enabled and a backend has registered a reconstructor,
+        // rebuild this nested array by reading the SAME segment file (this.parquetFile) through DataFusion +
+        // ArrowSourceSerializer instead of the FFI + Dremel assembly below. Reads the identical file the query
+        // phase saw, so there is no snapshot-alignment concern. Any null return / failure falls back to the FFI
+        // path — the two produce byte-identical output (both render leaves via SourceValueFormatters).
+        if (DATAFUSION_FETCH_ENABLED) {
+            org.opensearch.index.mapper.NestedSourceReconstructor reconstructor =
+                org.opensearch.index.mapper.NestedSourceReconstructor.get();
+            if (reconstructor != null) {
+                try {
+                    List<Map<String, Object>> df = reconstructor.reconstructNested(
+                        parquetFile.toString(),
+                        0L, // single-file read by path; writer generation is not needed to open the file
+                        path,
+                        parquetRow,
+                        mapperService
+                    );
+                    if (df != null) {
+                        return df;
+                    }
+                } catch (Exception e) {
+                    // Fall back to FFI reconstruction below; log once at debug to avoid per-hit spam.
+                    TRACE.debug("[NESTED-TRACE] DataFusion nested reconstruction failed for path='{}' row={}; "
+                        + "falling back to FFI. cause: {}", path, parquetRow, e.toString());
+                }
+            }
+        }
         if (TRACE.isTraceEnabled()) {
             List<String> cols = new ArrayList<>();
             for (NestedLeaf l : leaves) {
@@ -453,44 +500,12 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
 
     /**
      * Returns the {@code _source} value formatter for a nested-child leaf of the given OpenSearch mapping type.
-     * Mirrors the flat derived-source per-field rendering so a composite nested {@code _source} matches vanilla:
-     * <ul>
-     *   <li>{@code keyword}/{@code text}: raw UTF-8 bytes → {@code String}.</li>
-     *   <li>{@code ip}: the fixed 16-byte encoded form → dotted/canonical address (as {@code IpFieldMapper} does).</li>
-     *   <li>{@code binary}: raw bytes → Base64 (the shape a binary field serializes as in {@code _source}).</li>
-     *   <li>{@code date}/{@code date_nanos}: epoch millis/nanos → the field's date string (default ISO formatter).</li>
-     *   <li>numerics/boolean: already the correct Java value → identity.</li>
-     * </ul>
+     * Delegates to the shared {@link org.opensearch.index.mapper.SourceValueFormatters} so this Parquet-direct
+     * reconstruction and the Arrow-batch reconstruction render every type identically (no byte-for-byte drift).
      */
     private static java.util.function.UnaryOperator<Object> sourceFormatterFor(String typeName) {
-        switch (typeName) {
-            case "keyword":
-            case "text":
-                return v -> new String((byte[]) v, java.nio.charset.StandardCharsets.UTF_8);
-            case "ip":
-                return v -> {
-                    java.net.InetAddress addr = org.apache.lucene.document.InetAddressPoint.decode((byte[]) v);
-                    return org.opensearch.common.network.InetAddresses.toAddrString(addr);
-                };
-            case "binary":
-                return v -> java.util.Base64.getEncoder().encodeToString((byte[]) v);
-            case "date":
-                return v -> DATE_FORMATTER.format(java.time.Instant.ofEpochMilli(((Number) v).longValue()).atZone(java.time.ZoneOffset.UTC));
-            case "date_nanos":
-                return v -> {
-                    long nanos = ((Number) v).longValue();
-                    return DATE_FORMATTER.format(java.time.Instant.ofEpochSecond(nanos / 1_000_000_000L, nanos % 1_000_000_000L).atZone(java.time.ZoneOffset.UTC));
-                };
-            default:
-                return java.util.function.UnaryOperator.identity(); // numerics, boolean — already decoded
-        }
+        return org.opensearch.index.mapper.SourceValueFormatters.forType(typeName);
     }
-
-    /** Default strict date formatter for reconstructing {@code date}/{@code date_nanos} nested leaves. */
-    private static final java.time.format.DateTimeFormatter DATE_FORMATTER = java.time.format.DateTimeFormatter.ofPattern(
-        "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
-        java.util.Locale.ROOT
-    );
 
     private OrdinalTable ordinalTableFor(FieldInfo field, boolean multiValued) throws IOException {
         OrdinalTable table = ordinalTables.get(field.getName());

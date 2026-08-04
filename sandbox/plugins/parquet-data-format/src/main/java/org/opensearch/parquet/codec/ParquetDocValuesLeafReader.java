@@ -80,6 +80,21 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
 
     private final MapperService mapperService;
 
+    /**
+     * Node-level kill switch for serving flat (top-level) doc-values — and therefore flat derived {@code _source},
+     * range, aggregation and sort — from a registered {@link org.opensearch.index.mapper.FlatColumnValueSource}
+     * (DataFusion) instead of the FFI decode path. Default off; enable with
+     * {@code -Dopensearch.parquet.flat_docvalues.datafusion=true}. Interim full-column materialization; the
+     * forward-cursor optimization supersedes it later.
+     */
+    private static final boolean FLAT_DATAFUSION_DV = Boolean.getBoolean("opensearch.parquet.flat_docvalues.datafusion");
+
+    /** Lazily materialized flat columns (DataFusion path), keyed by field name; per-segment, single-threaded. */
+    private final Map<String, org.opensearch.index.mapper.FlatColumnValueSource.LongColumn> flatLongColumns =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, org.opensearch.index.mapper.FlatColumnValueSource.BytesColumn> flatBytesColumns =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
     /** Lazily constructed Parquet producer for this segment; null until first DV access. */
     private ParquetDocValuesProducer producer;
     private boolean producerInitialized;
@@ -582,6 +597,91 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
     }
 
     /**
+     * DataFusion variant of {@link #childFieldColumn}: builds the same per-child-docId value arrays, but sources
+     * each element's value from {@link org.opensearch.index.mapper.NestedSourceReconstructor#reconstructNestedLeaf}
+     * (which reconstructs the owning path's ordered elements from the primary-format file) instead of the FFI
+     * Dremel read. Scatter uses the SAME {@link PathChildMap} row+offset, so element {@code offset} here indexes
+     * the reconstructor's flattened element list identically. Returns {@code null} to fall back to FFI.
+     */
+    private ChildFieldColumn datafusionChildColumn(
+        String field,
+        ChildFieldInfo info,
+        PathChildMap map,
+        int max,
+        boolean isBytes,
+        long[] longs,
+        BytesRef[] bytes,
+        boolean[] present
+    ) throws IOException {
+        org.opensearch.index.mapper.NestedSourceReconstructor rec = org.opensearch.index.mapper.NestedSourceReconstructor.get();
+        if (rec == null) {
+            return null;
+        }
+        String owning = info.owningPath();
+        String leafName = field.substring(owning.length() + 1); // simple leaf name under the owning path
+        String parquetFile = producer().parquetFilePath();
+        // Per-row cache: reconstruct each distinct root row's owning-path leaf values once (child docIds of a
+        // block share a row). Element k of the list = the k-th child of `owning` in the block = map.offset()[docId].
+        java.util.Map<Integer, List<Object>> perRow = new java.util.HashMap<>();
+        for (int docId = 0; docId < max; docId++) {
+            int row = map.parquetRow()[docId];
+            if (row < 0) {
+                continue;
+            }
+            List<Object> elems = perRow.get(row);
+            if (elems == null) {
+                elems = rec.reconstructNestedLeaf(parquetFile, owning, leafName, row, mapperService);
+                if (elems == null) {
+                    return null; // reconstructor can't serve this — fall back to FFI wholesale
+                }
+                perRow.put(row, elems);
+            }
+            int off = map.offset()[docId];
+            if (off < 0 || off >= elems.size()) {
+                continue;
+            }
+            Object v = elems.get(off);
+            if (v == null) {
+                continue; // element exists but leaf absent — leave docId absent
+            }
+            if (isBytes) {
+                byte[] raw = (v instanceof byte[]) ? (byte[]) v
+                    : String.valueOf(v).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                bytes[docId] = new BytesRef(raw);
+            } else {
+                longs[docId] = childNumericBits(v, info.physical());
+            }
+            present[docId] = true;
+        }
+        return new ChildFieldColumn(longs, bytes, present);
+    }
+
+    /** Encodes a reconstructed nested-leaf raw value to the {@code long} bits the child numeric DV serves. */
+    private static long childNumericBits(Object v, ParquetPhysicalType physical) {
+        if (v instanceof Float f) {
+            return Float.floatToRawIntBits(f) & 0xFFFF_FFFFL;
+        }
+        if (v instanceof Double d) {
+            return Double.doubleToRawLongBits(d);
+        }
+        if (v instanceof Boolean b) {
+            return b ? 1L : 0L;
+        }
+        // date/date_nanos leaves may come back from DataFusion as Arrow temporal objects rather than an epoch
+        // long; the numeric DV (range/agg on a date) expects epoch millis, matching the FFI path.
+        if (v instanceof java.time.LocalDateTime ldt) {
+            return ldt.toInstant(java.time.ZoneOffset.UTC).toEpochMilli();
+        }
+        if (v instanceof java.time.Instant inst) {
+            return inst.toEpochMilli();
+        }
+        if (v instanceof java.time.LocalDate ld) {
+            return ld.atStartOfDay(java.time.ZoneOffset.UTC).toInstant().toEpochMilli();
+        }
+        return ((Number) v).longValue();
+    }
+
+    /**
      * Builds (once per field, cached) the {@link ChildFieldColumn} for a nested-child field: reads each
      * needed parent's repeated leaf column once and scatters element values to the child docIds of that
      * block. Numeric values are decoded per physical type; strings are kept as {@link BytesRef}.
@@ -605,6 +705,17 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
             ChildFieldColumn empty = new ChildFieldColumn(longs, bytes, present);
             childFieldColumns.put(field, empty);
             return empty;
+        }
+        // Optional DataFusion path (query-phase nested range/agg): build the per-child-docId values from
+        // reconstructed owning-path elements instead of the FFI Dremel read. Reuses the SAME PathChildMap
+        // (row + per-path element offset), so only the value SOURCE differs — order/offset alignment is
+        // identical (verified live at depth 3 and 4). Falls back to FFI on null/exception.
+        if (FLAT_DATAFUSION_DV) {
+            ChildFieldColumn df = datafusionChildColumn(field, info, map, max, isBytes, longs, bytes, present);
+            if (df != null) {
+                childFieldColumns.put(field, df);
+                return df;
+            }
         }
 
         ParquetColumnReader reader = producer().repeatedReaderFor(info.leafColumnPath(), info.physical());
@@ -879,6 +990,73 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
         return mergedFieldInfos;
     }
 
+    /**
+     * Serves a flat numeric field from the registered {@link org.opensearch.index.mapper.FlatColumnValueSource}
+     * (DataFusion) when the flag is on: materializes the whole column once (cached), then returns a
+     * {@link NumericDocValues} indexed by docId. Flat segments are identity ({@code docId == __row_id__}), so the
+     * materialized per-row array indexes directly by docId. Returns {@code null} to signal "not served here" so the
+     * caller falls back to the FFI path.
+     */
+    private NumericDocValues datafusionFlatNumeric(String field) throws IOException {
+        if (FLAT_DATAFUSION_DV == false || isIdentitySegment() == false) {
+            return null; // only flat/identity segments; nested child fields use their own path
+        }
+        org.opensearch.index.mapper.FlatColumnValueSource src = org.opensearch.index.mapper.FlatColumnValueSource.get();
+        if (src == null) {
+            return null;
+        }
+        org.opensearch.index.mapper.FlatColumnValueSource.LongColumn col = flatLongColumns.get(field);
+        if (col == null) {
+            col = src.materializeLong(producer().parquetFilePath(), field, producer().parquetRowCount());
+            if (col == null) {
+                return null;
+            }
+            flatLongColumns.put(field, col);
+        }
+        final org.opensearch.index.mapper.FlatColumnValueSource.LongColumn c = col;
+        return new NumericDocValues() {
+            private int doc = -1;
+
+            @Override
+            public boolean advanceExact(int target) {
+                doc = target;
+                return target >= 0 && target < c.present.length && c.present[target];
+            }
+
+            @Override
+            public long longValue() {
+                return c.values[doc];
+            }
+
+            @Override
+            public int docID() {
+                return doc;
+            }
+
+            @Override
+            public int nextDoc() {
+                return advance(doc + 1);
+            }
+
+            @Override
+            public int advance(int target) {
+                for (int i = target; i < c.present.length; i++) {
+                    if (c.present[i]) {
+                        doc = i;
+                        return i;
+                    }
+                }
+                doc = NO_MORE_DOCS;
+                return NO_MORE_DOCS;
+            }
+
+            @Override
+            public long cost() {
+                return c.present.length;
+            }
+        };
+    }
+
     @Override
     public NumericDocValues getNumericDocValues(String field) throws IOException {
         if (childFields.containsKey(field)) {
@@ -887,6 +1065,10 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
         }
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.NUMERIC) {
+            NumericDocValues df = datafusionFlatNumeric(field);
+            if (df != null) {
+                return df;
+            }
             RowIdResolver resolver = newRowIdResolver();
             NumericDocValues numeric = producer().getNumeric(fi);
             // IDENTITY (the guaranteed case — see newRowIdResolver) means docId == Parquet row, so the
@@ -904,6 +1086,10 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
             TRACE.trace("[NESTED-TRACE] getSortedNumericDocValues(child field='{}') -> serving numeric DV from Parquet"
                 + " (this is the RANGE/agg path; e.g. range on comments.score)", field);
             return DocValues.singleton(childNumericDocValues(childFieldColumn(field), maxDoc()));
+        }
+        NumericDocValues dfNumeric = datafusionFlatNumeric(field);
+        if (dfNumeric != null) {
+            return DocValues.singleton(dfNumeric);
         }
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {
@@ -938,11 +1124,82 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
     public BinaryDocValues getBinaryDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.BINARY) {
+            BinaryDocValues df = datafusionFlatBinary(field);
+            if (df != null) {
+                return df;
+            }
             RowIdResolver resolver = newRowIdResolver();
             BinaryDocValues binary = producer().getBinary(fi);
             return resolver == RowIdResolver.IDENTITY ? binary : RowIdRemappingDocValues.binary(binary, resolver, maxDoc());
         }
         return in.getBinaryDocValues(field);
+    }
+
+    /**
+     * Serves a flat BINARY field from the registered {@link org.opensearch.index.mapper.FlatColumnValueSource}
+     * (DataFusion) when the flag is on. Same shape as {@link #datafusionFlatNumeric} but over raw bytes. Returns
+     * {@code null} to fall back to FFI. NOTE: keyword/text/ip (SORTED/SORTED_SET) still use the FFI ordinal-table
+     * path for now — the interim DataFusion flat path covers numeric + binary doc-values; ordinal-encoded keyword
+     * columns join in the forward-cursor optimization pass.
+     */
+    private BinaryDocValues datafusionFlatBinary(String field) throws IOException {
+        if (FLAT_DATAFUSION_DV == false || isIdentitySegment() == false) {
+            return null;
+        }
+        org.opensearch.index.mapper.FlatColumnValueSource src = org.opensearch.index.mapper.FlatColumnValueSource.get();
+        if (src == null) {
+            return null;
+        }
+        org.opensearch.index.mapper.FlatColumnValueSource.BytesColumn col = flatBytesColumns.get(field);
+        if (col == null) {
+            col = src.materializeBytes(producer().parquetFilePath(), field, producer().parquetRowCount());
+            if (col == null) {
+                return null;
+            }
+            flatBytesColumns.put(field, col);
+        }
+        final org.opensearch.index.mapper.FlatColumnValueSource.BytesColumn c = col;
+        return new BinaryDocValues() {
+            private int doc = -1;
+
+            @Override
+            public org.apache.lucene.util.BytesRef binaryValue() {
+                return new org.apache.lucene.util.BytesRef(c.values[doc]);
+            }
+
+            @Override
+            public boolean advanceExact(int target) {
+                doc = target;
+                return target >= 0 && target < c.present.length && c.present[target];
+            }
+
+            @Override
+            public int docID() {
+                return doc;
+            }
+
+            @Override
+            public int nextDoc() {
+                return advance(doc + 1);
+            }
+
+            @Override
+            public int advance(int target) {
+                for (int i = target; i < c.present.length; i++) {
+                    if (c.present[i]) {
+                        doc = i;
+                        return i;
+                    }
+                }
+                doc = NO_MORE_DOCS;
+                return NO_MORE_DOCS;
+            }
+
+            @Override
+            public long cost() {
+                return c.present.length;
+            }
+        };
     }
 
     @Override
@@ -959,6 +1216,104 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
         return in.getSortedDocValues(field);
     }
 
+    /**
+     * Serves a flat keyword/text field's {@link SortedDocValues} from the registered
+     * {@link org.opensearch.index.mapper.FlatColumnValueSource} (DataFusion) when the flag is on: materializes the
+     * whole byte column once (cached), builds a sorted term dictionary + per-doc ordinal in Java (the ordinal
+     * semantics the FFI {@code OrdinalTable} produces), and returns a docId-indexed {@link SortedDocValues}. Flat
+     * segments are identity, so per-row values index directly by docId. Returns {@code null} to fall back to FFI.
+     */
+    private SortedDocValues datafusionFlatSorted(String field) throws IOException {
+        if (FLAT_DATAFUSION_DV == false || isIdentitySegment() == false) {
+            return null;
+        }
+        org.opensearch.index.mapper.FlatColumnValueSource src = org.opensearch.index.mapper.FlatColumnValueSource.get();
+        if (src == null) {
+            return null;
+        }
+        org.opensearch.index.mapper.FlatColumnValueSource.BytesColumn col = flatBytesColumns.get(field);
+        if (col == null) {
+            col = src.materializeBytes(producer().parquetFilePath(), field, producer().parquetRowCount());
+            if (col == null) {
+                return null;
+            }
+            flatBytesColumns.put(field, col);
+        }
+        final org.opensearch.index.mapper.FlatColumnValueSource.BytesColumn c = col;
+        // Build a sorted term dictionary (unique values, byte-ordered) and a per-doc ordinal, mirroring the FFI
+        // OrdinalTable: ord -> term ascending, docId -> ord (or -1 absent).
+        java.util.TreeMap<org.apache.lucene.util.BytesRef, Integer> dict = new java.util.TreeMap<>();
+        for (int r = 0; r < c.present.length; r++) {
+            if (c.present[r] && c.values[r] != null) {
+                dict.putIfAbsent(new org.apache.lucene.util.BytesRef(c.values[r]), 0);
+            }
+        }
+        final org.apache.lucene.util.BytesRef[] ordToTerm = new org.apache.lucene.util.BytesRef[dict.size()];
+        int nextOrd = 0;
+        for (java.util.Map.Entry<org.apache.lucene.util.BytesRef, Integer> e : dict.entrySet()) {
+            e.setValue(nextOrd);
+            ordToTerm[nextOrd] = e.getKey();
+            nextOrd++;
+        }
+        final int[] docToOrd = new int[c.present.length];
+        for (int r = 0; r < c.present.length; r++) {
+            docToOrd[r] = (c.present[r] && c.values[r] != null)
+                ? dict.get(new org.apache.lucene.util.BytesRef(c.values[r]))
+                : -1;
+        }
+        return new SortedDocValues() {
+            private int doc = -1;
+
+            @Override
+            public int ordValue() {
+                return docToOrd[doc];
+            }
+
+            @Override
+            public org.apache.lucene.util.BytesRef lookupOrd(int ord) {
+                return ordToTerm[ord];
+            }
+
+            @Override
+            public int getValueCount() {
+                return ordToTerm.length;
+            }
+
+            @Override
+            public boolean advanceExact(int target) {
+                doc = target;
+                return target >= 0 && target < docToOrd.length && docToOrd[target] >= 0;
+            }
+
+            @Override
+            public int docID() {
+                return doc;
+            }
+
+            @Override
+            public int nextDoc() {
+                return advance(doc + 1);
+            }
+
+            @Override
+            public int advance(int target) {
+                for (int i = target; i < docToOrd.length; i++) {
+                    if (docToOrd[i] >= 0) {
+                        doc = i;
+                        return i;
+                    }
+                }
+                doc = NO_MORE_DOCS;
+                return NO_MORE_DOCS;
+            }
+
+            @Override
+            public long cost() {
+                return docToOrd.length;
+            }
+        };
+    }
+
     @Override
     public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
         if (childFields.containsKey(field)) {
@@ -967,6 +1322,10 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader implement
             TRACE.trace("[NESTED-TRACE] getSortedSetDocValues(child field='{}') -> serving keyword DV from Parquet"
                 + " (doc-values path; used by keyword AGG/sort — NOT by an exact term query, which uses Lucene postings)", field);
             return DocValues.singleton(childSortedDocValues(childFieldColumn(field), maxDoc()));
+        }
+        SortedDocValues dfSorted = datafusionFlatSorted(field);
+        if (dfSorted != null) {
+            return DocValues.singleton(dfSorted);
         }
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {

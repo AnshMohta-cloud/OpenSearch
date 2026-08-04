@@ -103,7 +103,9 @@ public class DataFusionPlugin extends Plugin
         AnalyticsSearchBackendPlugin,
         ActionPlugin,
         CircuitBreakerPlugin,
-        DocumentLookupProvider {
+        DocumentLookupProvider,
+        org.opensearch.index.mapper.NestedSourceReconstructor,
+        org.opensearch.index.mapper.FlatColumnValueSource {
 
     private static final Logger logger = LogManager.getLogger(DataFusionPlugin.class);
 
@@ -574,6 +576,10 @@ public class DataFusionPlugin extends Plugin
         // Build the get-by-id service now that the DataFusion runtime is live. The
         // DocumentMetadataResolver is supplied per-call by the engine, so it is not needed here.
         this.getService = new GetService(this);
+        // Register this plugin as the nested-source reconstructor so the parquet-data-format codec's derived-source
+        // path can (behind its feature flag) rebuild nested _source through DataFusion instead of FFI + Dremel.
+        org.opensearch.index.mapper.NestedSourceReconstructor.register(this);
+        org.opensearch.index.mapper.FlatColumnValueSource.register(this);
 
         // Wire the dynamic spill limit setting to the native runtime so updates via the
         // cluster settings API take effect without restarting the node.
@@ -1115,6 +1121,58 @@ public class DataFusionPlugin extends Plugin
         throws IOException {
         GetService getService = getServiceOrThrow();
         return getService.documentLookupService(resolver).getById(get.id(), reader, index);
+    }
+
+    /**
+     * {@link org.opensearch.index.mapper.NestedSourceReconstructor} implementation: rebuild a nested field's
+     * {@code _source} array for one row by reading its columnar file through the native runtime. Delegates to
+     * {@link GetService}; returns {@code null} if the service is not yet live so the codec falls back to FFI.
+     */
+    @Override
+    public java.util.List<java.util.Map<String, Object>> reconstructNested(
+        String parquetFilePath,
+        long writerGeneration,
+        String path,
+        long rowId,
+        org.opensearch.index.mapper.MapperService mapperService
+    ) throws IOException {
+        GetService svc = getService;
+        if (svc == null) {
+            return null;
+        }
+        return svc.reconstructNested(parquetFilePath, writerGeneration, path, rowId, mapperService);
+    }
+
+    /** {@link org.opensearch.index.mapper.NestedSourceReconstructor}: per-element raw values of one nested-child leaf. */
+    @Override
+    public java.util.List<Object> reconstructNestedLeaf(
+        String parquetFilePath,
+        String owningPath,
+        String leafName,
+        long rowId,
+        org.opensearch.index.mapper.MapperService mapperService
+    ) throws IOException {
+        GetService svc = getService;
+        if (svc == null) {
+            return null;
+        }
+        return svc.reconstructNestedLeaf(parquetFilePath, owningPath, leafName, rowId, mapperService);
+    }
+
+    /** {@link org.opensearch.index.mapper.FlatColumnValueSource}: materialize a flat numeric column via DataFusion. */
+    @Override
+    public org.opensearch.index.mapper.FlatColumnValueSource.LongColumn materializeLong(String parquetFilePath, String field, int rowCount)
+        throws IOException {
+        GetService svc = getService;
+        return svc == null ? null : svc.scanLongColumn(parquetFilePath, field, rowCount);
+    }
+
+    /** {@link org.opensearch.index.mapper.FlatColumnValueSource}: materialize a flat byte-array column via DataFusion. */
+    @Override
+    public org.opensearch.index.mapper.FlatColumnValueSource.BytesColumn materializeBytes(String parquetFilePath, String field, int rowCount)
+        throws IOException {
+        GetService svc = getService;
+        return svc == null ? null : svc.scanBytesColumn(parquetFilePath, field, rowCount);
     }
 
     @Override
