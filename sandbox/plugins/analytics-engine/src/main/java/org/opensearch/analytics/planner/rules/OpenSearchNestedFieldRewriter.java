@@ -511,7 +511,53 @@ public final class OpenSearchNestedFieldRewriter {
             List.of(arrayRef, exprLit)
         );
 
-        return combineWithParentConjuncts(anyMatchCall, parentConjuncts, rexBuilder);
+        // ── Lucene pruning peers (the child-predicate split, done the superset-safe way non-flat
+        // delegation already works) ────────────────────────────────────────────────────────────
+        // The fused NESTED_ANY_MATCH_EXPR above is the AUTHORITATIVE, DataFusion-evaluated,
+        // element-correlated predicate (one element must satisfy the WHOLE compound jointly) — it
+        // alone is 100% correct. For each top-level-AND keyword-equality conjunct on our array we
+        // ALSO emit a NESTED_ANY_MATCH call, which is dual-viable [lucene, datafusion] and so gets
+        // performance-delegated to Lucene's native ToParentBlockJoinQuery. NESTED_ANY_MATCH(field=v)
+        // matches "parent has SOME child with field=v", which is a SUPERSET of the fused predicate's
+        // parent set (any parent satisfying `field=v AND <rest>` on a single element necessarily has
+        // SOME child with field=v). AND-ing a superset with the authoritative predicate never changes
+        // the result — but it lets Lucene's inverted index PRUNE which parquet rows DataFusion must
+        // read. This is exactly how flat-field performance delegation works (peer bitset intersected
+        // with the driving backend's native eval), extended to nested keyword children. Only pure
+        // keyword equality qualifies (Lucene indexes keyword/text child leaves; numeric/range/other
+        // stay on DataFusion). Emitted only in the compound (size>1) path; the single-conjunct case is
+        // already handled by tryDirectEqualityRewrite above.
+        List<RexNode> lucenerPeers = new ArrayList<>();
+        for (RexNode conjunct : arrayConjuncts) {
+            RexNode peer = tryDirectEqualityRewrite(conjunct, arrayCol, inputRowType, rexBuilder);
+            if (peer != null) {
+                lucenerPeers.add(peer);
+            }
+        }
+
+        RexNode nestedPredicate;
+        if (lucenerPeers.isEmpty()) {
+            nestedPredicate = anyMatchCall;
+        } else {
+            // authoritative fused expr AND (Lucene-prunable keyword peers). The peers are supersets, so
+            // this is semantically identical to `anyMatchCall` alone; the AND exists purely so the
+            // marking layer can performance-delegate the peers to Lucene for pruning.
+            List<RexNode> operands = new ArrayList<>(lucenerPeers.size() + 1);
+            operands.add(anyMatchCall);
+            operands.addAll(lucenerPeers);
+            nestedPredicate = rexBuilder.makeCall(
+                rexBuilder.getTypeFactory().createSqlType(SqlTypeName.BOOLEAN),
+                org.apache.calcite.sql.fun.SqlStdOperatorTable.AND,
+                operands
+            );
+            LOGGER.info(
+                "[NESTED-LAMBDA] fused NESTED_ANY_MATCH_EXPR (authoritative) + {} Lucene pruning peer(s) "
+                    + "(keyword-equality conjuncts delegated to Lucene block-join for pruning)",
+                lucenerPeers.size()
+            );
+        }
+
+        return combineWithParentConjuncts(nestedPredicate, parentConjuncts, rexBuilder);
     }
 
     /**
