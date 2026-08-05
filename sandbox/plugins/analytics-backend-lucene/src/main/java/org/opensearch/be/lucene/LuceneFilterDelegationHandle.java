@@ -423,12 +423,57 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
          */
         private final int[] parentDocIds;
         private final long[] rowIds;
+        /**
+         * Nested child-ordinal lane (child docId → (root row, element offset)), used ONLY by the child-grain
+         * split delegation path. Lazily built + cached the first time {@link #childOffset} / {@link #childRow}
+         * is called for a path, since most delegations (flat / whole-node block-join) never need it. Holds the
+         * leaf so the lazy build can read {@code _nested_path} postings on demand. Null on a non-nested leaf.
+         */
+        private final LeafReader leafForChildOrdinal;
+        private NestedChildOrdinalMap childOrdinalMap;
 
-        private RowIdTranslator(boolean nested, int logicalRowCount, int[] parentDocIds, long[] rowIds) {
+        private RowIdTranslator(boolean nested, int logicalRowCount, int[] parentDocIds, long[] rowIds, LeafReader leafForChildOrdinal) {
             this.nested = nested;
             this.logicalRowCount = logicalRowCount;
             this.parentDocIds = parentDocIds;
             this.rowIds = rowIds;
+            this.leafForChildOrdinal = leafForChildOrdinal;
+        }
+
+        /**
+         * The element offset of a matched CHILD docId within its root's list for {@code path} (child-grain
+         * split lane), or {@code -1} if {@code docId} is not a child at {@code path}. Lazily builds the
+         * per-segment {@link NestedChildOrdinalMap} covering {@code path} on first use. Only valid on a
+         * nested leaf.
+         */
+        int childOffset(String path, int docId) throws IOException {
+            if (nested == false || leafForChildOrdinal == null) {
+                return -1;
+            }
+            ensureChildOrdinal(path);
+            return childOrdinalMap.offsetForDocId(path, docId);
+        }
+
+        /** The root Parquet row of a matched CHILD docId for {@code path}, or {@code -1}. See {@link #childOffset}. */
+        int childRow(String path, int docId) throws IOException {
+            if (nested == false || leafForChildOrdinal == null) {
+                return -1;
+            }
+            ensureChildOrdinal(path);
+            return childOrdinalMap.rowForDocId(path, docId);
+        }
+
+        private void ensureChildOrdinal(String path) throws IOException {
+            if (childOrdinalMap == null || childOrdinalMap.paths().contains(path) == false) {
+                // Build (or rebuild widening) the map to cover `path`. Rebuild is rare (one delegated nested
+                // path per query in the common case) and cached thereafter.
+                java.util.Set<String> want = new java.util.HashSet<>();
+                if (childOrdinalMap != null) {
+                    want.addAll(childOrdinalMap.paths());
+                }
+                want.add(path);
+                childOrdinalMap = NestedChildOrdinalMap.build(leafForChildOrdinal, want);
+            }
         }
 
         /**
@@ -456,7 +501,7 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                     parentField,
                     rowIdDV != null
                 );
-                return new RowIdTranslator(false, maxDoc, null, null);
+                return new RowIdTranslator(false, maxDoc, null, null, null);
             }
 
             // Nested segment: collect (parentDocId, rowId) pairs in docId order. __row_id__ exists only on
@@ -483,13 +528,13 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                 java.util.Arrays.toString(java.util.Arrays.copyOf(rows, Math.min(n, 8)))
             );
             if (n == docIds.length) {
-                return new RowIdTranslator(true, n, docIds, rows);
+                return new RowIdTranslator(true, n, docIds, rows, reader);
             }
             int[] trimmedDocIds = new int[n];
             long[] trimmedRows = new long[n];
             System.arraycopy(docIds, 0, trimmedDocIds, 0, n);
             System.arraycopy(rows, 0, trimmedRows, 0, n);
-            return new RowIdTranslator(true, n, trimmedDocIds, trimmedRows);
+            return new RowIdTranslator(true, n, trimmedDocIds, trimmedRows, reader);
         }
 
         boolean isNested() {
