@@ -346,6 +346,93 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         return wordCount;
     }
 
+    /**
+     * CHILD-GRAIN collect lane for the nested predicate split (mirror of {@link #collectDocs}, but the
+     * returned bitset is indexed by CHILD ELEMENT ORDINAL, not parent row).
+     *
+     * <p>For a nested predicate split across engines (keyword child clause → Lucene, numeric/range child
+     * clause → Parquet/DataFusion), the keyword clause is shipped as a CHILD-scoped query (a plain
+     * {@code TermQuery} on {@code path.field} restricted to {@code _nested_path:path} children — NOT wrapped
+     * in a NestedQueryBuilder/block-join), so its scorer yields CHILD docIds. Each matched child docId is
+     * translated to its element ordinal within the query's per-RG dense child-id space via
+     * {@link RowIdTranslator#childOffset} + the caller-supplied {@code childBase} prefix-sums, and that bit is
+     * set. The driving backend (DataFusion) then intersects this per-element bitset with its own per-element
+     * evaluation of the range clause, at CHILD grain, before the ∃ roll-up to parents — preserving element
+     * correlation (the same child must satisfy both), matching vanilla nested semantics.
+     *
+     * <p>{@code childBase[r - rowMin]} = the dense child-id offset of parent row r's first element within the
+     * RG's child-id space; element k of row r has child-id {@code childBase[r-rowMin] + k}. The bitset spans
+     * {@code totalChildren} bits. {@code path} selects which nested level's ordinal to use (deep nesting).
+     *
+     * @return number of u64 words written, or -1 on error.
+     */
+    public int collectChildDocs(int collectorKey, int minDoc, int maxDoc, int[] childBase, int totalChildren, String path, MemorySegment out) {
+        ScorerHandle handle = scorersByCollectorKey.get(collectorKey);
+        if (handle == null) {
+            return -1;
+        }
+        int span = maxDoc - minDoc;
+        if (span <= 0 || totalChildren <= 0) {
+            return 0;
+        }
+        FixedBitSet bits = new FixedBitSet(totalChildren);
+        if (handle.scorer != null) {
+            int scanRowFrom = Math.max(minDoc, handle.partitionRowMin);
+            int scanRowTo = Math.min(maxDoc, handle.partitionRowMax);
+            if (scanRowFrom < scanRowTo) {
+                RowIdTranslator translator = handle.translator;
+                int docFrom = translator.firstDocIdForRow(scanRowFrom);
+                int docTo = translator.docIdScanBoundForRow(scanRowTo);
+                int matchedChildren = 0;
+                int skippedNoChild = 0;
+                try {
+                    DocIdSetIterator iterator = handle.scorer.iterator();
+                    int docId = iterator.docID() == -1 ? iterator.nextDoc() : iterator.docID();
+                    if (docId < docFrom) {
+                        docId = iterator.advance(docFrom);
+                    }
+                    while (docId != DocIdSetIterator.NO_MORE_DOCS && docId < docTo) {
+                        // Matched a CHILD doc → (root row, element offset). row must be in [minDoc,maxDoc);
+                        // child-id = childBase[row-minDoc] + offset. A matched doc with no child ordinal for
+                        // this path (offset < 0) is a mis-shaped query and is skipped, not corrupting the set.
+                        int row = translator.childRow(path, docId);
+                        int off = translator.childOffset(path, docId);
+                        if (row < 0 || off < 0 || row < minDoc || row >= maxDoc) {
+                            skippedNoChild++;
+                        } else {
+                            int childId = childBase[row - minDoc] + off;
+                            if (childId >= 0 && childId < totalChildren) {
+                                bits.set(childId);
+                                matchedChildren++;
+                            } else {
+                                skippedNoChild++;
+                            }
+                        }
+                        docId = iterator.nextDoc();
+                    }
+                    LOGGER.info(
+                        "[NESTED-SPLIT] collectChildDocs collectorKey={} path={} rowWindow=[{},{}) totalChildren={} "
+                            + "matchedChildren={} skippedNoChild={} → cardinality={}",
+                        collectorKey,
+                        path,
+                        minDoc,
+                        maxDoc,
+                        totalChildren,
+                        matchedChildren,
+                        skippedNoChild,
+                        bits.cardinality()
+                    );
+                } catch (IOException exception) {
+                    LOGGER.warn("[NESTED-SPLIT] IOException during collectChildDocs, returning partial bitset", exception);
+                }
+            }
+        }
+        long[] words = bits.getBits();
+        int wordCount = (totalChildren + 63) >>> 6;
+        MemorySegment.copy(words, 0, out, ValueLayout.JAVA_LONG, 0, wordCount);
+        return wordCount;
+    }
+
     @Override
     public void releaseCollector(int collectorKey) {
         scorersByCollectorKey.remove(collectorKey);
