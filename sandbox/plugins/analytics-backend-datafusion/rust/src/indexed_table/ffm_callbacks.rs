@@ -208,6 +208,46 @@ impl FfmSegmentCollector {
     }
 }
 
+impl FfmSegmentCollector {
+    /// Child-grain collect for the nested predicate split: returns a packed u64 bitset dimensioned by
+    /// `total_children` (dense per-RG child-element ordinals), NOT by the parent-row span. Reuses the SAME
+    /// `collectDocs` FFM callback and transport (no new callback / no ABI change) — the Java side routes to
+    /// its child-grain lane based on the collector being registered child-grain, and the only Rust-side
+    /// difference is the output buffer is sized by child count. `[min_doc,max_doc)` is still the parent-row
+    /// window (bounds the scan); `total_children` is the number of elements across those rows in this RG.
+    pub(crate) fn collect_child_packed_bitset(
+        &self,
+        min_doc: i32,
+        max_doc: i32,
+        total_children: usize,
+    ) -> Result<Vec<u64>, String> {
+        if max_doc <= min_doc || total_children == 0 {
+            return Ok(Vec::new());
+        }
+        let word_count = total_children.div_ceil(64);
+        let mut buf = vec![0u64; word_count];
+        let collect_fn = load_collect_docs()?;
+        let n = unsafe {
+            collect_fn(self.context_id, self.key, min_doc, max_doc, buf.as_mut_ptr(), word_count as i64)
+        };
+        if n < 0 {
+            return Err(format!(
+                "collectChildDocs(context_id={}, key={}) failed: {}",
+                self.context_id, self.key, n
+            ));
+        }
+        let n = n as usize;
+        if n > word_count {
+            return Err(format!(
+                "collectChildDocs(context_id={}, key={}) reported wordsWritten={} > capacity={}",
+                self.context_id, self.key, n, word_count,
+            ));
+        }
+        buf.truncate(n);
+        Ok(buf)
+    }
+}
+
 impl RowGroupDocsCollector for FfmSegmentCollector {
     fn collect_packed_u64_bitset(&self, min_doc: i32, max_doc: i32) -> Result<Vec<u64>, String> {
         if max_doc <= min_doc {
