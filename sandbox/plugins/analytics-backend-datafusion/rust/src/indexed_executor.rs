@@ -441,10 +441,12 @@ fn extract_single_collector_residual(tree: &BoolNode) -> Option<BoolNode> {
 /// grain in `on_batch_mask` instead. Returns `None` when the tree has no child-split shape (the common
 /// case) — the caller then keeps the existing non-nested / superset-peer behavior unchanged.
 fn build_child_split(tree: &BoolNode) -> Option<(ChildSplitState, Vec<i32>)> {
-    // 1. Find the nested_any_match_expr predicate: array-column index (args[0] Column) + json (args[1] Utf8).
-    let mut nested: Option<(usize, String)> = None;
+    // 1. Find the nested_any_match_expr predicate: array-column NAME (args[0] Column) + json (args[1] Utf8).
+    //    We carry the NAME, not the plan Column index, because the delivered batch is projected and its
+    //    column order differs from the full-table schema the index refers to.
+    let mut nested: Option<(String, String)> = None;
     find_nested_expr_predicate(tree, &mut nested);
-    let (array_col_index, expr_json) = nested?;
+    let (array_col_name, expr_json) = nested?;
 
     // 2. Only engage if the json actually has {"lucene": i} holes — otherwise there's nothing to delegate
     //    at child grain (a plain nested_any_match_expr runs the standard residual path).
@@ -479,7 +481,7 @@ fn build_child_split(tree: &BoolNode) -> Option<(ChildSplitState, Vec<i32>)> {
 
     Some((
         ChildSplitState {
-            array_col_index,
+            array_col_name,
             expr_json,
             clauses,
             // Filled by the caller (indexed_executor) with the query-scoped child provider-lock map.
@@ -537,10 +539,11 @@ fn strip_child_split_from_residual(node: &BoolNode) -> Option<BoolNode> {
     }
 }
 
-/// DFS for the `nested_any_match_expr` predicate leaf; records `(array_col_index, json)` from its
-/// `ScalarFunctionExpr` operands (args[0] = Column, args[1] = Utf8 literal). First match wins (a
-/// SingleCollector residual has at most one nested predicate over one array).
-fn find_nested_expr_predicate(node: &BoolNode, out: &mut Option<(usize, String)>) {
+/// DFS for the `nested_any_match_expr` predicate leaf; records `(array_col_name, json)` from its
+/// `ScalarFunctionExpr` operands (args[0] = Column, args[1] = Utf8 literal). The column NAME (not index) is
+/// carried because the delivered batch is projected — the plan's Column index would point at the wrong
+/// column. First match wins (a SingleCollector residual has at most one nested predicate over one array).
+fn find_nested_expr_predicate(node: &BoolNode, out: &mut Option<(String, String)>) {
     if out.is_some() {
         return;
     }
@@ -559,7 +562,7 @@ fn find_nested_expr_predicate(node: &BoolNode, out: &mut Option<(usize, String)>
                         if let (Some(col), Some(json)) =
                             ((args[0].as_ref() as &dyn std::any::Any).downcast_ref::<Column>(), literal_utf8(&args[1]))
                         {
-                            *out = Some((col.index(), json));
+                            *out = Some((col.name().to_string(), json));
                         }
                     }
                 }
@@ -1405,7 +1408,7 @@ async unsafe fn execute_indexed_with_context_inner(
                 state.provider_locks = Arc::clone(&child_provider_locks);
                 log_debug!(
                     "child-split ENGAGED: array_col={} clauses={} child_annotation_ids={:?}",
-                    state.array_col_index,
+                    state.array_col_name,
                     state.clauses.len(),
                     child_annotation_ids
                 );

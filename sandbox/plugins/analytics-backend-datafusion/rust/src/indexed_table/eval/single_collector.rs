@@ -141,8 +141,11 @@ pub struct ChildClause {
 /// ∃ roll-up to parents. `None` (the common case) → the evaluator behaves exactly as before.
 #[derive(Debug, Clone)]
 pub struct ChildSplitState {
-    /// Batch column index of the `LIST<STRUCT>` nested array the predicate ranges over.
-    pub array_col_index: usize,
+    /// NAME of the `LIST<STRUCT>` nested-array column the predicate ranges over. Resolved to the delivered
+    /// batch's column position by NAME at eval time — the `Column` index carried in the physical plan is a
+    /// FULL-TABLE-schema index, which does not match a projected batch's column order (same reason
+    /// `remap_expr_to_batch` remaps residual columns by name).
+    pub array_col_name: String,
     /// The `nested_any_match_expr` JSON (with `{"lucene": i}` holes, each carrying a `"fallback"`).
     pub expr_json: String,
     /// One entry per Lucene-delegated clause, sorted ascending by `clause_idx` so `clause_bits[i]`
@@ -328,12 +331,20 @@ impl SingleCollectorEvaluator {
         batch_len: usize,
         batch: &RecordBatch,
     ) -> Result<BooleanArray, String> {
-        // Decode the LIST<STRUCT> column and its batch-local element offsets.
-        let array = batch.column(child_split.array_col_index).clone();
+        // Resolve the LIST<STRUCT> column by NAME against the DELIVERED batch's schema. The plan's Column
+        // index is a full-table-schema index and does not match a projected batch's column order.
+        let array_idx = batch.schema().index_of(&child_split.array_col_name).map_err(|_| {
+            format!(
+                "child-split: array column '{}' not found in batch schema {:?}",
+                child_split.array_col_name,
+                batch.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+            )
+        })?;
+        let array = batch.column(array_idx).clone();
         let list = array.as_list_opt::<i32>().ok_or_else(|| {
             format!(
-                "child-split: column {} is not a List, got {:?}",
-                child_split.array_col_index,
+                "child-split: column '{}' is not a List, got {:?}",
+                child_split.array_col_name,
                 array.data_type()
             )
         })?;
@@ -1327,7 +1338,7 @@ mod tests {
             None,
             HashMap::new(),
             Some(ChildSplitState {
-                array_col_index: 0,
+                array_col_name: "comments".to_string(),
                 expr_json: split_json(),
                 clauses: vec![ChildClause {
                     clause_idx: 0,
