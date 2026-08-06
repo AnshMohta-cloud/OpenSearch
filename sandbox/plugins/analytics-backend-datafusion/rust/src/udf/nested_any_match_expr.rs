@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, AsArray, BooleanBuilder};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanBuilder};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
@@ -82,62 +82,83 @@ impl ScalarUDFImpl for NestedAnyMatchExprUdf {
         let tree: Json = serde_json::from_str(&expr_json)
             .map_err(|e| DataFusionError::Execution(format!("nested_any_match_expr: invalid expr JSON: {e}")))?;
 
-        let num_rows = array_col.len();
-        let mut result = BooleanBuilder::with_capacity(num_rows);
-
-        let list_array = array_col.as_list_opt::<i32>().ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "nested_any_match_expr: first argument must be List, got {:?}",
-                array_col.data_type()
-            ))
-        })?;
-
-        let element_type = match list_array.data_type() {
-            DataType::List(f) => f.data_type().clone(),
-            _ => return plan_err!("nested_any_match_expr: expected List type, got {:?}", list_array.data_type()),
-        };
-        let struct_fields = match &element_type {
-            DataType::Struct(fields) => fields.clone(),
-            _ => {
-                return plan_err!(
-                    "nested_any_match_expr: expected List<Struct>, got List<{:?}>",
-                    element_type
-                );
-            }
-        };
-
-        let values = list_array.values();
-        let struct_array = values.as_struct();
-
-        for row_idx in 0..num_rows {
-            if list_array.is_null(row_idx) {
-                result.append_null();
-                continue;
-            }
-            let start = list_array.value_offsets()[row_idx] as usize;
-            let end = list_array.value_offsets()[row_idx + 1] as usize;
-            if start == end {
-                result.append_value(false);
-                continue;
-            }
-
-            let mut any_match = false;
-            for elem_idx in start..end {
-                // Plain path: no Lucene-delegated clauses (lucene = None). The child-grain split invokes the
-                // evaluate_with_lucene entry point instead, which supplies per-element Lucene verdicts.
-                match eval_bool(&tree, struct_array, &struct_fields, elem_idx, None)? {
-                    Some(true) => {
-                        any_match = true;
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
-            result.append_value(any_match);
-        }
-
-        Ok(ColumnarValue::Array(Arc::new(result.finish())))
+        // Plain path: no Lucene-delegated clauses. The child-grain split calls
+        // evaluate_nested_with_lucene directly (below) to supply per-element Lucene verdicts.
+        let result = evaluate_nested_any_match(&array_col, &tree, None)?;
+        Ok(ColumnarValue::Array(Arc::new(result)))
     }
+}
+
+/// Core per-element evaluation shared by the plain UDF path and the child-grain split path: for each parent
+/// row of the `LIST<STRUCT>` `array_col`, returns true iff SOME single element satisfies the whole `tree`
+/// (element-correlated ∃), null for a null array row, false for an empty array. `lucene`, when present,
+/// supplies per-element verdicts for `{"lucene": i}` nodes (a keyword clause evaluated by Lucene in the
+/// split); `None` on the plain path. This is the single place the ∃-over-elements roll-up lives — so a
+/// split keyword clause and a DataFusion-evaluated range clause intersect at the SAME element index,
+/// preserving vanilla nested correlation.
+fn evaluate_nested_any_match(
+    array_col: &ArrayRef,
+    tree: &Json,
+    lucene: Option<&LuceneClauseBits>,
+) -> Result<datafusion::arrow::array::BooleanArray> {
+    let num_rows = array_col.len();
+    let mut result = BooleanBuilder::with_capacity(num_rows);
+
+    let list_array = array_col.as_list_opt::<i32>().ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "nested_any_match_expr: first argument must be List, got {:?}",
+            array_col.data_type()
+        ))
+    })?;
+    let element_type = match list_array.data_type() {
+        DataType::List(f) => f.data_type().clone(),
+        _ => return plan_err!("nested_any_match_expr: expected List type, got {:?}", list_array.data_type()),
+    };
+    let struct_fields = match &element_type {
+        DataType::Struct(fields) => fields.clone(),
+        _ => return plan_err!("nested_any_match_expr: expected List<Struct>, got List<{:?}>", element_type),
+    };
+    let values = list_array.values();
+    let struct_array = values.as_struct();
+
+    for row_idx in 0..num_rows {
+        if list_array.is_null(row_idx) {
+            result.append_null();
+            continue;
+        }
+        let start = list_array.value_offsets()[row_idx] as usize;
+        let end = list_array.value_offsets()[row_idx + 1] as usize;
+        if start == end {
+            result.append_value(false);
+            continue;
+        }
+        let mut any_match = false;
+        for elem_idx in start..end {
+            if let Some(true) = eval_bool(tree, struct_array, &struct_fields, elem_idx, lucene)? {
+                any_match = true;
+                break;
+            }
+        }
+        result.append_value(any_match);
+    }
+    Ok(result.finish())
+}
+
+/// Child-grain split entry point (called by `SingleCollectorEvaluator`, NOT registered as a UDF). Evaluates
+/// the nested predicate `tree` over `array_col` exactly like the plain path, except any `{"lucene": i}` leaf
+/// takes its per-element verdict from `clause_bits[i]` (indexed by the global element index — the same order
+/// this fn iterates elements). `clause_bits` is produced by expanding the Lucene child bitset into
+/// element-index space upstream. Element correlation is preserved because Lucene and DataFusion clauses are
+/// combined per element inside the same ∃-over-elements loop.
+pub(crate) fn evaluate_nested_with_lucene(
+    array_col: &ArrayRef,
+    expr_json: &str,
+    clause_bits: &[datafusion::arrow::array::BooleanArray],
+) -> Result<datafusion::arrow::array::BooleanArray> {
+    let tree: Json = serde_json::from_str(expr_json)
+        .map_err(|e| DataFusionError::Execution(format!("nested_any_match_expr: invalid expr JSON: {e}")))?;
+    let lucene = LuceneClauseBits { clause_bits };
+    evaluate_nested_any_match(array_col, &tree, Some(&lucene))
 }
 
 /// Per-element evaluation context for the child-grain nested split. `clause_bits[i]` is the boolean
