@@ -321,6 +321,50 @@ impl SingleCollectorEvaluator {
     /// child bitset Java returns is directly indexable by the residual UDF's element index — correct under
     /// every `PositionMap` (Identity / Bitmap / Runs) and multi-batch RG split. A parent row not delivered
     /// in this batch keeps `child_base[p] == -1`, and Java skips any child whose row maps to `-1`.
+    /// Build the correctness-Collector candidate mask over the delivered rows (the same mask the non-child
+    /// `on_batch_mask` path AND-combines with its residual). Bit `i` is set iff delivered row `i`'s RG
+    /// position is a candidate in `state.mask_buffer`. Shared by the child-split and non-child paths so a
+    /// correctness Collector's row narrowing (e.g. a text `match()` parent predicate delegated to Lucene)
+    /// is honored under the child split too.
+    fn collector_mask_for_batch(
+        &self,
+        state: &SingleCollectorState,
+        position_map: &PositionMap,
+        batch_offset: usize,
+        batch_len: usize,
+    ) -> Result<BooleanArray, String> {
+        Ok(match position_map {
+            PositionMap::Identity { .. } => {
+                let bb = datafusion::arrow::buffer::BooleanBuffer::new(
+                    state.mask_buffer.clone(),
+                    batch_offset,
+                    batch_len,
+                );
+                BooleanArray::new(bb, None)
+            }
+            PositionMap::Bitmap { .. } => {
+                BooleanArray::new(datafusion::arrow::buffer::BooleanBuffer::new_set(batch_len), None)
+            }
+            PositionMap::Runs { .. } => {
+                let words = batch_len.div_ceil(64);
+                let mut out = vec![0u64; words];
+                let src_bytes = state.mask_buffer.as_slice();
+                for i in 0..batch_len {
+                    let delivered_idx = batch_offset + i;
+                    let rg_pos = position_map.rg_position(delivered_idx).ok_or_else(|| {
+                        format!("SingleCollectorEvaluator: delivered_idx {} out of range", delivered_idx)
+                    })?;
+                    let hit =
+                        rg_pos < state.mask_len && (src_bytes[rg_pos >> 3] >> (rg_pos & 7)) & 1 == 1;
+                    if hit {
+                        out[i >> 6] |= 1u64 << (i & 63);
+                    }
+                }
+                packed_bits_to_boolean_array(out, batch_len)
+            }
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn evaluate_child_split(
         &self,
@@ -736,21 +780,23 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
                 batch_len,
                 batch,
             )?;
+            // AND the correctness-Collector candidate mask: when a genuine correctness Collector coexists
+            // (e.g. a text `match()` parent predicate delegated to Lucene, which is NOT in residual_expr),
+            // its row narrowing lives only in state.mask_buffer and must still apply. For a performance-only
+            // query the candidates are the page-pruned/full universe, so this AND is a safe no-op.
+            let mut combined =
+                self.collector_mask_for_batch(state, position_map, batch_offset, batch_len)?;
+            combined = datafusion::arrow::compute::kernels::boolean::and_kleene(&combined, &nested_mask)
+                .map_err(|e| format!("SingleCollectorEvaluator child-split: and_kleene(collector): {}", e))?;
             // AND any non-nested residual conjuncts (e.g. a parent-column predicate co-located in the
-            // same top-level AND). None → the nested predicate alone is the mask.
-            return match self.residual_expr {
-                None => Ok(Some(nested_mask)),
-                Some(ref residual) => {
-                    let residual_mask =
-                        super::eval_helpers::evaluate_residual(residual, batch, batch_len)?;
-                    let combined = datafusion::arrow::compute::kernels::boolean::and_kleene(
-                        &nested_mask,
-                        &residual_mask,
-                    )
-                    .map_err(|e| format!("SingleCollectorEvaluator child-split: and_kleene: {}", e))?;
-                    Ok(Some(combined))
-                }
-            };
+            // same top-level AND) still carried in residual_expr.
+            if let Some(ref residual) = self.residual_expr {
+                let residual_mask =
+                    super::eval_helpers::evaluate_residual(residual, batch, batch_len)?;
+                combined = datafusion::arrow::compute::kernels::boolean::and_kleene(&combined, &residual_mask)
+                    .map_err(|e| format!("SingleCollectorEvaluator child-split: and_kleene(residual): {}", e))?;
+            }
+            return Ok(Some(combined));
         }
 
         // No residual → no post-decode work. Stream's current_mask
@@ -759,53 +805,10 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
             return Ok(None);
         };
 
-        // Build Collector mask over delivered rows via PositionMap.
-        // All paths produce a `BooleanArray` whose underlying
-        // `Buffer` is a refcounted view into `state.mask_buffer` —
-        // zero allocation for Identity, at most one small packed
-        // Vec<u64> for Runs.
-        let collector_mask: BooleanArray = match position_map {
-            // Identity: delivered row i == rg_position (batch_offset + i).
-            // BooleanBuffer::new adjusts bit_offset without copying the
-            // underlying Buffer. The returned BooleanArray points into
-            // state.mask_buffer; lifecycle is Arc-managed.
-            PositionMap::Identity { .. } => {
-                let bb = datafusion::arrow::buffer::BooleanBuffer::new(
-                    state.mask_buffer.clone(),
-                    batch_offset,
-                    batch_len,
-                );
-                BooleanArray::new(bb, None)
-            }
-            // Every delivered row is by construction a candidate — mask is all-true.
-            PositionMap::Bitmap { .. } => BooleanArray::new(
-                datafusion::arrow::buffer::BooleanBuffer::new_set(batch_len),
-                None,
-            ),
-            // Runs: gather per-row bit from the shared mask_buffer into
-            // a new packed Vec<u64> (small — bounded by batch_len/64).
-            PositionMap::Runs { .. } => {
-                let words = batch_len.div_ceil(64);
-                let mut out = vec![0u64; words];
-                let src_bytes = state.mask_buffer.as_slice();
-                for i in 0..batch_len {
-                    let delivered_idx = batch_offset + i;
-                    let rg_pos = position_map.rg_position(delivered_idx).ok_or_else(|| {
-                        format!(
-                            "SingleCollectorEvaluator: delivered_idx {} out of range",
-                            delivered_idx
-                        )
-                    })?;
-                    // Read bit rg_pos from the packed buffer (LSB-first).
-                    let hit = rg_pos < state.mask_len
-                        && (src_bytes[rg_pos >> 3] >> (rg_pos & 7)) & 1 == 1;
-                    if hit {
-                        out[i >> 6] |= 1u64 << (i & 63);
-                    }
-                }
-                packed_bits_to_boolean_array(out, batch_len)
-            }
-        };
+        // Build the Collector candidate mask over delivered rows via PositionMap (shared with the
+        // child-split path). Zero allocation for Identity, at most one small packed Vec<u64> for Runs.
+        let collector_mask =
+            self.collector_mask_for_batch(state, position_map, batch_offset, batch_len)?;
 
         // Evaluate residual against the batch.
         let residual_mask = super::eval_helpers::evaluate_residual(residual, batch, batch_len)?;
@@ -1350,10 +1353,22 @@ mod tests {
     }
 
     fn state_for(rg_num_rows: usize) -> SingleCollectorState {
-        // Minimal state; only rg_num_rows / rg_first_row are read by evaluate_child_split.
+        // No correctness Collector → candidates are the full universe (every row a candidate), which is
+        // what prefetch_rg seeds for a performance-only query. The collector_mask must then be all-true so
+        // the child-split AND is a no-op.
+        state_with_candidates(rg_num_rows, &(0..rg_num_rows).collect::<Vec<_>>())
+    }
+
+    /// State whose candidate mask has exactly `candidate_rows` set (RG-relative positions).
+    fn state_with_candidates(rg_num_rows: usize, candidate_rows: &[usize]) -> SingleCollectorState {
+        let mut candidates = RoaringBitmap::new();
+        for &r in candidate_rows {
+            candidates.insert(r as u32);
+        }
+        let packed = bitmap_to_packed_bits(&candidates, rg_num_rows as u32);
         SingleCollectorState {
-            candidates: RoaringBitmap::new(),
-            mask_buffer: datafusion::arrow::buffer::Buffer::from_vec(vec![0u64; 1]),
+            candidates,
+            mask_buffer: datafusion::arrow::buffer::Buffer::from_vec(packed),
             mask_len: rg_num_rows,
             rg_num_rows,
             rg_first_row: 0,
@@ -1417,6 +1432,39 @@ mod tests {
             .evaluate_child_split(eval.child_split.as_ref().unwrap(), &state, &pm, 0, 2, &batch)
             .unwrap();
         assert_eq!(mask, BooleanArray::from(vec![true, false]));
+    }
+
+    #[test]
+    fn child_split_on_batch_mask_honors_collector_candidates() {
+        // Full on_batch_mask path (not just evaluate_child_split): a correctness Collector coexists and
+        // narrowed candidates to rows {0} only (e.g. a text match() parent predicate delegated to Lucene,
+        // which is NOT in residual_expr). Even though BOTH P0 and P1 satisfy the nested predicate
+        // element-wise, the collector_mask must exclude P1. Expected mask [true, false].
+        let batch = comments_batch(&[vec![("alice", 70)], vec![("alice", 90)]]);
+        let eval = child_split_eval(vec![(0, 0), (1, 0)]); // Lucene says alice at both rows' elem 0
+        // candidates = {row 0} only → collector narrowed P1 out.
+        let state = state_with_candidates(2, &[0]);
+        let pm = PositionMap::Identity { delivered_count: 2 };
+        let mask = eval
+            .on_batch_mask(&state as &dyn std::any::Any, 0, &pm, 0, 2, &batch)
+            .unwrap()
+            .expect("child split produces a mask");
+        assert_eq!(mask, BooleanArray::from(vec![true, false]));
+    }
+
+    #[test]
+    fn child_split_on_batch_mask_full_universe_is_noop() {
+        // No correctness Collector → full-universe candidates → collector_mask all-true → the nested
+        // predicate alone decides. Same corpus as the Identity test: P0 no (alice@40 not>50), P1 yes.
+        let batch = comments_batch(&[vec![("alice", 40), ("bob", 90)], vec![("alice", 70)]]);
+        let eval = child_split_eval(vec![(0, 0), (1, 0)]);
+        let state = state_for(2); // full universe
+        let pm = PositionMap::Identity { delivered_count: 2 };
+        let mask = eval
+            .on_batch_mask(&state as &dyn std::any::Any, 0, &pm, 0, 2, &batch)
+            .unwrap()
+            .expect("child split produces a mask");
+        assert_eq!(mask, BooleanArray::from(vec![false, true]));
     }
 
     // Keep the `fmt` import used
