@@ -30,8 +30,11 @@ import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
+import org.opensearch.index.mapper.NestedPathFieldMapper;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.index.query.TermQueryBuilder;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -66,6 +69,16 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
     // semantics for compile-failure timing (eager = fail at ctor, lazy = fail
     // at first use). Revisit if this surfaces as a real cost — needs revisiting.
     private final Map<Integer, Query> queriesByAnnotationId;
+    /**
+     * Child-grain nested split only: for a delegated expression that is a CHILD-scoped query (a
+     * {@code NESTED_ANY_MATCH_CHILD} peer — see {@code NestedAnyMatchChildSerializer}), the nested path
+     * its {@code _nested_path} filter restricts to. Absent for every non-child delegated expression. Used
+     * to select the correct per-level ordinal in {@link #collectChildDocs} without marshaling the path
+     * across the FFM boundary.
+     */
+    private final Map<Integer, String> childPathByAnnotationId;
+    /** {@code providerKey → child nested path}, populated in {@link #createProvider} from {@link #childPathByAnnotationId}. */
+    private final ConcurrentHashMap<Integer, String> childPathByProviderKey = new ConcurrentHashMap<>();
     private final DirectoryReader directoryReader;
     private final IndexSearcher searcher;
     private final List<LeafReaderContext> leaves;
@@ -91,14 +104,16 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         this.searcher = queryShardContext.searcher();
         this.leaves = directoryReader.leaves();
         this.generationToSegmentName = luceneReader.generationToSegmentName();
-        this.queriesByAnnotationId = compileQueries(expressions, queryShardContext, namedWriteableRegistry);
+        this.childPathByAnnotationId = new HashMap<>();
+        this.queriesByAnnotationId = compileQueries(expressions, queryShardContext, namedWriteableRegistry, this.childPathByAnnotationId);
         this.isCancelledSupplier = isCancelledSupplier;
     }
 
     private static Map<Integer, Query> compileQueries(
         List<DelegatedExpression> expressions,
         QueryShardContext context,
-        NamedWriteableRegistry registry
+        NamedWriteableRegistry registry,
+        Map<Integer, String> childPathOut
     ) {
         Map<Integer, Query> queries = new HashMap<>();
         for (DelegatedExpression expr : expressions) {
@@ -106,6 +121,13 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                 StreamInput rawInput = StreamInput.wrap(expr.getExpressionBytes());
                 StreamInput input = new NamedWriteableAwareStreamInput(rawInput, registry);
                 QueryBuilder queryBuilder = input.readNamedWriteable(QueryBuilder.class);
+                // Child-grain split: if this is a CHILD-scoped query (NestedAnyMatchChildSerializer emits
+                // bool(must: term(path.field), filter: term(_nested_path, path))), record the nested path
+                // so collectChildDocs can pick the right per-level ordinal without an FFM path arg.
+                String childPath = extractChildNestedPath(queryBuilder);
+                if (childPath != null) {
+                    childPathOut.put(expr.getAnnotationId(), childPath);
+                }
                 // Rewrite FieldExistsQuery → a postings-only equivalent: the lucene-secondary segment
                 // has no doc_values/norms (they live in the parquet primary), so a FieldExistsQuery
                 // built from an _exists_ clause (PPL `search field!=value`) would throw at rewrite().
@@ -137,6 +159,24 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         return queries;
     }
 
+    /**
+     * If {@code queryBuilder} is the CHILD-scoped shape {@code NestedAnyMatchChildSerializer} emits —
+     * {@code bool(must: term(path.field, value), filter: term(_nested_path, path))} — return the nested
+     * {@code path} carried by the {@code _nested_path} filter clause; otherwise {@code null}. This is the
+     * only builder shape that carries a {@code _nested_path} term, so the match is unambiguous.
+     */
+    private static String extractChildNestedPath(QueryBuilder queryBuilder) {
+        if (queryBuilder instanceof BoolQueryBuilder bool) {
+            for (QueryBuilder filter : bool.filter()) {
+                if (filter instanceof TermQueryBuilder term && NestedPathFieldMapper.NAME.equals(term.fieldName())) {
+                    Object value = term.value();
+                    return value == null ? null : value.toString();
+                }
+            }
+        }
+        return null;
+    }
+
     @Override
     public int createProvider(int annotationId) {
         Query query = queriesByAnnotationId.get(annotationId);
@@ -147,6 +187,12 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             Weight weight = searcher.createWeight(searcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
             int providerKey = nextProviderKey.getAndIncrement();
             weightsByProviderKey.put(providerKey, weight);
+            // Carry the child nested path (if this is a child-scoped peer) to the provider key so the
+            // per-collector ScorerHandle can pick the right ordinal in collectChildDocs.
+            String childPath = childPathByAnnotationId.get(annotationId);
+            if (childPath != null) {
+                childPathByProviderKey.put(providerKey, childPath);
+            }
             LOGGER.debug("[scf] createProvider annotationId={} → providerKey={}", annotationId, providerKey);
             return providerKey;
         } catch (IOException exception) {
@@ -223,7 +269,10 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         try {
             Scorer scorer = weight.scorer(leaf);
             int collectorKey = nextCollectorKey.getAndIncrement();
-            scorersByCollectorKey.put(collectorKey, new ScorerHandle(scorer, minDoc, maxDoc, translator));
+            scorersByCollectorKey.put(
+                collectorKey,
+                new ScorerHandle(scorer, minDoc, maxDoc, translator, childPathByProviderKey.get(providerKey))
+            );
             // [NESTED] createCollector trace: rowWindow is a Parquet row-group slice (logical-row space);
             // nested=true means the docId→row translation is active for this leaf. Grep: NESTED lucene-delegation.
             LOGGER.info(
@@ -360,20 +409,38 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
      * evaluation of the range clause, at CHILD grain, before the ∃ roll-up to parents — preserving element
      * correlation (the same child must satisfy both), matching vanilla nested semantics.
      *
-     * <p>{@code childBase[r - rowMin]} = the dense child-id offset of parent row r's first element within the
-     * RG's child-id space; element k of row r has child-id {@code childBase[r-rowMin] + k}. The bitset spans
-     * {@code totalChildren} bits. {@code path} selects which nested level's ordinal to use (deep nesting).
+     * <p>{@code childBase[r - rowMin]} = the CALLER's element index at which parent row r's elements begin
+     * (built from the decoded Arrow LIST {@code value_offsets} of the current batch); element k of row r has
+     * child-id {@code childBase[r-rowMin] + k}. A {@code childBase} entry of {@code -1} marks a parent row
+     * NOT present in the caller's current batch — matched children of such a row are skipped. The bitset
+     * spans {@code totalChildren} bits. The nested path is taken from the collector's own child-scoped query
+     * ({@link ScorerHandle#childPath}); no path is marshaled across FFM.
      *
      * @return number of u64 words written, or -1 on error.
      */
-    public int collectChildDocs(int collectorKey, int minDoc, int maxDoc, int[] childBase, int totalChildren, String path, MemorySegment out) {
+    @Override
+    public int collectChildDocs(int collectorKey, int minDoc, int maxDoc, int[] childBase, int totalChildren, MemorySegment out) {
         ScorerHandle handle = scorersByCollectorKey.get(collectorKey);
         if (handle == null) {
+            return -1;
+        }
+        String path = handle.childPath;
+        if (path == null) {
+            LOGGER.error("[NESTED-SPLIT] collectChildDocs collectorKey={} has no child path (not a child-scoped collector)", collectorKey);
             return -1;
         }
         int span = maxDoc - minDoc;
         if (span <= 0 || totalChildren <= 0) {
             return 0;
+        }
+        if (childBase == null || childBase.length != span) {
+            LOGGER.error(
+                "[NESTED-SPLIT] collectChildDocs collectorKey={} childBase length={} != row span={}",
+                collectorKey,
+                childBase == null ? -1 : childBase.length,
+                span
+            );
+            return -1;
         }
         FixedBitSet bits = new FixedBitSet(totalChildren);
         if (handle.scorer != null) {
@@ -394,18 +461,25 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                     while (docId != DocIdSetIterator.NO_MORE_DOCS && docId < docTo) {
                         // Matched a CHILD doc → (root row, element offset). row must be in [minDoc,maxDoc);
                         // child-id = childBase[row-minDoc] + offset. A matched doc with no child ordinal for
-                        // this path (offset < 0) is a mis-shaped query and is skipped, not corrupting the set.
+                        // this path (offset < 0), or whose row is not in the caller's current batch
+                        // (childBase[row-minDoc] == -1), is skipped, not corrupting the set — the -1 sentinel
+                        // must be checked BEFORE adding `off`, else -1 + off could land on a valid index.
                         int row = translator.childRow(path, docId);
                         int off = translator.childOffset(path, docId);
                         if (row < 0 || off < 0 || row < minDoc || row >= maxDoc) {
                             skippedNoChild++;
                         } else {
-                            int childId = childBase[row - minDoc] + off;
-                            if (childId >= 0 && childId < totalChildren) {
-                                bits.set(childId);
-                                matchedChildren++;
+                            int base = childBase[row - minDoc];
+                            if (base < 0) {
+                                skippedNoChild++; // parent row not delivered in this batch
                             } else {
-                                skippedNoChild++;
+                                int childId = base + off;
+                                if (childId >= 0 && childId < totalChildren) {
+                                    bits.set(childId);
+                                    matchedChildren++;
+                                } else {
+                                    skippedNoChild++;
+                                }
                             }
                         }
                         docId = iterator.nextDoc();
@@ -464,14 +538,21 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         final int partitionRowMax;
         /** docId↔row translator for the collector's leaf (pass-through on a non-nested leaf). */
         final RowIdTranslator translator;
+        /**
+         * Child-grain split only: the nested path this collector's child-scoped query targets, so
+         * {@link #collectChildDocs} can select the right per-level ordinal. Null for every non-child
+         * (flat / whole-node block-join) collector.
+         */
+        final String childPath;
         /** Forward cursor in Lucene docId space, monotonic across successive collectDocs calls. */
         int currentDoc = -1;
 
-        ScorerHandle(Scorer scorer, int partitionRowMin, int partitionRowMax, RowIdTranslator translator) {
+        ScorerHandle(Scorer scorer, int partitionRowMin, int partitionRowMax, RowIdTranslator translator, String childPath) {
             this.scorer = scorer;
             this.partitionRowMin = partitionRowMin;
             this.partitionRowMax = partitionRowMax;
             this.translator = translator;
+            this.childPath = childPath;
         }
     }
 

@@ -114,6 +114,7 @@ public final class NativeBridge {
     private static final MethodHandle FREE_METRICS_BUF;
     private static final MethodHandle SQL_TO_SUBSTRAIT;
     private static final MethodHandle REGISTER_FILTER_TREE_CALLBACKS;
+    private static final MethodHandle REGISTER_CHILD_COLLECT_CALLBACK;
     private static final MethodHandle CREATE_LOCAL_SESSION;
     private static final MethodHandle CLOSE_LOCAL_SESSION;
     private static final MethodHandle REGISTER_PARTITION_STREAM;
@@ -386,7 +387,7 @@ public final class NativeBridge {
             )
         );
 
-        // void df_register_filter_tree_callbacks(createCollector, collectDocs, releaseCollector)
+        // void df_register_filter_tree_callbacks(createProvider, releaseProvider, createCollector, collectDocs, releaseCollector)
         REGISTER_FILTER_TREE_CALLBACKS = linker.downcallHandle(
             lib.find("df_register_filter_tree_callbacks").orElseThrow(),
             FunctionDescriptor.ofVoid(
@@ -397,6 +398,14 @@ public final class NativeBridge {
                 ValueLayout.ADDRESS
             )
         );
+
+        // void df_register_child_collect_callback(collectChildDocs) — additive, separate from the primary
+        // registration above so the 5-callback ABI is untouched. Optional on the Rust side; if this symbol
+        // is ever absent (older dylib) we skip registration and only the child-grain nested path is
+        // unavailable — the node still boots.
+        REGISTER_CHILD_COLLECT_CALLBACK = lib.find("df_register_child_collect_callback")
+            .map(sym -> linker.downcallHandle(sym, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS)))
+            .orElse(null);
 
         CREATE_CUSTOM_CACHE_MANAGER = linker.downcallHandle(
             lib.find("df_create_custom_cache_manager").orElseThrow(),
@@ -681,6 +690,24 @@ public final class NativeBridge {
                 "releaseCollector",
                 java.lang.invoke.MethodType.methodType(void.class, long.class, int.class)
             );
+            // Child-grain nested split (additive). Signature:
+            // long collectChildDocs(long ctx, int key, int minDoc, int maxDoc, MemorySegment childBase,
+            //                        long totalChildren, MemorySegment out, long outWordCap)
+            MethodHandle collectChildDocs = lookup.findStatic(
+                cb,
+                "collectChildDocs",
+                java.lang.invoke.MethodType.methodType(
+                    long.class,
+                    long.class,
+                    int.class,
+                    int.class,
+                    int.class,
+                    java.lang.foreign.MemorySegment.class,
+                    long.class,
+                    java.lang.foreign.MemorySegment.class,
+                    long.class
+                )
+            );
 
             java.lang.foreign.MemorySegment createProviderStub = linker.upcallStub(
                 createProvider,
@@ -730,6 +757,27 @@ public final class NativeBridge {
                 collectDocsStub,
                 releaseCollectorStub
             );
+
+            // Register the additive child-grain collect callback separately. Skipped when the dylib predates
+            // the child split (symbol absent) — the node still boots; only child-grain nested queries fail.
+            if (REGISTER_CHILD_COLLECT_CALLBACK != null) {
+                java.lang.foreign.MemorySegment collectChildDocsStub = linker.upcallStub(
+                    collectChildDocs,
+                    FunctionDescriptor.of(
+                        ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_INT,
+                        ValueLayout.JAVA_INT,
+                        ValueLayout.JAVA_INT,
+                        ValueLayout.ADDRESS,
+                        ValueLayout.JAVA_LONG,
+                        ValueLayout.ADDRESS,
+                        ValueLayout.JAVA_LONG
+                    ),
+                    arena
+                );
+                NativeCall.invokeVoid(REGISTER_CHILD_COLLECT_CALLBACK, collectChildDocsStub);
+            }
         } catch (Throwable t) {
             throw new ExceptionInInitializerError(t);
         }

@@ -15,6 +15,7 @@ import org.opensearch.analytics.spi.DelegationThreadTracker;
 import org.opensearch.analytics.spi.FilterDelegationHandle;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -251,6 +252,68 @@ public final class FilterTreeCallbacks {
                     collectorKey,
                     minDoc,
                     maxDoc
+                ),
+                throwable
+            );
+            return -1L;
+        } finally {
+            trackEnd(contextId, tid);
+        }
+    }
+
+    /**
+     * {@code collectChildDocs(contextId, collectorKey, minDoc, maxDoc, childBasePtr, totalChildren, outPtr, outWordCap) -> wordsWritten|-1}.
+     *
+     * <p>Child-grain sibling of {@link #collectDocs}. {@code childBasePtr} points to {@code maxDoc - minDoc}
+     * {@code i32}s (the caller's per-row element base offsets, built from the decoded Arrow LIST value
+     * offsets); a {@code -1} entry marks a parent row absent from the current batch. Reads them into a Java
+     * {@code int[]} and delegates to {@link FilterDelegationHandle#collectChildDocs}.
+     */
+    public static long collectChildDocs(
+        long contextId,
+        int collectorKey,
+        int minDoc,
+        int maxDoc,
+        MemorySegment childBasePtr,
+        long totalChildren,
+        MemorySegment outPtr,
+        long outWordCap
+    ) {
+        long tid = trackStart(contextId);
+        try {
+            QueryBinding binding = BINDINGS.get(contextId);
+            assertBindingExists(binding, "collectChildDocs", contextId);
+            if (binding == null || binding.handle() == null) {
+                return -1L;
+            }
+            FilterDelegationHandle handle = binding.handle();
+            if (handle.isCancelled()) {
+                return -1L;
+            }
+            int span = maxDoc - minDoc;
+            if (span <= 0 || totalChildren <= 0) {
+                return 0L;
+            }
+            // Read the childBase i32[] from native memory. reinterpret to the exact byte size so the copy
+            // is bounds-checked against the caller-declared span.
+            MemorySegment childBaseView = childBasePtr.reinterpret((long) span * Integer.BYTES);
+            int[] childBase = childBaseView.toArray(ValueLayout.JAVA_INT);
+            int totalChildrenInt = (int) Math.min(totalChildren, (long) Integer.MAX_VALUE);
+            int maxWords = (int) Math.min(outWordCap, (long) Integer.MAX_VALUE);
+            MemorySegment outView = outPtr.reinterpret((long) maxWords * Long.BYTES);
+            int wordsWritten = handle.collectChildDocs(collectorKey, minDoc, maxDoc, childBase, totalChildrenInt, outView);
+            return (wordsWritten < 0) ? -1L : wordsWritten;
+        } catch (AssertionError e) {
+            throw e;
+        } catch (Throwable throwable) {
+            LOGGER.error(
+                new ParameterizedMessage(
+                    "collectChildDocs(contextId={}, collectorKey={}, [{}, {}), totalChildren={}) failed",
+                    contextId,
+                    collectorKey,
+                    minDoc,
+                    maxDoc,
+                    totalChildren
                 ),
                 throwable
             );

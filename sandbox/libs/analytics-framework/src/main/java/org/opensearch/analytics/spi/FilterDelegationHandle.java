@@ -71,6 +71,31 @@ public interface FilterDelegationHandle extends Closeable {
     int collectDocs(int collectorKey, int minDoc, int maxDoc, MemorySegment out);
 
     /**
+     * CHILD-GRAIN collect for the nested-predicate split: fill {@code out} with a bitset indexed by CHILD
+     * ELEMENT ORDINAL (not parent row). For each nested-child doc the collector's child-scoped query matches
+     * in the parent-row window {@code [minDoc, maxDoc)}, set bit {@code childBase[row - minDoc] + elementOffset}.
+     *
+     * <p>{@code childBase} (length {@code maxDoc - minDoc}) is supplied by the caller from the decoded Arrow
+     * LIST {@code value_offsets} of the current batch, so the returned bitset lands directly in the caller's
+     * flattened-element coordinate space. A {@code childBase} entry of {@code -1} marks a parent row not
+     * present in the current batch (its matched children are skipped). The nested path is resolved from the
+     * collector's own child-scoped query — it is not passed here.
+     *
+     * <p>Default: unsupported (returns {@code -1}). Only the composite/nested Lucene handle implements it.
+     *
+     * @param collectorKey key returned by {@link #createCollector(int, long, int, int)}
+     * @param minDoc inclusive lower bound (parent-row window)
+     * @param maxDoc exclusive upper bound (parent-row window)
+     * @param childBase per-row element base offsets in caller coordinate space; length {@code maxDoc - minDoc}
+     * @param totalChildren number of bits in the output bitset (elements across the batch)
+     * @param out destination buffer
+     * @return number of words written, or {@code -1} on error / unsupported
+     */
+    default int collectChildDocs(int collectorKey, int minDoc, int maxDoc, int[] childBase, int totalChildren, MemorySegment out) {
+        return -1;
+    }
+
+    /**
      * Release resources for a collector.
      */
     void releaseCollector(int collectorKey);
