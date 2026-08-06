@@ -258,7 +258,7 @@ impl FfmSegmentCollector {
     }
 }
 
-impl FfmSegmentCollector {
+impl RowGroupDocsCollector for FfmSegmentCollector {
     /// Child-grain collect for the nested predicate split: returns a packed u64 bitset in the CALLER'S
     /// element coordinate space, dimensioned by `total_children`. For each Lucene child doc the scorer
     /// matches in `[min_doc, max_doc)` (parent-row window), Java sets bit `child_base[row - min_doc] +
@@ -271,7 +271,7 @@ impl FfmSegmentCollector {
     /// `child_base` has length `max_doc - min_doc`; an entry of `-1` marks a parent row not present in the
     /// current batch (Java skips it). Uses the optional sixth FFM callback (`load_collect_child_docs`),
     /// which returns a clear error if the Java side never registered it.
-    pub(crate) fn collect_child_docs_batch(
+    fn collect_child_docs_batch(
         &self,
         min_doc: i32,
         max_doc: i32,
@@ -323,9 +323,7 @@ impl FfmSegmentCollector {
         buf.truncate(n);
         Ok(buf)
     }
-}
 
-impl RowGroupDocsCollector for FfmSegmentCollector {
     fn collect_packed_u64_bitset(&self, min_doc: i32, max_doc: i32) -> Result<Vec<u64>, String> {
         if max_doc <= min_doc {
             return Ok(Vec::new());

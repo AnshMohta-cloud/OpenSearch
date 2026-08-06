@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use datafusion::arrow::array::BooleanArray;
+use datafusion::arrow::array::{Array, AsArray, BooleanArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use native_bridge_common::log_debug;
 use roaring::RoaringBitmap;
@@ -37,6 +37,7 @@ use crate::indexed_table::page_pruner::{PagePruneMetrics, PagePruner, StatsPrune
 use crate::indexed_table::row_selection::{
     bitmap_to_packed_bits, packed_bits_to_boolean_array, row_selection_to_bitmap, PositionMap,
 };
+use crate::udf::nested_any_match_expr::evaluate_nested_with_lucene;
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use std::time::Instant;
@@ -114,6 +115,44 @@ struct SingleCollectorState {
     candidates: RoaringBitmap,
     mask_buffer: datafusion::arrow::buffer::Buffer,
     mask_len: usize,
+    /// Number of rows in this RG (== `mask_len`). Kept explicitly so the child-grain split's
+    /// `on_batch_mask` can size the per-RG `child_base` vector without re-deriving it.
+    rg_num_rows: usize,
+    /// RG's first row in absolute (segment-relative) doc space. The child collect scans the parent-row
+    /// window `[rg_first_row, rg_first_row + rg_num_rows)`. `None` when no child split is active.
+    rg_first_row: i64,
+}
+
+/// One Lucene-delegated keyword clause of a child-grain nested split. `clause_idx` is the position
+/// referenced by the residual JSON's `{"lucene": clause_idx}` node; `annotation_id` keys the lazily-created
+/// peer provider (a child-scoped Lucene query — see `NestedAnyMatchChildSerializer`).
+#[derive(Debug, Clone)]
+pub struct ChildClause {
+    pub clause_idx: usize,
+    pub annotation_id: i32,
+}
+
+/// State for the child-grain nested-predicate split, attached to a `SingleCollectorEvaluator` when the
+/// residual is a `nested_any_match_expr` whose keyword conjunct(s) were routed to Lucene at element grain.
+///
+/// When present, `on_batch_mask` evaluates the nested predicate against the decoded `LIST<STRUCT>` column
+/// with each `{"lucene": i}` node's per-element verdict supplied by clause `i`'s Lucene child collect —
+/// intersecting the keyword (Lucene) and range/other (DataFusion) clauses at the SAME element before the
+/// ∃ roll-up to parents. `None` (the common case) → the evaluator behaves exactly as before.
+#[derive(Debug, Clone)]
+pub struct ChildSplitState {
+    /// Batch column index of the `LIST<STRUCT>` nested array the predicate ranges over.
+    pub array_col_index: usize,
+    /// The `nested_any_match_expr` JSON (with `{"lucene": i}` holes, each carrying a `"fallback"`).
+    pub expr_json: String,
+    /// One entry per Lucene-delegated clause, sorted ascending by `clause_idx` so `clause_bits[i]`
+    /// aligns with the JSON's `{"lucene": i}` reference.
+    pub clauses: Vec<ChildClause>,
+    /// Lazy per-child-clause provider locks, keyed by `annotation_id` (one `OnceLock` each). Separate from
+    /// the evaluator's parent-grain `performance_provider_locks` so a child-scoped query is NEVER consulted
+    /// at parent grain in `prefetch_rg`. Query-scoped (shared across per-(segment×chunk) evaluators via
+    /// `Arc::clone`) so each child provider is created once per (query × annotation_id).
+    pub provider_locks: Arc<HashMap<i32, Arc<OnceLock<ProviderHandle>>>>,
 }
 
 /// Evaluator holding one collector and applying per-RG page pruning.
@@ -186,6 +225,11 @@ pub struct SingleCollectorEvaluator {
     stats_prune_tree: Option<Arc<StatsPruneTree>>,
     /// Reverse map: absolute RG index → position in `rg_can_match` vectors.
     rg_index_to_pos: HashMap<usize, usize>,
+    /// Child-grain nested split. `Some` when the residual is a `nested_any_match_expr` with keyword
+    /// clause(s) routed to Lucene at element grain; the child clauses' peer providers live in
+    /// `performance_provider_locks` (keyed by their annotation_id) and are consulted at CHILD grain in
+    /// `on_batch_mask`, NOT at parent grain in `prefetch_rg`. `None` → non-nested behavior, unchanged.
+    child_split: Option<ChildSplitState>,
 }
 
 /// Resources needed for per-RG bloom filter pruning.
@@ -215,6 +259,7 @@ impl SingleCollectorEvaluator {
         bloom_config: Option<BloomConfig>,
         stats_prune_tree: Option<Arc<StatsPruneTree>>,
         rg_index_to_pos: HashMap<usize, usize>,
+        child_split: Option<ChildSplitState>,
     ) -> Self {
         Self {
             collector,
@@ -231,6 +276,7 @@ impl SingleCollectorEvaluator {
             bloom_config,
             stats_prune_tree,
             rg_index_to_pos,
+            child_split,
         }
     }
 }
@@ -260,6 +306,115 @@ fn should_consult_lucene(
     }
     let surviving_fraction = surviving_rows as f64 / rg.num_rows as f64;
     surviving_fraction > threshold
+}
+
+impl SingleCollectorEvaluator {
+    /// Evaluate a child-grain nested split against one delivered batch. Returns the per-parent-row
+    /// BooleanArray (length `batch_len`) that the `nested_any_match_expr` predicate produces once each
+    /// `{"lucene": i}` node is fed clause `i`'s per-element Lucene verdict.
+    ///
+    /// The coordinate system is owned HERE, not by Java: `child_base[p]` is the batch-flattened element
+    /// index at which parent RG-row `p`'s elements begin (from the decoded LIST `value_offsets`), so the
+    /// child bitset Java returns is directly indexable by the residual UDF's element index — correct under
+    /// every `PositionMap` (Identity / Bitmap / Runs) and multi-batch RG split. A parent row not delivered
+    /// in this batch keeps `child_base[p] == -1`, and Java skips any child whose row maps to `-1`.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_child_split(
+        &self,
+        child_split: &ChildSplitState,
+        state: &SingleCollectorState,
+        position_map: &PositionMap,
+        batch_offset: usize,
+        batch_len: usize,
+        batch: &RecordBatch,
+    ) -> Result<BooleanArray, String> {
+        // Decode the LIST<STRUCT> column and its batch-local element offsets.
+        let array = batch.column(child_split.array_col_index).clone();
+        let list = array.as_list_opt::<i32>().ok_or_else(|| {
+            format!(
+                "child-split: column {} is not a List, got {:?}",
+                child_split.array_col_index,
+                array.data_type()
+            )
+        })?;
+        let value_offsets = list.value_offsets();
+        // value_offsets has batch_len+1 entries; the last is the flattened element count for this batch.
+        let total_children = *value_offsets.last().map(|&o| o).get_or_insert(0) as usize;
+
+        // Build child_base over the WHOLE RG (rows not in this batch stay -1). value_offsets[d] is the
+        // element start of delivered row d; map d → its RG position and record the base there.
+        let mut child_base = vec![-1i32; state.rg_num_rows];
+        for d in 0..batch_len {
+            let p = position_map.rg_position(batch_offset + d).ok_or_else(|| {
+                format!(
+                    "child-split: delivered row {} (batch_offset {}) out of PositionMap range",
+                    d, batch_offset
+                )
+            })?;
+            if p >= state.rg_num_rows {
+                return Err(format!(
+                    "child-split: RG position {} >= rg_num_rows {}",
+                    p, state.rg_num_rows
+                ));
+            }
+            child_base[p] = value_offsets[d];
+        }
+
+        // Parent-row window for the child scan: the whole RG in absolute doc space.
+        let min_doc = state.rg_first_row as i32;
+        let max_doc = (state.rg_first_row + state.rg_num_rows as i64) as i32;
+
+        // For each Lucene-delegated clause (ascending clause_idx), collect its per-element bits. The
+        // provider is created lazily and shared across batches/RGs of the same query via the query-scoped
+        // OnceLock map; the collector is per-(segment, RG window). clause_bits[i] aligns with clause_idx i
+        // because `clauses` is sorted ascending — the classifier guarantees a dense 0..N clause set.
+        let mut clause_bits: Vec<BooleanArray> = Vec::with_capacity(child_split.clauses.len());
+        for (expected_idx, clause) in child_split.clauses.iter().enumerate() {
+            if clause.clause_idx != expected_idx {
+                return Err(format!(
+                    "child-split: clauses not densely sorted — expected clause_idx {}, got {}",
+                    expected_idx, clause.clause_idx
+                ));
+            }
+            let lock = child_split
+                .provider_locks
+                .get(&clause.annotation_id)
+                .ok_or_else(|| {
+                    format!(
+                        "child-split: no provider lock for child clause annotation_id={}",
+                        clause.annotation_id
+                    )
+                })?;
+            let context_id = self.context_id;
+            let annotation_id = clause.annotation_id;
+            let provider = lock.get_or_init(|| {
+                create_provider(context_id, annotation_id).expect("create_provider FFM upcall failed")
+            });
+            let collector = self
+                .delegated_backend_collector_factory
+                .create(context_id, provider.key(), self.writer_generation, min_doc, max_doc)
+                .map_err(|e| {
+                    format!(
+                        "child-split: collector create (annotation_id={}, provider={}, writer_generation={}): {}",
+                        annotation_id,
+                        provider.key(),
+                        self.writer_generation,
+                        e
+                    )
+                })?;
+            let words =
+                collector.collect_child_docs_batch(min_doc, max_doc, &child_base, total_children)?;
+            if let Some(ref c) = self.ffm_collector_calls {
+                c.add(1);
+            }
+            clause_bits.push(packed_bits_to_boolean_array(words, total_children));
+        }
+
+        // Evaluate the nested predicate with the Lucene per-element verdicts wired into the {"lucene":i}
+        // nodes. The ∃-over-elements roll-up (and element correlation) lives inside the UDF.
+        evaluate_nested_with_lucene(&array, &child_split.expr_json, &clause_bits)
+            .map_err(|e| format!("child-split: evaluate_nested_with_lucene: {}", e))
+    }
 }
 
 impl RowGroupBitsetSource for SingleCollectorEvaluator {
@@ -527,6 +682,8 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
                 candidates,
                 mask_buffer: mask_buffer.clone(),
                 mask_len,
+                rg_num_rows: rg.num_rows as usize,
+                rg_first_row: rg.first_row,
             }),
             mask_buffer: Some(mask_buffer),
         }))
@@ -541,17 +698,55 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
         batch_len: usize,
         batch: &RecordBatch,
     ) -> Result<Option<BooleanArray>, String> {
-        // No residual → no post-decode work. Stream's current_mask
-        // (if built) handles Collector narrowing.
-        let Some(ref residual) = self.residual_expr else {
+        // No child split AND no residual → no post-decode work; the stream's current_mask handles
+        // Collector narrowing. Return before touching rg_state (some callers pass a placeholder state on
+        // this no-work path).
+        if self.child_split.is_none() && self.residual_expr.is_none() {
             return Ok(None);
-        };
+        }
 
         let state = rg_state
             .downcast_ref::<SingleCollectorState>()
             .ok_or_else(|| {
                 "SingleCollectorEvaluator: rg_state is not SingleCollectorState".to_string()
             })?;
+
+        // Child-grain nested split: evaluate the nested predicate against the decoded LIST<STRUCT>
+        // column, feeding each {"lucene": i} node its clause's per-element Lucene verdict. This is the
+        // authoritative, element-correlated filter — it REPLACES the collector-mask ∧ residual combine
+        // (the child peers were kept OUT of `residual_expr` by the classifier; any non-nested conjuncts
+        // that remain in `residual_expr` are still AND'd in below).
+        if let Some(ref child_split) = self.child_split {
+            let nested_mask = self.evaluate_child_split(
+                child_split,
+                state,
+                position_map,
+                batch_offset,
+                batch_len,
+                batch,
+            )?;
+            // AND any non-nested residual conjuncts (e.g. a parent-column predicate co-located in the
+            // same top-level AND). None → the nested predicate alone is the mask.
+            return match self.residual_expr {
+                None => Ok(Some(nested_mask)),
+                Some(ref residual) => {
+                    let residual_mask =
+                        super::eval_helpers::evaluate_residual(residual, batch, batch_len)?;
+                    let combined = datafusion::arrow::compute::kernels::boolean::and_kleene(
+                        &nested_mask,
+                        &residual_mask,
+                    )
+                    .map_err(|e| format!("SingleCollectorEvaluator child-split: and_kleene: {}", e))?;
+                    Ok(Some(combined))
+                }
+            };
+        }
+
+        // No residual → no post-decode work. Stream's current_mask
+        // (if built) handles Collector narrowing.
+        let Some(ref residual) = self.residual_expr else {
+            return Ok(None);
+        };
 
         // Build Collector mask over delivered rows via PositionMap.
         // All paths produce a `BooleanArray` whose underlying
@@ -687,6 +882,66 @@ mod tests {
         }
     }
 
+    /// Child-grain stub collector: given a set of matching `(rg_row, element_offset)` pairs (what a
+    /// Lucene child-scoped query would match), it consults the caller-supplied `child_base` exactly as
+    /// the real FFM collector does — setting bit `child_base[row - min_doc] + offset` — so the test
+    /// exercises the REAL coordinate math (`child_base` built from `value_offsets` under a non-Identity
+    /// PositionMap), not a shortcut. Rows whose `child_base` entry is `-1` (not in this batch) are skipped.
+    #[derive(Debug)]
+    struct ChildStubCollector {
+        /// (rg_row, element_offset) pairs the child-scoped query matches.
+        matches: Vec<(i32, i32)>,
+    }
+
+    impl RowGroupDocsCollector for ChildStubCollector {
+        fn collect_packed_u64_bitset(&self, _min: i32, _max: i32) -> Result<Vec<u64>, String> {
+            Err("ChildStubCollector is child-grain only".into())
+        }
+        fn collect_child_docs_batch(
+            &self,
+            min_doc: i32,
+            max_doc: i32,
+            child_base: &[i32],
+            total_children: usize,
+        ) -> Result<Vec<u64>, String> {
+            let mut bits = vec![0u64; total_children.div_ceil(64)];
+            for &(row, off) in &self.matches {
+                if row < min_doc || row >= max_doc {
+                    continue;
+                }
+                let base = child_base[(row - min_doc) as usize];
+                if base < 0 {
+                    continue; // row not delivered in this batch
+                }
+                let child_id = (base + off) as usize;
+                if child_id < total_children {
+                    bits[child_id / 64] |= 1u64 << (child_id % 64);
+                }
+            }
+            Ok(bits)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChildStubFactory {
+        matches: Vec<(i32, i32)>,
+    }
+
+    impl DelegatedBackendCollectorFactory for ChildStubFactory {
+        fn create(
+            &self,
+            _context_id: i64,
+            _provider_key: i32,
+            _writer_generation: i64,
+            _doc_min: i32,
+            _doc_max: i32,
+        ) -> Result<Arc<dyn RowGroupDocsCollector>, String> {
+            Ok(Arc::new(ChildStubCollector {
+                matches: self.matches.clone(),
+            }) as Arc<dyn RowGroupDocsCollector>)
+        }
+    }
+
     fn minimal_page_pruner() -> Arc<PagePruner> {
         // Build a 1-row-group parquet with no filters — page pruner becomes a no-op
         // (filter_row_ids returns input, candidate_row_ids returns [first_row, first_row+num_rows)).
@@ -733,6 +988,7 @@ mod tests {
             None,
             None,
             HashMap::new(),
+            None,
         );
 
         let rg = RowGroupInfo {
@@ -764,6 +1020,7 @@ mod tests {
             None,
             None,
             HashMap::new(),
+            None,
         );
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
@@ -807,6 +1064,7 @@ mod tests {
             None,
             None,
             HashMap::new(),
+            None,
         );
         assert!(eval.needs_row_mask());
     }
@@ -830,6 +1088,7 @@ mod tests {
             None,
             None,
             HashMap::new(),
+            None,
         );
         let rg = RowGroupInfo {
             index: 0,
@@ -865,6 +1124,7 @@ mod tests {
             None,
             None,
             HashMap::new(),
+            None,
         );
 
         let rg = RowGroupInfo {
@@ -902,6 +1162,7 @@ mod tests {
             None,
             Some(Arc::new(spt)),
             HashMap::from([(0, 0)]),
+            None,
         );
         let rg = RowGroupInfo {
             index: 0,
@@ -936,6 +1197,7 @@ mod tests {
             None,
             Some(Arc::new(spt)),
             HashMap::from([(0, 0)]),
+            None,
         );
         let rg = RowGroupInfo {
             index: 0,
@@ -970,6 +1232,7 @@ mod tests {
             None,
             None,
             HashMap::new(),
+            None,
         );
         let rg = RowGroupInfo {
             index: 0,
@@ -982,6 +1245,167 @@ mod tests {
             .expect("should have matches");
         let got: Vec<u32> = prefetched.candidates.iter().collect();
         assert_eq!(got, vec![1u32, 5]);
+    }
+
+    // ── Child-grain split coordinate math ─────────────────────────────
+
+    use datafusion::arrow::array::{ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, StructArray};
+    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::arrow::datatypes::Fields;
+
+    /// One `LIST<STRUCT{author:Utf8, score:Int64}>` column wrapped in a RecordBatch named "comments".
+    fn comments_batch(rows: &[Vec<(&str, i64)>]) -> RecordBatch {
+        let mut authors: Vec<Option<String>> = Vec::new();
+        let mut scores: Vec<Option<i64>> = Vec::new();
+        let mut offsets: Vec<i32> = vec![0];
+        let mut acc = 0i32;
+        for row in rows {
+            for (a, s) in row {
+                authors.push(Some((*a).to_string()));
+                scores.push(Some(*s));
+            }
+            acc += row.len() as i32;
+            offsets.push(acc);
+        }
+        let sfields: Fields = Fields::from(vec![
+            Field::new("author", DataType::Utf8, true),
+            Field::new("score", DataType::Int64, true),
+        ]);
+        let struct_array = StructArray::new(
+            sfields.clone(),
+            vec![
+                Arc::new(StringArray::from(authors)) as ArrayRef,
+                Arc::new(Int64Array::from(scores)) as ArrayRef,
+            ],
+            None,
+        );
+        let list_field = Arc::new(Field::new("item", DataType::Struct(sfields), true));
+        let list = ListArray::new(
+            list_field.clone(),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(struct_array),
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "comments",
+            DataType::List(list_field),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(list) as ArrayRef]).unwrap()
+    }
+
+    fn split_json() -> String {
+        // comments.author='alice' (routed to Lucene, clause 0) AND comments.score>50 (native).
+        r#"{"op":"AND","args":[
+             {"lucene":0,"fallback":{"op":"=","args":[{"field":"author"},{"lit":"alice"}]}},
+             {"op":">","args":[{"field":"score"},{"lit":50}]}
+           ]}"#
+        .to_string()
+    }
+
+    fn child_split_eval(matches: Vec<(i32, i32)>) -> SingleCollectorEvaluator {
+        let annotation_id = 7;
+        // Child provider locks live on ChildSplitState. Pre-seed the lock so no FFM createProvider upcall
+        // happens in the unit test.
+        let mut child_locks = HashMap::new();
+        let lock: Arc<OnceLock<ProviderHandle>> = Arc::new(OnceLock::new());
+        lock.set(ProviderHandle::new_for_test(0)).ok();
+        child_locks.insert(annotation_id, lock);
+        SingleCollectorEvaluator::new(
+            None,
+            minimal_page_pruner(),
+            None,
+            None, // no non-nested residual
+            None,
+            None,
+            CollectorCallStrategy::FullRange,
+            Arc::new(HashMap::new()), // parent-grain perf locks: none (child peers excluded)
+            0,
+            Arc::new(ChildStubFactory { matches }),
+            0,
+            None,
+            None,
+            HashMap::new(),
+            Some(ChildSplitState {
+                array_col_index: 0,
+                expr_json: split_json(),
+                clauses: vec![ChildClause {
+                    clause_idx: 0,
+                    annotation_id,
+                }],
+                provider_locks: Arc::new(child_locks),
+            }),
+        )
+    }
+
+    fn state_for(rg_num_rows: usize) -> SingleCollectorState {
+        // Minimal state; only rg_num_rows / rg_first_row are read by evaluate_child_split.
+        SingleCollectorState {
+            candidates: RoaringBitmap::new(),
+            mask_buffer: datafusion::arrow::buffer::Buffer::from_vec(vec![0u64; 1]),
+            mask_len: rg_num_rows,
+            rg_num_rows,
+            rg_first_row: 0,
+        }
+    }
+
+    #[test]
+    fn child_split_identity_full_rg() {
+        // 2 parents delivered in full (Identity). P0: alice@40, bob@90 (alice element is 40, not >50 →
+        // no single element satisfies both). P1: alice@70 (satisfies both). Lucene matches author=alice
+        // at (row0,off0) and (row1,off0). Expected [false, true].
+        let batch = comments_batch(&[vec![("alice", 40), ("bob", 90)], vec![("alice", 70)]]);
+        let eval = child_split_eval(vec![(0, 0), (1, 0)]);
+        let state = state_for(2);
+        let pm = PositionMap::Identity { delivered_count: 2 };
+        let mask = eval
+            .evaluate_child_split(eval.child_split.as_ref().unwrap(), &state, &pm, 0, 2, &batch)
+            .unwrap();
+        assert_eq!(mask, BooleanArray::from(vec![false, true]));
+    }
+
+    #[test]
+    fn child_split_runs_delivered_subset_preserves_correlation() {
+        // The RG has 4 parent rows but a co-delegated `status='x'` pruned it so parquet delivers only
+        // rows 1 and 3 (a Runs PositionMap). This is the exact case where value_offsets (batch-local)
+        // diverge from a whole-RG child prefix sum — the redesign's raison d'être.
+        //
+        // Delivered batch (2 rows): d0 = RG row 1 = [alice@70]; d1 = RG row 3 = [bob@30, alice@80].
+        // value_offsets = [0, 1, 3]. child_base must be [-1, 0, -1, 1] (RG rows 0,2 absent).
+        // Lucene matches author=alice at RG (row1, off0) and (row3, off1). For row1: alice@70 satisfies
+        // (alice AND >50) → true. For row3: alice is off1 with score 80 → element (alice,80) satisfies →
+        // true. Expected mask over DELIVERED rows [true, true].
+        let batch = comments_batch(&[vec![("alice", 70)], vec![("bob", 30), ("alice", 80)]]);
+        let eval = child_split_eval(vec![(1, 0), (3, 1)]);
+        let state = state_for(4);
+        // Runs: delivered d0 → rg 1, d1 → rg 3.
+        let pm = PositionMap::Runs {
+            runs: vec![(1, 0, 1), (3, 1, 1)],
+            delivered_count: 2,
+        };
+        let mask = eval
+            .evaluate_child_split(eval.child_split.as_ref().unwrap(), &state, &pm, 0, 2, &batch)
+            .unwrap();
+        assert_eq!(mask, BooleanArray::from(vec![true, true]));
+    }
+
+    #[test]
+    fn child_split_runs_wrong_element_offset_would_break_correlation() {
+        // Same delivered subset, but Lucene claims author=alice at RG (row3, off0) — that's bob@30, NOT
+        // alice. If child_base were miscomputed the intersection would silently pass; with correct
+        // coordinates, element off0 of row3 is (bob,30) which fails score>50, so row3 → false.
+        // Row1 still true. Expected [true, false].
+        let batch = comments_batch(&[vec![("alice", 70)], vec![("bob", 30), ("alice", 80)]]);
+        let eval = child_split_eval(vec![(1, 0), (3, 0)]);
+        let state = state_for(4);
+        let pm = PositionMap::Runs {
+            runs: vec![(1, 0, 1), (3, 1, 1)],
+            delivered_count: 2,
+        };
+        let mask = eval
+            .evaluate_child_split(eval.child_split.as_ref().unwrap(), &state, &pm, 0, 2, &batch)
+            .unwrap();
+        assert_eq!(mask, BooleanArray::from(vec![true, false]));
     }
 
     // Keep the `fmt` import used

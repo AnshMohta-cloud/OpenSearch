@@ -433,6 +433,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_tree_single_collector(
                 None,
                     None,
                     std::collections::HashMap::new(),
+                    None,
             ));
             let _ = segment;
             Ok(eval)
