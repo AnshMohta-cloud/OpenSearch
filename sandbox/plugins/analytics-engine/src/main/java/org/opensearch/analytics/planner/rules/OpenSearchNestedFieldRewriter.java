@@ -803,11 +803,12 @@ public final class OpenSearchNestedFieldRewriter {
                 rexBuilder.makeLiteral(fieldName),
                 rexBuilder.makeLiteral("EQUALS"),
                 rexBuilder.makeLiteral(value),
-                rexBuilder.makeLiteral(
-                    java.math.BigDecimal.valueOf(clauseIdx),
-                    rexBuilder.getTypeFactory().createSqlType(SqlTypeName.INTEGER),
-                    false
-                )
+                // clauseIdx as a STRING literal, not INTEGER: substrait/isthmus requires all operands at a
+                // variadic position to share a type, and the preceding operands are CHAR. A trailing INTEGER
+                // trips "Unable to convert call NESTED_ANY_MATCH_CHILD(list, char, char, char, i32)". Keeping
+                // every literal CHAR matches the proven NESTED_ANY_MATCH (4-arg) conversion path; the Rust
+                // classifier parses the string back to an index.
+                rexBuilder.makeLiteral(Integer.toString(clauseIdx))
             )
         );
     }

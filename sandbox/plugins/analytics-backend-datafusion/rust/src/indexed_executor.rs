@@ -643,6 +643,11 @@ fn literal_i32(expr: &Arc<dyn PhysicalExpr>) -> Option<i32> {
     match lit.value() {
         datafusion::common::ScalarValue::Int32(Some(v)) => Some(*v),
         datafusion::common::ScalarValue::Int64(Some(v)) => i32::try_from(*v).ok(),
+        // clauseIdx is emitted as a STRING literal (isthmus variadic type-uniformity — see the rewriter's
+        // tryDirectEqualityChildRewrite). Parse it back to an index.
+        datafusion::common::ScalarValue::Utf8(Some(s))
+        | datafusion::common::ScalarValue::Utf8View(Some(s))
+        | datafusion::common::ScalarValue::LargeUtf8(Some(s)) => s.trim().parse::<i32>().ok(),
         _ => None,
     }
 }
