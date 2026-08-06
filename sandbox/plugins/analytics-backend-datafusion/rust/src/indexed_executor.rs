@@ -1245,7 +1245,20 @@ async unsafe fn execute_indexed_with_context_inner(
     //   `on_batch_mask` using arrow kernels; no pushdown needed.
     let pushdown_predicate: Option<Arc<dyn PhysicalExpr>> = match &classification {
         FilterClass::SingleCollector => extraction.as_ref().and_then(|e| {
-            let residual_bool = extract_single_collector_residual(&e.tree);
+            let residual_bool = extract_single_collector_residual(&e.tree).and_then(|b| {
+                // When a child-grain split is active, strip the nested_any_match_expr predicate AND the
+                // child peers (delegation_possible(nested_any_match_child(...))) from the pushdown
+                // predicate — exactly as the evaluator's residual is stripped. Otherwise parquet's
+                // with_predicate pushdown (row-granular mode) would evaluate the nested_any_match_child
+                // stub, whose Rust UDF body fails loud, erroring the query. The child branch of
+                // on_batch_mask is authoritative for the nested predicate; only genuinely non-nested
+                // conjuncts belong in pushdown.
+                if build_child_split(&e.tree).is_some() {
+                    strip_child_split_from_residual(&b)
+                } else {
+                    Some(b)
+                }
+            });
             residual_bool
                 .as_ref()
                 .and_then(residual_bool_to_physical_expr)
