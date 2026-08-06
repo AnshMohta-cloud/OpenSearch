@@ -171,8 +171,15 @@ struct LuceneClauseBits<'a> {
 }
 
 impl<'a> LuceneClauseBits<'a> {
+    /// Whether clause `idx`'s per-element verdicts were supplied by the executor. When false, the caller
+    /// must fall back to evaluating the clause's `fallback` subtree natively (do NOT treat as all-false).
+    fn has_clause(&self, idx: usize) -> bool {
+        idx < self.clause_bits.len()
+    }
+
     /// The Lucene clause `idx`'s verdict for the element at global index `elem_idx`. A missing element bit
-    /// (out of range / null) is treated as `false` (element did not match the keyword clause).
+    /// (out of range / null) is treated as `false` (element did not match the keyword clause). Only call
+    /// when {@link #has_clause} is true.
     fn value(&self, idx: usize, elem_idx: usize) -> bool {
         self.clause_bits
             .get(idx)
@@ -193,11 +200,33 @@ fn eval_bool(
     elem_idx: usize,
     lucene: Option<&LuceneClauseBits>,
 ) -> Result<Option<bool>> {
-    // Child-grain split leaf: a keyword clause evaluated by Lucene, its per-element verdict supplied in
-    // `lucene`. `{"lucene": <clauseIdx>}`. Two-valued (matched / not) — Lucene has no NULL notion here.
+    // Child-grain split leaf: a keyword clause the rewriter chose to route to Lucene.
+    // `{"lucene": <clauseIdx>, "fallback": <originalPredicateSubtree>}`.
+    //
+    // Lucene is a pure OPTIMIZATION here, never a correctness dependency: when the child-grain split
+    // executor supplies this clause's per-element verdicts (`lucene` present AND has clause `idx`), use
+    // them (two-valued: matched / not — Lucene has no NULL notion). Otherwise — the plain UDF path
+    // (`lucene == None`), the Tree/OR-NOT path where the peer was demoted to native, or any path where
+    // this clause wasn't delegated — evaluate the `fallback` subtree natively so the result is identical.
+    // This keeps `nested_any_match_expr` self-sufficient on EVERY execution path; the split only makes it
+    // faster, never changes its answer.
     if let Some(idx) = node.get("lucene").and_then(|v| v.as_u64()) {
-        let matched = lucene.map(|l| l.value(idx as usize, elem_idx)).unwrap_or(false);
-        return Ok(Some(matched));
+        let idx = idx as usize;
+        if let Some(l) = lucene {
+            if l.has_clause(idx) {
+                return Ok(Some(l.value(idx, elem_idx)));
+            }
+        }
+        match node.get("fallback") {
+            Some(fallback) => return eval_bool(fallback, struct_array, struct_fields, elem_idx, lucene),
+            None => {
+                return plan_err!(
+                    "nested_any_match_expr: {{\"lucene\":{idx}}} node has neither delegated bits nor a \
+                     \"fallback\" subtree — the rewriter must always emit a fallback so the predicate is \
+                     correct when Lucene verdicts are absent"
+                )
+            }
+        }
     }
     let op = node
         .get("op")
@@ -408,5 +437,126 @@ fn extract_string_scalar(arg: &ColumnarValue, name: &str) -> Result<String> {
             plan_err!("nested_any_match_expr: '{}' must be a string literal", name)
         }
         other => plan_err!("nested_any_match_expr: '{}' must be a string literal, got {:?}", name, other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{
+        ArrayRef, BooleanArray, Int64Array, ListArray, StringArray, StructArray,
+    };
+    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::arrow::datatypes::{DataType, Field, Fields};
+
+    /// Build a `LIST<STRUCT{author: Utf8, score: Int64}>` from per-row element lists.
+    /// Each inner Vec is one parent row's elements as `(author, score)` pairs.
+    fn comments_array(rows: &[Vec<(&str, i64)>]) -> ArrayRef {
+        let mut authors: Vec<Option<String>> = Vec::new();
+        let mut scores: Vec<Option<i64>> = Vec::new();
+        let mut offsets: Vec<i32> = vec![0];
+        let mut acc = 0i32;
+        for row in rows {
+            for (a, s) in row {
+                authors.push(Some((*a).to_string()));
+                scores.push(Some(*s));
+            }
+            acc += row.len() as i32;
+            offsets.push(acc);
+        }
+        let struct_fields: Fields = Fields::from(vec![
+            Field::new("author", DataType::Utf8, true),
+            Field::new("score", DataType::Int64, true),
+        ]);
+        let struct_array = StructArray::new(
+            struct_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(authors)) as ArrayRef,
+                Arc::new(Int64Array::from(scores)) as ArrayRef,
+            ],
+            None,
+        );
+        let list_field = Arc::new(Field::new("item", DataType::Struct(struct_fields), true));
+        Arc::new(ListArray::new(
+            list_field,
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(struct_array),
+            None,
+        )) as ArrayRef
+    }
+
+    // The JSON the rewriter emits for `comments.author='alice' AND comments.score>50` under the
+    // child-grain split: the keyword clause is a {"lucene":0} node carrying its original subtree as
+    // "fallback"; the range clause stays native.
+    fn split_json() -> &'static str {
+        r#"{"op":"AND","args":[
+             {"lucene":0,"fallback":{"op":"=","args":[{"field":"author"},{"lit":"alice"}]}},
+             {"op":">","args":[{"field":"score"},{"lit":50}]}
+           ]}"#
+    }
+
+    // Two parents. P0: alice@40, bob@90 — NO single element satisfies author=alice AND score>50
+    // (alice's element is 40, not >50). P1: alice@70 — one element satisfies both. Vanilla nested
+    // semantics ⇒ [false, true]. This is the exact element-correlation the split must preserve.
+    fn corpus() -> ArrayRef {
+        comments_array(&[vec![("alice", 40), ("bob", 90)], vec![("alice", 70)]])
+    }
+
+    #[test]
+    fn fallback_path_matches_vanilla_when_no_lucene_bits() {
+        // No clause_bits supplied → the {"lucene":0} node must evaluate its "fallback" natively and
+        // produce the correct element-correlated answer.
+        let array = corpus();
+        let out = evaluate_nested_with_lucene(&array, split_json(), &[]).unwrap();
+        assert_eq!(out, BooleanArray::from(vec![false, true]));
+    }
+
+    #[test]
+    fn plain_udf_path_matches_vanilla() {
+        // The plain (non-split) UDF path with the same JSON (lucene=None) must also fall back and agree.
+        let array = corpus();
+        let tree: Json = serde_json::from_str(split_json()).unwrap();
+        let out = evaluate_nested_any_match(&array, &tree, None).unwrap();
+        assert_eq!(out, BooleanArray::from(vec![false, true]));
+    }
+
+    #[test]
+    fn lucene_bits_are_used_and_correlate_per_element() {
+        // Supply per-element Lucene verdicts for clause 0 (author='alice'). Global element order is
+        // [P0.alice, P0.bob, P1.alice] → alice matches at indices 0 and 2.
+        let array = corpus();
+        let clause0 = BooleanArray::from(vec![true, false, true]);
+        let out = evaluate_nested_with_lucene(&array, split_json(), &[clause0]).unwrap();
+        // Same correlated result: P0 has no element with (alice AND score>50); P1 does.
+        assert_eq!(out, BooleanArray::from(vec![false, true]));
+    }
+
+    #[test]
+    fn lucene_bits_override_fallback_wrongly_would_change_result() {
+        // Prove the bits are actually consulted (not the fallback): feed DELIBERATELY WRONG bits that
+        // claim P0.bob (index 1) is 'alice'. Now P0 has element bob@90 matching (lucene-author AND
+        // score>50) ⇒ P0 flips to true. This can only happen if the bits, not the fallback, drove it.
+        let array = corpus();
+        let wrong = BooleanArray::from(vec![false, true, true]);
+        let out = evaluate_nested_with_lucene(&array, split_json(), &[wrong]).unwrap();
+        assert_eq!(out, BooleanArray::from(vec![true, true]));
+    }
+
+    #[test]
+    fn lucene_node_without_fallback_and_no_bits_errors() {
+        // A {"lucene"} node with neither supplied bits nor a fallback is a rewriter bug — must fail loud,
+        // never silently treat as all-false.
+        let array = corpus();
+        let json = r#"{"lucene":0}"#;
+        let err = evaluate_nested_with_lucene(&array, json, &[]).unwrap_err();
+        assert!(err.to_string().contains("fallback"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn empty_and_null_arrays() {
+        // Empty array → false (no element); null array → null. Independent of the split.
+        let array = comments_array(&[vec![], vec![("alice", 70)]]);
+        let out = evaluate_nested_with_lucene(&array, split_json(), &[]).unwrap();
+        assert_eq!(out, BooleanArray::from(vec![false, true]));
     }
 }

@@ -544,8 +544,14 @@ public final class OpenSearchNestedFieldRewriter {
             for (int i = 0; i < arrayConjuncts.size(); i++) {
                 RexNode peer = tryDirectEqualityChildRewrite(arrayConjuncts.get(i), arrayCol, inputRowType, rexBuilder, childPeers.size());
                 if (peer != null) {
-                    // Replace this conjunct's JSON subtree with a lucene-delegated marker at the peer's index.
-                    arrayTrees.set(i, Map.of("lucene", childPeers.size()));
+                    // Route this conjunct's keyword-equality to Lucene at element grain: mark it
+                    // {"lucene": clauseIdx} and KEEP the original subtree under "fallback". The UDF uses
+                    // Lucene's per-element verdict when the child-grain executor supplies it, and evaluates
+                    // the fallback natively otherwise (the plain UDF path, or a Tree/OR-NOT plan where the
+                    // peer was demoted to native) — so NESTED_ANY_MATCH_EXPR is correct on EVERY path and
+                    // Lucene is a pure accelerant, never a correctness dependency.
+                    Map<String, Object> luceneNode = Map.of("lucene", childPeers.size(), "fallback", arrayTrees.get(i));
+                    arrayTrees.set(i, luceneNode);
                     childPeers.add(peer);
                 }
             }
