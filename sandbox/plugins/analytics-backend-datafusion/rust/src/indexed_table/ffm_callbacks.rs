@@ -17,6 +17,21 @@
 //! - `releaseCollector(contextId, collectorKey)`
 //! - `releaseProvider(contextId, providerKey)`
 //!
+//! One OPTIONAL sixth slot, populated by a SEPARATE additive registration
+//! `df_register_child_collect_callback` (kept separate so the primary 5-arg
+//! registration ABI never changes — a node whose Java side predates the child
+//! split simply leaves this slot null and the child-grain nested path errors
+//! gracefully while everything else, including non-nested delegation, boots and
+//! runs unaffected):
+//!
+//! - `collectChildDocs(contextId, collectorKey, minDoc, maxDoc, childBase, totalChildren, outBuf, outWordCap) -> wordsWritten|-1`
+//!   The child-grain sibling of `collectDocs`: sets bits by CHILD-ELEMENT ordinal
+//!   (`childBase[row-minDoc] + elementOffset`) instead of by parent row, so the
+//!   returned bitset lands directly in the caller's batch-flattened element space.
+//!   `childBase` is a `*const i32` of length `maxDoc-minDoc` supplied by the
+//!   caller (built from the decoded Arrow LIST `value_offsets`); a `-1` entry
+//!   marks a parent row not present in the current batch (Java must skip it).
+//!
 //! `ProviderHandle` and `FfmSegmentCollector` are the lifetime wrappers —
 //! they call the release callbacks on drop.
 //!
@@ -39,12 +54,24 @@ type ReleaseProviderFn = unsafe extern "C" fn(i64, i32);
 type CreateCollectorFn = unsafe extern "C" fn(i64, i32, i64, i32, i32) -> i32;
 type CollectDocsFn = unsafe extern "C" fn(i64, i32, i32, i32, *mut u64, i64) -> i64;
 type ReleaseCollectorFn = unsafe extern "C" fn(i64, i32);
+/// `(context_id, collector_key, min_doc, max_doc, child_base, total_children, out, out_word_cap) -> words_written | -1`.
+///
+/// Child-grain sibling of `CollectDocsFn`. `child_base` is a `*const i32` of length
+/// `max_doc - min_doc`; `child_base[row - min_doc]` is the batch-flattened element index of
+/// parent row `row`'s first element (or `-1` if that row isn't in the current batch, which
+/// Java skips). Bits are set at `child_base[row-min_doc] + element_offset`. The output bitset
+/// spans `total_children` bits.
+type CollectChildDocsFn =
+    unsafe extern "C" fn(i64, i32, i32, i32, *const i32, i64, *mut u64, i64) -> i64;
 
 static CREATE_PROVIDER: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static RELEASE_PROVIDER: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static CREATE_COLLECTOR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static COLLECT_DOCS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static RELEASE_COLLECTOR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+/// Optional sixth slot — see `df_register_child_collect_callback`. Null until Java
+/// registers it; the child-grain nested split is the only consumer.
+static COLLECT_CHILD_DOCS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Registered by Java at startup. Stores function pointers into atomic
 /// slots. Each call to this entry replaces the slots wholesale.
@@ -71,6 +98,18 @@ pub unsafe extern "C" fn df_register_filter_tree_callbacks(
         CREATE_COLLECTOR.store(create_collector as *mut (), Ordering::Release);
         COLLECT_DOCS.store(collect_docs as *mut (), Ordering::Release);
         RELEASE_COLLECTOR.store(release_collector as *mut (), Ordering::Release);
+    }));
+}
+
+/// Registers the OPTIONAL child-grain collect callback. Kept as a SEPARATE entry point from
+/// `df_register_filter_tree_callbacks` so the primary 5-callback registration ABI is untouched:
+/// an older Java side that never calls this leaves `COLLECT_CHILD_DOCS` null, the node boots
+/// normally, and only the child-grain nested split (which checks the slot and errors cleanly if
+/// unset) is unavailable. Same manual `catch_unwind` rationale as the primary registration.
+#[no_mangle]
+pub unsafe extern "C" fn df_register_child_collect_callback(collect_child_docs: CollectChildDocsFn) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        COLLECT_CHILD_DOCS.store(collect_child_docs as *mut (), Ordering::Release);
     }));
 }
 
@@ -110,6 +149,17 @@ fn load_release_collector() -> Option<ReleaseCollectorFn> {
     } else {
         Some(unsafe { std::mem::transmute::<*mut (), ReleaseCollectorFn>(p) })
     }
+}
+fn load_collect_child_docs() -> Result<CollectChildDocsFn, String> {
+    let p = COLLECT_CHILD_DOCS.load(Ordering::Acquire);
+    if p.is_null() {
+        return Err(
+            "child-grain collect callback not registered (Java side predates the nested child \
+             split, or df_register_child_collect_callback was never called)"
+                .into(),
+        );
+    }
+    Ok(unsafe { std::mem::transmute::<*mut (), CollectChildDocsFn>(p) })
 }
 
 // ── ProviderHandle — owns `releaseProvider` on drop ───────────────────
@@ -209,26 +259,52 @@ impl FfmSegmentCollector {
 }
 
 impl FfmSegmentCollector {
-    /// Child-grain collect for the nested predicate split: returns a packed u64 bitset dimensioned by
-    /// `total_children` (dense per-RG child-element ordinals), NOT by the parent-row span. Reuses the SAME
-    /// `collectDocs` FFM callback and transport (no new callback / no ABI change) — the Java side routes to
-    /// its child-grain lane based on the collector being registered child-grain, and the only Rust-side
-    /// difference is the output buffer is sized by child count. `[min_doc,max_doc)` is still the parent-row
-    /// window (bounds the scan); `total_children` is the number of elements across those rows in this RG.
-    pub(crate) fn collect_child_packed_bitset(
+    /// Child-grain collect for the nested predicate split: returns a packed u64 bitset in the CALLER'S
+    /// element coordinate space, dimensioned by `total_children`. For each Lucene child doc the scorer
+    /// matches in `[min_doc, max_doc)` (parent-row window), Java sets bit `child_base[row - min_doc] +
+    /// element_offset`, where `child_base` is supplied BY THE CALLER — built from the decoded Arrow LIST
+    /// `value_offsets` of the current batch, so the returned bits are directly indexable by the UDF's
+    /// batch-flattened element index (`elem_idx`). This is what makes the intersection correct under every
+    /// PositionMap (Identity / Bitmap / Runs) and multi-batch RG split: the caller, not Java, owns the
+    /// element numbering, and it always matches the array it will evaluate the residual against.
+    ///
+    /// `child_base` has length `max_doc - min_doc`; an entry of `-1` marks a parent row not present in the
+    /// current batch (Java skips it). Uses the optional sixth FFM callback (`load_collect_child_docs`),
+    /// which returns a clear error if the Java side never registered it.
+    pub(crate) fn collect_child_docs_batch(
         &self,
         min_doc: i32,
         max_doc: i32,
+        child_base: &[i32],
         total_children: usize,
     ) -> Result<Vec<u64>, String> {
         if max_doc <= min_doc || total_children == 0 {
             return Ok(Vec::new());
         }
+        let span = (max_doc - min_doc) as usize;
+        if child_base.len() != span {
+            return Err(format!(
+                "collect_child_docs_batch: child_base.len()={} != row span={} ([{},{}))",
+                child_base.len(),
+                span,
+                min_doc,
+                max_doc
+            ));
+        }
         let word_count = total_children.div_ceil(64);
         let mut buf = vec![0u64; word_count];
-        let collect_fn = load_collect_docs()?;
+        let collect_fn = load_collect_child_docs()?;
         let n = unsafe {
-            collect_fn(self.context_id, self.key, min_doc, max_doc, buf.as_mut_ptr(), word_count as i64)
+            collect_fn(
+                self.context_id,
+                self.key,
+                min_doc,
+                max_doc,
+                child_base.as_ptr(),
+                total_children as i64,
+                buf.as_mut_ptr(),
+                word_count as i64,
+            )
         };
         if n < 0 {
             return Err(format!(
@@ -239,7 +315,8 @@ impl FfmSegmentCollector {
         let n = n as usize;
         if n > word_count {
             return Err(format!(
-                "collectChildDocs(context_id={}, key={}) reported wordsWritten={} > capacity={}",
+                "collectChildDocs(context_id={}, key={}) reported wordsWritten={} > capacity={}; \
+                 callback contract violated (possible heap overflow)",
                 self.context_id, self.key, n, word_count,
             ));
         }
