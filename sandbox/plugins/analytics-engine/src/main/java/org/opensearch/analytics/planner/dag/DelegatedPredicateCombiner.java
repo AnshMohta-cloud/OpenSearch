@@ -152,8 +152,17 @@ final class DelegatedPredicateCombiner {
             ? null
             : registry.getBackend(commonBackend).getDelegatedSubtreeConvertor();
 
-        if ((correctnessChildren.isEmpty() && performanceChildren.isEmpty()) || multiBackend) {
-            outcome = "INDIVIDUAL";
+        // A child-scoped nested peer (NESTED_ANY_MATCH_CHILD) matches CHILD docs; a parent-grain peer
+        // (NESTED_ANY_MATCH block-join) matches ROOT docs. These doc-id spaces are DISJOINT, so fusing
+        // them into one Lucene BoolQuery (must(child) AND must(root)) yields a query that matches nothing
+        // (cardinality 0), wiping the result. When BOTH grains appear among the performance children of
+        // this AND, do NOT fuse: materialize every delegated child INDIVIDUALLY so each becomes its own
+        // delegation_possible leaf — the child peer is consumed at child grain by the executor, the parent
+        // peer lands in the parent-grain performance locks and drives row-group pruning, independently.
+        boolean mixedNestedGrains = hasChildScopedPeer(performanceChildren) && hasParentGrainPeer(performanceChildren);
+
+        if ((correctnessChildren.isEmpty() && performanceChildren.isEmpty()) || multiBackend || mixedNestedGrains) {
+            outcome = mixedNestedGrains ? "INDIVIDUAL (mixed nested grains — no fuse)" : "INDIVIDUAL";
             result = new Resolved(materializeIndividually(call, ordered));
         } else if (convertor == null) {
             outcome = "INDIVIDUAL (no convertor)";
@@ -316,6 +325,26 @@ final class DelegatedPredicateCombiner {
             return call.clone(call.getType(), rewritten);
         }
         return leafFn.apply((AnnotatedPredicate) node);
+    }
+
+    /** True if any perf child's delegated subtree is the child-scoped nested peer (NESTED_ANY_MATCH_CHILD). */
+    private static boolean hasChildScopedPeer(List<Delegated> perfChildren) {
+        return perfChildren.stream().anyMatch(d -> isOp(d.subtree(), "NESTED_ANY_MATCH_CHILD"));
+    }
+
+    /** True if any perf child's delegated subtree is a parent-grain nested peer (NESTED_ANY_MATCH). */
+    private static boolean hasParentGrainPeer(List<Delegated> perfChildren) {
+        return perfChildren.stream().anyMatch(d -> isOp(d.subtree(), "NESTED_ANY_MATCH"));
+    }
+
+    /**
+     * True if {@code node}, once unwrapped past any annotation wrapper, is a RexCall whose operator name
+     * equals {@code opName} exactly. Used to distinguish child-scoped vs parent-grain nested peers so the
+     * combiner never fuses their disjoint doc-id spaces into one (empty) Lucene query.
+     */
+    private static boolean isOp(RexNode node, String opName) {
+        RexNode n = node instanceof AnnotatedPredicate ap ? ap.unwrap() : node;
+        return n instanceof RexCall call && opName.equals(call.getOperator().getName());
     }
 
     /** Checks if the peer backend has a serializer for this predicate's function. */

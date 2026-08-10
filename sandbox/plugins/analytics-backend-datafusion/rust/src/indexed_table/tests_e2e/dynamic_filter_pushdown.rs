@@ -139,10 +139,11 @@ async fn run_indexed(sql: &str) -> (Vec<i32>, Arc<dyn datafusion::physical_plan:
                 crate::indexed_table::eval::single_collector::SingleCollectorEvaluator::new(
                     Some(collector),
                     pruner,
-                    None,
-                    None,
-                    None,
-                    None,
+                    None, // arg3: pruning_predicate
+                    None, // arg4: residual_expr
+                    None, // arg5: page_prune_metrics
+                    None, // arg6: ffm_collector_calls
+                    None, // arg7: rg_pruned_by_peer
                     crate::indexed_table::eval::single_collector::CollectorCallStrategy::FullRange,
                     std::sync::Arc::new(std::collections::HashMap::new()),
                     segment.writer_generation,
@@ -153,6 +154,7 @@ async fn run_indexed(sql: &str) -> (Vec<i32>, Arc<dyn datafusion::physical_plan:
                     None,
                     None,
                     std::collections::HashMap::new(),
+                    None,
                 ),
             );
             Ok(eval)

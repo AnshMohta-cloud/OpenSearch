@@ -126,7 +126,14 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         // UDF natively; same shape as CIDRMATCH.
         ScalarFunction.JSON_VALID,
         ScalarFunction.NESTED_ANY_MATCH,
-        ScalarFunction.NESTED_ANY_MATCH_EXPR
+        ScalarFunction.NESTED_ANY_MATCH_EXPR,
+        // NESTED_ANY_MATCH_CHILD (child-grain split): DataFusion must declare capability so the leaf is
+        // marked dual-viable [lucene, datafusion] and thus emitted as delegation_possible (a performance
+        // peer), NOT delegated_predicate (a correctness Collector). The indexed executor's child-split
+        // classifier intercepts the peer and consults Lucene at CHILD grain in on_batch_mask; DataFusion
+        // never actually evaluates the nested_any_match_child body (its UDF stub fails loud) — declaring
+        // capability here is purely what makes it a dual-viable peer the classifier can recognize.
+        ScalarFunction.NESTED_ANY_MATCH_CHILD
     );
 
     // Project-side scalar functions DataFusion can evaluate natively. Each entry corresponds to a

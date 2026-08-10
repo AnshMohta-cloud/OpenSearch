@@ -136,6 +136,10 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
         FunctionMappings.s(SqlStdOperatorTable.ITEM, "item"),
         FunctionMappings.s(org.opensearch.analytics.planner.rules.OpenSearchNestedFieldRewriter.NESTED_ANY_MATCH_OP, "nested_any_match"),
         FunctionMappings.s(org.opensearch.analytics.planner.rules.OpenSearchNestedFieldRewriter.NESTED_ANY_MATCH_EXPR_OP, "nested_any_match_expr"),
+        // Child-grain split peer: the delegation_possible marker's arg0 (NESTED_ANY_MATCH_CHILD(...)) is
+        // emitted into substrait and must resolve to the Rust name-resolution stub `nested_any_match_child`
+        // (its body fails loud; the indexed executor consumes the peer at child grain before evaluation).
+        FunctionMappings.s(org.opensearch.analytics.planner.rules.OpenSearchNestedFieldRewriter.NESTED_ANY_MATCH_CHILD_OP, "nested_any_match_child"),
         FunctionMappings.s(UnixTimestampAdapter.LOCAL_TO_UNIXTIME_OP, "to_unixtime"),
         FunctionMappings.s(DateTimeAdapters.LOCAL_NOW_OP, "now"),
         FunctionMappings.s(DateTimeAdapters.LOCAL_CURRENT_DATE_OP, "current_date"),

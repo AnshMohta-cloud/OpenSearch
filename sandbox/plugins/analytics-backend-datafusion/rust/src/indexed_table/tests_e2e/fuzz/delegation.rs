@@ -420,6 +420,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_delegation_tree(
                 Some(Arc::clone(&residual_physical)),
                 None,
                 stream_metrics.ffm_collector_calls.clone(),
+                None, // arg7: rg_pruned_by_peer
                 CollectorCallStrategy::FullRange,
                 Arc::clone(&provider_locks),
                 segment.writer_generation,
@@ -428,6 +429,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_delegation_tree(
                 None,
                 None,
                 HashMap::new(),
+                None,
             ));
             Ok(eval)
         })

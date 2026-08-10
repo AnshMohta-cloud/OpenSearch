@@ -430,6 +430,25 @@ scalar_functions:
           - { value: any1, name: "array_col" }
           - { value: string, name: "expr_json" }
         return: "boolean?"
+  - name: "nested_any_match_child"
+    description: >-
+      CHILD-GRAIN sibling of `nested_any_match` for the opt-in child-grain nested split. Same
+      keyword-equality meaning (array_col, field, op, value), plus a trailing clause_idx that pairs
+      this peer with the `{"lucene": clause_idx}` hole in the paired `nested_any_match_expr` JSON.
+      It is emitted only as the original predicate inside a `delegation_possible(...)` marker: the
+      indexed executor recognizes the child peer, ships a CHILD-scoped Lucene query, and consults it
+      at child-element grain in on_batch_mask — the Rust `nested_any_match_child` body is a
+      name-resolution stub that never executes (it fails loud if it ever does). clause_idx is a
+      string (substrait requires uniform variadic operand types; all trailing args are string).
+      Args: (array_col: list<struct>, field_name: string, op: string, value: any, clause_idx: string)
+    impls:
+      - args:
+          - { value: any1, name: "array_col" }
+          - { value: string, name: "field_name" }
+          - { value: string, name: "op" }
+          - { value: any2, name: "value" }
+          - { value: string, name: "clause_idx" }
+        return: "boolean?"
   - name: regexp_like
     description: >-
       Regex containment match (boolean). datafusion-substrait resolves the

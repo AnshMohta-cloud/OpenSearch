@@ -56,11 +56,28 @@ public class NestedAnyMatchSerializer extends AbstractQuerySerializer {
         }
 
         FieldStorageInfo arrayField = FieldStorageInfo.resolve(fieldStorage, arrayColRef.getIndex());
-        String nestedPath = arrayField.getFieldName();
-        String leafField = nestedPath + "." + fieldName;
+        String topPath = arrayField.getFieldName();
+
+        // `fieldName` is the descent-plus-leaf path relative to the array column. Single-level: a bare
+        // leaf ("author"). DEEP (Phase B): a dotted chain of intermediate nested levels ending in the leaf
+        // ("divisions.teams.members.mname"). The leaf is the last segment; everything before it is the
+        // deepest nested level's path.
+        //
+        // A SINGLE NestedQueryBuilder on the deepest path suffices — even for a deep path — because this
+        // clause is a PARENT-GRAIN PRUNE peer (a deliberate superset), not a correlated predicate. Built at
+        // root scope, NestedQueryBuilder(deepPath) compiles to one ToParentBlockJoinQuery whose parentFilter
+        // is the root filter (enclosing level = null), so it yields "root has SOME element at deepPath with
+        // leaf=value" — exactly the superset that prunes row-groups without changing results. We do NOT chain
+        // intermediate NestedQueryBuilders: chaining is only needed for same-element CORRELATION across
+        // levels, which the authoritative DataFusion NESTED_ANY_MATCH_EXPR already enforces; the peer only
+        // needs the (uncorrelated) superset. (Vanilla level-chaining: server .../NestedQueryBuilder.java.)
+        int lastDot = fieldName.lastIndexOf('.');
+        String deepestPath = lastDot < 0 ? topPath : topPath + "." + fieldName.substring(0, lastDot);
+        String leaf = lastDot < 0 ? fieldName : fieldName.substring(lastDot + 1);
+        String leafField = deepestPath + "." + leaf;
 
         QueryBuilder child = new TermQueryBuilder(leafField, value);
-        return new NestedQueryBuilder(nestedPath, child, ScoreMode.None);
+        return new NestedQueryBuilder(deepestPath, child, ScoreMode.None);
     }
 
     private static String literalString(RexNode node, String operandName) {

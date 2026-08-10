@@ -156,6 +156,7 @@ async fn run_two_segment_query(
             let eval: Arc<dyn RowGroupBitsetSource> = Arc::new(
                 crate::indexed_table::eval::single_collector::SingleCollectorEvaluator::new(
                     Some(collector), pruner, None, None, None, None,
+                    None, // arg7: rg_pruned_by_peer
                     crate::indexed_table::eval::single_collector::CollectorCallStrategy::FullRange,
                     std::sync::Arc::new(std::collections::HashMap::new()),
                     segment.writer_generation,
@@ -164,6 +165,7 @@ async fn run_two_segment_query(
                     None,
                     None,
                     std::collections::HashMap::new(),
+                    None,
                 ),
             );
             Ok(eval)
@@ -365,6 +367,7 @@ async fn run_two_segment_query_witness(
             let eval: Arc<dyn RowGroupBitsetSource> = Arc::new(
                 crate::indexed_table::eval::single_collector::SingleCollectorEvaluator::new(
                     Some(collector), pruner, None, None, None, None,
+                    None, // arg7: rg_pruned_by_peer
                     crate::indexed_table::eval::single_collector::CollectorCallStrategy::FullRange,
                     std::sync::Arc::new(std::collections::HashMap::new()),
                     segment.writer_generation,
@@ -373,6 +376,7 @@ async fn run_two_segment_query_witness(
                     None,
                     None,
                     std::collections::HashMap::new(),
+                    None,
                 ),
             );
             Ok(eval)
@@ -574,6 +578,7 @@ async fn run_segments(specs: Vec<SegSpec>, num_partitions: usize) -> Vec<(i32, S
             let eval: Arc<dyn RowGroupBitsetSource> = Arc::new(
                 crate::indexed_table::eval::single_collector::SingleCollectorEvaluator::new(
                     Some(collector), pruner, None, None, None, None,
+                    None, // arg7: rg_pruned_by_peer
                     crate::indexed_table::eval::single_collector::CollectorCallStrategy::FullRange,
                     std::sync::Arc::new(std::collections::HashMap::new()),
                     segment.writer_generation,
@@ -582,6 +587,7 @@ async fn run_segments(specs: Vec<SegSpec>, num_partitions: usize) -> Vec<(i32, S
                     None,
                     None,
                     std::collections::HashMap::new(),
+                    None,
                 ),
             );
             Ok(eval)

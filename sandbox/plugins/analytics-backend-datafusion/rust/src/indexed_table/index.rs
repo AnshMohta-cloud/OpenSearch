@@ -47,6 +47,25 @@ use std::sync::Arc;
 /// row groups by calling with `max_doc == min_doc`.
 pub trait RowGroupDocsCollector: Send + Sync + Debug {
     fn collect_packed_u64_bitset(&self, min_doc: i32, max_doc: i32) -> Result<Vec<u64>, String>;
+
+    /// CHILD-grain collect for the nested-predicate split: for each nested-child doc the collector's
+    /// (child-scoped) query matches in the parent-row window `[min_doc, max_doc)`, set bit
+    /// `child_base[row - min_doc] + element_offset`. `child_base` has length `max_doc - min_doc`; a `-1`
+    /// entry marks a parent row not present in the caller's current batch (skip it). The returned bitset
+    /// spans `total_children` bits in the CALLER'S element coordinate space (built from the decoded Arrow
+    /// LIST `value_offsets`), so it is directly indexable by the residual UDF's flattened element index.
+    ///
+    /// Default: unsupported. Only the FFM-backed collector implements it (the real Lucene child scan);
+    /// mock/stub collectors used off the child-split path never call it.
+    fn collect_child_docs_batch(
+        &self,
+        _min_doc: i32,
+        _max_doc: i32,
+        _child_base: &[i32],
+        _total_children: usize,
+    ) -> Result<Vec<u64>, String> {
+        Err("collect_child_docs_batch not supported by this collector".to_string())
+    }
 }
 
 /// A searcher scoped to a single shard (index), created once per query.

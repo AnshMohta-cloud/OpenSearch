@@ -79,6 +79,32 @@ impl ScalarUDFImpl for NestedAnyMatchUdf {
         let field_name = extract_string_scalar(&args[1], "field_name")?;
         let op = extract_string_scalar(&args[2], "op")?;
 
+        // DEEP path (Phase B): a dotted field_name (e.g. "divisions.teams.members.mname") is the
+        // descent-plus-leaf path of a DEEP keyword prune peer. NESTED_ANY_MATCH is dual-viable
+        // [lucene, datafusion]; when NOT delegated to Lucene (or when DataFusion evaluates the residual),
+        // the flat single-field lookup below cannot resolve a dotted name — so we build the equivalent
+        // {"nested":...,"inner":...} descent tree (all segments but the last are nested arrays; the last is
+        // the scalar leaf — guaranteed by the rewriter's isAllNestedScalarLeafPath) and delegate to the
+        // recursive evaluator. This keeps the deep peer CORRECT on DataFusion too (Lucene stays a pure
+        // pruning optimization, never a correctness dependency — the single-level invariant, at any depth).
+        if field_name.contains('.') {
+            // NESTED_ANY_MATCH only ever carries a string keyword value (EQUALS); read it as a string lit.
+            let value = extract_string_scalar(&args[3], "value")?;
+            let op_sym = match op.as_str() {
+                "EQUALS" => "=",
+                other => other, // NESTED_ANY_MATCH only emits EQUALS today; pass through defensively
+            };
+            let segs: Vec<&str> = field_name.split('.').collect();
+            let leaf = segs[segs.len() - 1];
+            // innermost leaf comparison, then wrap each intermediate segment as a nested descent (inner-first)
+            let mut node = serde_json::json!({"op": op_sym, "args": [{"field": leaf}, {"lit": value}]});
+            for i in (0..segs.len() - 1).rev() {
+                node = serde_json::json!({"nested": segs[i], "inner": node});
+            }
+            let out = super::nested_any_match_expr::evaluate_nested_descent(&array_col, &node)?;
+            return Ok(ColumnarValue::Array(Arc::new(out)));
+        }
+
         let num_rows = array_col.len();
         let mut result = BooleanBuilder::with_capacity(num_rows);
 

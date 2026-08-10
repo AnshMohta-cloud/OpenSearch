@@ -361,6 +361,7 @@ async fn run_single_collector(
                 Some(Arc::clone(&residual_expr)),
                 Some(crate::indexed_table::page_pruner::PagePruneMetrics::from_stream_metrics(sm)),
                 sm.ffm_collector_calls.clone(),
+                None, // arg7: rg_pruned_by_peer
                 strategy,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 segment.writer_generation,
@@ -369,6 +370,7 @@ async fn run_single_collector(
                 None,
                     None,
                     std::collections::HashMap::new(),
+                    None,
             ));
             Ok(eval)
         })

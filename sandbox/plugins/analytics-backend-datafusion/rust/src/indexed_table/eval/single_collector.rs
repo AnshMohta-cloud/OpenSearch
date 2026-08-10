@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use datafusion::arrow::array::BooleanArray;
+use datafusion::arrow::array::{Array, AsArray, BooleanArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use native_bridge_common::log_debug;
 use roaring::RoaringBitmap;
@@ -37,6 +37,7 @@ use crate::indexed_table::page_pruner::{PagePruneMetrics, PagePruner, StatsPrune
 use crate::indexed_table::row_selection::{
     bitmap_to_packed_bits, packed_bits_to_boolean_array, row_selection_to_bitmap, PositionMap,
 };
+use crate::udf::nested_any_match_expr::evaluate_nested_with_lucene;
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use std::time::Instant;
@@ -114,6 +115,55 @@ struct SingleCollectorState {
     candidates: RoaringBitmap,
     mask_buffer: datafusion::arrow::buffer::Buffer,
     mask_len: usize,
+    /// Number of rows in this RG (== `mask_len`). Kept explicitly so the child-grain split's
+    /// `on_batch_mask` can size the per-RG `child_base` vector without re-deriving it.
+    rg_num_rows: usize,
+    /// RG's first row in absolute (segment-relative) doc space. The child collect scans the parent-row
+    /// window `[rg_first_row, rg_first_row + rg_num_rows)`. `None` when no child split is active.
+    rg_first_row: i64,
+}
+
+/// One Lucene-delegated keyword clause of a child-grain nested split. `clause_idx` is the position
+/// referenced by the residual JSON's `{"lucene": clause_idx}` node; `annotation_id` keys the lazily-created
+/// peer provider (a child-scoped Lucene query — see `NestedAnyMatchChildSerializer`).
+#[derive(Debug, Clone)]
+pub struct ChildClause {
+    pub clause_idx: usize,
+    pub annotation_id: i32,
+    /// The nested-descent path from the top-level array element down to (but excluding) the leaf field the
+    /// Lucene keyword clause tests — i.e. the `{"nested":X}` heads above this clause's `{"lucene":i}` node in
+    /// the residual JSON. EMPTY for a top-level clause (the `{"lucene":i}` node sits at the top, no descent) —
+    /// that is the original single-level bridge. For a DEEP clause (Phase C) e.g. `divisions.teams.members.mname`
+    /// the path is `["divisions","teams","members"]`, and the executor composes a DEEP `child_base` /
+    /// `total_children` in the deepest level's flattened coordinate space so the returned bitset lines up with
+    /// the UDF's global `inner_idx` at that depth.
+    pub path: Vec<String>,
+}
+
+/// State for the child-grain nested-predicate split, attached to a `SingleCollectorEvaluator` when the
+/// residual is a `nested_any_match_expr` whose keyword conjunct(s) were routed to Lucene at element grain.
+///
+/// When present, `on_batch_mask` evaluates the nested predicate against the decoded `LIST<STRUCT>` column
+/// with each `{"lucene": i}` node's per-element verdict supplied by clause `i`'s Lucene child collect —
+/// intersecting the keyword (Lucene) and range/other (DataFusion) clauses at the SAME element before the
+/// ∃ roll-up to parents. `None` (the common case) → the evaluator behaves exactly as before.
+#[derive(Debug, Clone)]
+pub struct ChildSplitState {
+    /// NAME of the `LIST<STRUCT>` nested-array column the predicate ranges over. Resolved to the delivered
+    /// batch's column position by NAME at eval time — the `Column` index carried in the physical plan is a
+    /// FULL-TABLE-schema index, which does not match a projected batch's column order (same reason
+    /// `remap_expr_to_batch` remaps residual columns by name).
+    pub array_col_name: String,
+    /// The `nested_any_match_expr` JSON (with `{"lucene": i}` holes, each carrying a `"fallback"`).
+    pub expr_json: String,
+    /// One entry per Lucene-delegated clause, sorted ascending by `clause_idx` so `clause_bits[i]`
+    /// aligns with the JSON's `{"lucene": i}` reference.
+    pub clauses: Vec<ChildClause>,
+    /// Lazy per-child-clause provider locks, keyed by `annotation_id` (one `OnceLock` each). Separate from
+    /// the evaluator's parent-grain `performance_provider_locks` so a child-scoped query is NEVER consulted
+    /// at parent grain in `prefetch_rg`. Query-scoped (shared across per-(segment×chunk) evaluators via
+    /// `Arc::clone`) so each child provider is created once per (query × annotation_id).
+    pub provider_locks: Arc<HashMap<i32, Arc<OnceLock<ProviderHandle>>>>,
 }
 
 /// Evaluator holding one collector and applying per-RG page pruning.
@@ -157,6 +207,11 @@ pub struct SingleCollectorEvaluator {
     /// Incremented once per `prefetch_rg` call (once per RG) — the
     /// Collector path always performs one FFM round-trip to Java.
     ffm_collector_calls: Option<datafusion::physical_plan::metrics::Count>,
+    /// Incremented once per RG that is SKIPPED because the parent-grain Lucene performance peer's
+    /// row bitset emptied `candidates` (the `candidates &= peer_bm` in `prefetch_rg` left nothing).
+    /// This is the observable signal that Lucene-driven row-group pruning fired — distinct from
+    /// stats/bloom/page pruning. Exposed in the PPL profile as `rg_pruned_by_peer`.
+    rg_pruned_by_peer: Option<datafusion::physical_plan::metrics::Count>,
     call_strategy: CollectorCallStrategy,
     /// Lazy `ProviderHandle` cache, one per performance-delegated annotation_id.
     /// Empty when the query has no performance-delegated leaves. Populated by
@@ -186,6 +241,11 @@ pub struct SingleCollectorEvaluator {
     stats_prune_tree: Option<Arc<StatsPruneTree>>,
     /// Reverse map: absolute RG index → position in `rg_can_match` vectors.
     rg_index_to_pos: HashMap<usize, usize>,
+    /// Child-grain nested split. `Some` when the residual is a `nested_any_match_expr` with keyword
+    /// clause(s) routed to Lucene at element grain; the child clauses' peer providers live in
+    /// `performance_provider_locks` (keyed by their annotation_id) and are consulted at CHILD grain in
+    /// `on_batch_mask`, NOT at parent grain in `prefetch_rg`. `None` → non-nested behavior, unchanged.
+    child_split: Option<ChildSplitState>,
 }
 
 /// Resources needed for per-RG bloom filter pruning.
@@ -207,6 +267,7 @@ impl SingleCollectorEvaluator {
         residual_expr: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
         page_prune_metrics: Option<PagePruneMetrics>,
         ffm_collector_calls: Option<datafusion::physical_plan::metrics::Count>,
+        rg_pruned_by_peer: Option<datafusion::physical_plan::metrics::Count>,
         call_strategy: CollectorCallStrategy,
         performance_provider_locks: Arc<HashMap<i32, Arc<OnceLock<ProviderHandle>>>>,
         writer_generation: i64,
@@ -215,6 +276,7 @@ impl SingleCollectorEvaluator {
         bloom_config: Option<BloomConfig>,
         stats_prune_tree: Option<Arc<StatsPruneTree>>,
         rg_index_to_pos: HashMap<usize, usize>,
+        child_split: Option<ChildSplitState>,
     ) -> Self {
         Self {
             collector,
@@ -223,6 +285,7 @@ impl SingleCollectorEvaluator {
             residual_expr,
             page_prune_metrics,
             ffm_collector_calls,
+            rg_pruned_by_peer,
             call_strategy,
             performance_provider_locks,
             writer_generation,
@@ -231,6 +294,7 @@ impl SingleCollectorEvaluator {
             bloom_config,
             stats_prune_tree,
             rg_index_to_pos,
+            child_split,
         }
     }
 }
@@ -260,6 +324,254 @@ fn should_consult_lucene(
     }
     let surviving_fraction = surviving_rows as f64 / rg.num_rows as f64;
     surviving_fraction > threshold
+}
+
+/// Build the `(child_base, total_children)` a child clause needs, in the grain of the clause's `path`.
+///
+/// `child_base` is indexed by RG position (length `rg_num_rows`), with `-1` for rows not delivered in this
+/// batch. `child_base[rg_pos] + offset` (offset = Lucene's per-path element rank under the root, from
+/// `NestedChildOrdinalMap`) is the GLOBAL flattened element ordinal in the deepest level's values array —
+/// the exact space the UDF's `inner_idx` iterates at that depth. `total_children` = that deepest level's
+/// flattened element count (the bitset length).
+///
+/// - **Empty path** (top-level clause): `child_base[row] = value_offsets[d]`, `total_children =
+///   value_offsets.last()` — identical to the original single-level bridge.
+/// - **Deep path** (`["divisions","teams","members"]`): descend each named LIST<STRUCT> level composing
+///   `value_offsets`, so a root's base is the flattened start of its FIRST deepest element. This is correct
+///   because a root's deepest descendants are CONTIGUOUS in the flattened values array (Arrow depth-first
+///   document order == Lucene ingest post-order), so one base per root + Lucene's per-root rank reconstructs
+///   the global deep ordinal. Monotonic offsets make empty/null intermediate slots safe (an empty root's
+///   base coincides with the next root's; Lucene emits no bits for it).
+fn build_child_base_for_path(
+    top_list: &datafusion::arrow::array::ListArray,
+    path: &[String],
+    state: &SingleCollectorState,
+    position_map: &PositionMap,
+    batch_offset: usize,
+    batch_len: usize,
+) -> Result<(Vec<i32>, usize), String> {
+    let top_offsets = top_list.value_offsets();
+
+    // Resolve the deepest LIST<STRUCT> along `path` and, per delivered row, its composed flattened start.
+    // We walk: for each row d, start with its top-level slice [top_offsets[d], top_offsets[d+1]); descend
+    // each path segment by taking that segment's inner-list value_offsets at the slice's START index (the
+    // contiguity invariant guarantees the whole root's deeper elements begin there). The deepest level's
+    // total element count is the inner-most values length.
+    let mut child_base = vec![-1i32; state.rg_num_rows];
+
+    if path.is_empty() {
+        // Top-level clause — original single-level bridge.
+        let total_children = *top_offsets.last().unwrap_or(&0) as usize;
+        for d in 0..batch_len {
+            let p = position_map
+                .rg_position(batch_offset + d)
+                .ok_or_else(|| format!("child-split: delivered row {} (batch_offset {}) out of PositionMap range", d, batch_offset))?;
+            if p >= state.rg_num_rows {
+                return Err(format!("child-split: RG position {} >= rg_num_rows {}", p, state.rg_num_rows));
+            }
+            child_base[p] = top_offsets[d];
+        }
+        return Ok((child_base, total_children));
+    }
+
+    // Deep clause: resolve the chain of inner ListArrays along `path` once (they are batch-global columns),
+    // then per row compose the flattened start by indexing each level's offsets at the running start.
+    // Collect (struct_of_this_level, inner_list_for_next_segment) by walking the path.
+    // `cur_struct` is the StructArray whose field `seg` is the next nested LIST<STRUCT>.
+    let mut level_lists: Vec<datafusion::arrow::array::ListArray> = Vec::with_capacity(path.len());
+    {
+        let mut cur_values = top_list.values().clone();
+        for seg in path {
+            let cur_struct = cur_values.as_struct_opt().ok_or_else(|| {
+                format!("child-split deep: expected Struct values while resolving path segment '{}', got {:?}", seg, cur_values.data_type())
+            })?;
+            let field_idx = cur_struct
+                .column_names()
+                .iter()
+                .position(|n| *n == seg.as_str())
+                .ok_or_else(|| format!("child-split deep: nested field '{}' not found; available {:?}", seg, cur_struct.column_names()))?;
+            let inner_list = cur_struct
+                .column(field_idx)
+                .as_list_opt::<i32>()
+                .ok_or_else(|| format!("child-split deep: field '{}' is not a List<Struct>, got {:?}", seg, cur_struct.column(field_idx).data_type()))?
+                .clone();
+            cur_values = inner_list.values().clone();
+            level_lists.push(inner_list);
+        }
+    }
+    // The deepest level is the last inner list; its flattened element count is the bitset dimension.
+    let deepest = level_lists.last().expect("path non-empty ⇒ at least one level");
+    let total_children = deepest.values().len();
+
+    // Per delivered row, compose the flattened start index of its FIRST deepest element by walking offsets:
+    //   flat_0 = top_offsets[d]                       (top-level element start for this row)
+    //   flat_k = level_lists[k].value_offsets()[flat_{k-1}]   (start of this level's block for that element)
+    // The deepest flat start is `child_base[row]`. (A root with zero elements at some level yields a base
+    // equal to the next root's start; Lucene emits no bits for it, so the -1-free coincidence is harmless.)
+    for d in 0..batch_len {
+        let p = position_map
+            .rg_position(batch_offset + d)
+            .ok_or_else(|| format!("child-split: delivered row {} (batch_offset {}) out of PositionMap range", d, batch_offset))?;
+        if p >= state.rg_num_rows {
+            return Err(format!("child-split: RG position {} >= rg_num_rows {}", p, state.rg_num_rows));
+        }
+        let mut flat = top_offsets[d] as usize;
+        for lvl in &level_lists {
+            let off = lvl.value_offsets();
+            if flat >= off.len() {
+                return Err(format!("child-split deep: composed index {} out of offsets len {} for row {}", flat, off.len(), d));
+            }
+            flat = off[flat] as usize;
+        }
+        child_base[p] = flat as i32;
+    }
+    Ok((child_base, total_children))
+}
+
+impl SingleCollectorEvaluator {
+    /// Evaluate a child-grain nested split against one delivered batch. Returns the per-parent-row
+    /// BooleanArray (length `batch_len`) that the `nested_any_match_expr` predicate produces once each
+    /// `{"lucene": i}` node is fed clause `i`'s per-element Lucene verdict.
+    ///
+    /// The coordinate system is owned HERE, not by Java: `child_base[p]` is the batch-flattened element
+    /// index at which parent RG-row `p`'s elements begin (from the decoded LIST `value_offsets`), so the
+    /// child bitset Java returns is directly indexable by the residual UDF's element index — correct under
+    /// every `PositionMap` (Identity / Bitmap / Runs) and multi-batch RG split. A parent row not delivered
+    /// in this batch keeps `child_base[p] == -1`, and Java skips any child whose row maps to `-1`.
+    /// Build the correctness-Collector candidate mask over the delivered rows (the same mask the non-child
+    /// `on_batch_mask` path AND-combines with its residual). Bit `i` is set iff delivered row `i`'s RG
+    /// position is a candidate in `state.mask_buffer`. Shared by the child-split and non-child paths so a
+    /// correctness Collector's row narrowing (e.g. a text `match()` parent predicate delegated to Lucene)
+    /// is honored under the child split too.
+    fn collector_mask_for_batch(
+        &self,
+        state: &SingleCollectorState,
+        position_map: &PositionMap,
+        batch_offset: usize,
+        batch_len: usize,
+    ) -> Result<BooleanArray, String> {
+        Ok(match position_map {
+            PositionMap::Identity { .. } => {
+                let bb = datafusion::arrow::buffer::BooleanBuffer::new(
+                    state.mask_buffer.clone(),
+                    batch_offset,
+                    batch_len,
+                );
+                BooleanArray::new(bb, None)
+            }
+            PositionMap::Bitmap { .. } => {
+                BooleanArray::new(datafusion::arrow::buffer::BooleanBuffer::new_set(batch_len), None)
+            }
+            PositionMap::Runs { .. } => {
+                let words = batch_len.div_ceil(64);
+                let mut out = vec![0u64; words];
+                let src_bytes = state.mask_buffer.as_slice();
+                for i in 0..batch_len {
+                    let delivered_idx = batch_offset + i;
+                    let rg_pos = position_map.rg_position(delivered_idx).ok_or_else(|| {
+                        format!("SingleCollectorEvaluator: delivered_idx {} out of range", delivered_idx)
+                    })?;
+                    let hit =
+                        rg_pos < state.mask_len && (src_bytes[rg_pos >> 3] >> (rg_pos & 7)) & 1 == 1;
+                    if hit {
+                        out[i >> 6] |= 1u64 << (i & 63);
+                    }
+                }
+                packed_bits_to_boolean_array(out, batch_len)
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_child_split(
+        &self,
+        child_split: &ChildSplitState,
+        state: &SingleCollectorState,
+        position_map: &PositionMap,
+        batch_offset: usize,
+        batch_len: usize,
+        batch: &RecordBatch,
+    ) -> Result<BooleanArray, String> {
+        // Resolve the LIST<STRUCT> column by NAME against the DELIVERED batch's schema. The plan's Column
+        // index is a full-table-schema index and does not match a projected batch's column order.
+        let array_idx = batch.schema().index_of(&child_split.array_col_name).map_err(|_| {
+            format!(
+                "child-split: array column '{}' not found in batch schema {:?}",
+                child_split.array_col_name,
+                batch.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+            )
+        })?;
+        let array = batch.column(array_idx).clone();
+        let list = array.as_list_opt::<i32>().ok_or_else(|| {
+            format!(
+                "child-split: column '{}' is not a List, got {:?}",
+                child_split.array_col_name,
+                array.data_type()
+            )
+        })?;
+        // Parent-row window for the child scan: the whole RG in absolute doc space.
+        let min_doc = state.rg_first_row as i32;
+        let max_doc = (state.rg_first_row + state.rg_num_rows as i64) as i32;
+
+        // For each Lucene-delegated clause (ascending clause_idx), collect its per-element bits. child_base /
+        // total_children are computed PER CLAUSE in the clause's own path grain: a top-level clause (empty
+        // path) uses the top-level list's value_offsets (the original single-level bridge); a DEEP clause
+        // composes offsets down its `path` so the base/dimension live in the deepest level's flattened space,
+        // matching the UDF's global `inner_idx` at that depth. The provider is created lazily and shared
+        // across batches/RGs of the same query via the query-scoped OnceLock map; the collector is
+        // per-(segment, RG window). clause_bits[i] aligns with clause_idx i because `clauses` is sorted
+        // ascending — the classifier guarantees a dense 0..N clause set.
+        let mut clause_bits: Vec<BooleanArray> = Vec::with_capacity(child_split.clauses.len());
+        for (expected_idx, clause) in child_split.clauses.iter().enumerate() {
+            if clause.clause_idx != expected_idx {
+                return Err(format!(
+                    "child-split: clauses not densely sorted — expected clause_idx {}, got {}",
+                    expected_idx, clause.clause_idx
+                ));
+            }
+            // Build this clause's child_base (indexed by RG position) + total_children in its path's grain.
+            let (child_base, total_children) =
+                build_child_base_for_path(list, &clause.path, state, position_map, batch_offset, batch_len)?;
+
+            let lock = child_split
+                .provider_locks
+                .get(&clause.annotation_id)
+                .ok_or_else(|| {
+                    format!(
+                        "child-split: no provider lock for child clause annotation_id={}",
+                        clause.annotation_id
+                    )
+                })?;
+            let context_id = self.context_id;
+            let annotation_id = clause.annotation_id;
+            let provider = lock.get_or_init(|| {
+                create_provider(context_id, annotation_id).expect("create_provider FFM upcall failed")
+            });
+            let collector = self
+                .delegated_backend_collector_factory
+                .create(context_id, provider.key(), self.writer_generation, min_doc, max_doc)
+                .map_err(|e| {
+                    format!(
+                        "child-split: collector create (annotation_id={}, provider={}, writer_generation={}): {}",
+                        annotation_id,
+                        provider.key(),
+                        self.writer_generation,
+                        e
+                    )
+                })?;
+            let words =
+                collector.collect_child_docs_batch(min_doc, max_doc, &child_base, total_children)?;
+            if let Some(ref c) = self.ffm_collector_calls {
+                c.add(1);
+            }
+            clause_bits.push(packed_bits_to_boolean_array(words, total_children));
+        }
+
+        // Evaluate the nested predicate with the Lucene per-element verdicts wired into the {"lucene":i}
+        // nodes. The ∃-over-elements roll-up (and element correlation) lives inside the UDF.
+        evaluate_nested_with_lucene(&array, &child_split.expr_json, &clause_bits)
+            .map_err(|e| format!("child-split: evaluate_nested_with_lucene: {}", e))
+    }
 }
 
 impl RowGroupBitsetSource for SingleCollectorEvaluator {
@@ -502,6 +814,23 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
             // let candidates_before = candidates.len();
             // let peer_card = peer_bm.len();
             candidates &= peer_bm;
+            // If the peer's row bitset emptied this RG's candidates, the RG will be skipped below —
+            // record it as a peer-driven prune (the observable RG-skip signal for the Lucene peer):
+            // both the profile counter and a guaranteed-visible INFO log (mirrors the collectChildDocs
+            // trace) so the pruning-IT can assert the skip fired regardless of profile-metric plumbing.
+            if candidates.is_empty() {
+                if let Some(ref c) = self.rg_pruned_by_peer {
+                    c.add(1);
+                }
+                native_bridge_common::log_info!(
+                    "[NESTED-PRUNE] rg={} SKIPPED by Lucene peer (annotation_id={}, row_window=[{},{})) — \
+                     peer bitset emptied candidates, parquet row-group not decoded",
+                    rg.index,
+                    annotation_id,
+                    min_doc,
+                    max_doc
+                );
+            }
             // log_debug!(
             //     "[scf-rust] peer bitset intersected rg={} writer_generation={} candidates_before={} peer_cardinality={} candidates_after={}",
             //     rg.index, self.writer_generation, candidates_before, peer_card, candidates.len()
@@ -527,6 +856,8 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
                 candidates,
                 mask_buffer: mask_buffer.clone(),
                 mask_len,
+                rg_num_rows: rg.num_rows as usize,
+                rg_first_row: rg.first_row,
             }),
             mask_buffer: Some(mask_buffer),
         }))
@@ -541,11 +872,12 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
         batch_len: usize,
         batch: &RecordBatch,
     ) -> Result<Option<BooleanArray>, String> {
-        // No residual → no post-decode work. Stream's current_mask
-        // (if built) handles Collector narrowing.
-        let Some(ref residual) = self.residual_expr else {
+        // No child split AND no residual → no post-decode work; the stream's current_mask handles
+        // Collector narrowing. Return before touching rg_state (some callers pass a placeholder state on
+        // this no-work path).
+        if self.child_split.is_none() && self.residual_expr.is_none() {
             return Ok(None);
-        };
+        }
 
         let state = rg_state
             .downcast_ref::<SingleCollectorState>()
@@ -553,53 +885,49 @@ impl RowGroupBitsetSource for SingleCollectorEvaluator {
                 "SingleCollectorEvaluator: rg_state is not SingleCollectorState".to_string()
             })?;
 
-        // Build Collector mask over delivered rows via PositionMap.
-        // All paths produce a `BooleanArray` whose underlying
-        // `Buffer` is a refcounted view into `state.mask_buffer` —
-        // zero allocation for Identity, at most one small packed
-        // Vec<u64> for Runs.
-        let collector_mask: BooleanArray = match position_map {
-            // Identity: delivered row i == rg_position (batch_offset + i).
-            // BooleanBuffer::new adjusts bit_offset without copying the
-            // underlying Buffer. The returned BooleanArray points into
-            // state.mask_buffer; lifecycle is Arc-managed.
-            PositionMap::Identity { .. } => {
-                let bb = datafusion::arrow::buffer::BooleanBuffer::new(
-                    state.mask_buffer.clone(),
-                    batch_offset,
-                    batch_len,
-                );
-                BooleanArray::new(bb, None)
+        // Child-grain nested split: evaluate the nested predicate against the decoded LIST<STRUCT>
+        // column, feeding each {"lucene": i} node its clause's per-element Lucene verdict. This is the
+        // authoritative, element-correlated filter — it REPLACES the collector-mask ∧ residual combine
+        // (the child peers were kept OUT of `residual_expr` by the classifier; any non-nested conjuncts
+        // that remain in `residual_expr` are still AND'd in below).
+        if let Some(ref child_split) = self.child_split {
+            let nested_mask = self.evaluate_child_split(
+                child_split,
+                state,
+                position_map,
+                batch_offset,
+                batch_len,
+                batch,
+            )?;
+            // AND the correctness-Collector candidate mask: when a genuine correctness Collector coexists
+            // (e.g. a text `match()` parent predicate delegated to Lucene, which is NOT in residual_expr),
+            // its row narrowing lives only in state.mask_buffer and must still apply. For a performance-only
+            // query the candidates are the page-pruned/full universe, so this AND is a safe no-op.
+            let mut combined =
+                self.collector_mask_for_batch(state, position_map, batch_offset, batch_len)?;
+            combined = datafusion::arrow::compute::kernels::boolean::and_kleene(&combined, &nested_mask)
+                .map_err(|e| format!("SingleCollectorEvaluator child-split: and_kleene(collector): {}", e))?;
+            // AND any non-nested residual conjuncts (e.g. a parent-column predicate co-located in the
+            // same top-level AND) still carried in residual_expr.
+            if let Some(ref residual) = self.residual_expr {
+                let residual_mask =
+                    super::eval_helpers::evaluate_residual(residual, batch, batch_len)?;
+                combined = datafusion::arrow::compute::kernels::boolean::and_kleene(&combined, &residual_mask)
+                    .map_err(|e| format!("SingleCollectorEvaluator child-split: and_kleene(residual): {}", e))?;
             }
-            // Every delivered row is by construction a candidate — mask is all-true.
-            PositionMap::Bitmap { .. } => BooleanArray::new(
-                datafusion::arrow::buffer::BooleanBuffer::new_set(batch_len),
-                None,
-            ),
-            // Runs: gather per-row bit from the shared mask_buffer into
-            // a new packed Vec<u64> (small — bounded by batch_len/64).
-            PositionMap::Runs { .. } => {
-                let words = batch_len.div_ceil(64);
-                let mut out = vec![0u64; words];
-                let src_bytes = state.mask_buffer.as_slice();
-                for i in 0..batch_len {
-                    let delivered_idx = batch_offset + i;
-                    let rg_pos = position_map.rg_position(delivered_idx).ok_or_else(|| {
-                        format!(
-                            "SingleCollectorEvaluator: delivered_idx {} out of range",
-                            delivered_idx
-                        )
-                    })?;
-                    // Read bit rg_pos from the packed buffer (LSB-first).
-                    let hit = rg_pos < state.mask_len
-                        && (src_bytes[rg_pos >> 3] >> (rg_pos & 7)) & 1 == 1;
-                    if hit {
-                        out[i >> 6] |= 1u64 << (i & 63);
-                    }
-                }
-                packed_bits_to_boolean_array(out, batch_len)
-            }
+            return Ok(Some(combined));
+        }
+
+        // No residual → no post-decode work. Stream's current_mask
+        // (if built) handles Collector narrowing.
+        let Some(ref residual) = self.residual_expr else {
+            return Ok(None);
         };
+
+        // Build the Collector candidate mask over delivered rows via PositionMap (shared with the
+        // child-split path). Zero allocation for Identity, at most one small packed Vec<u64> for Runs.
+        let collector_mask =
+            self.collector_mask_for_batch(state, position_map, batch_offset, batch_len)?;
 
         // Evaluate residual against the batch.
         let residual_mask = super::eval_helpers::evaluate_residual(residual, batch, batch_len)?;
@@ -687,6 +1015,66 @@ mod tests {
         }
     }
 
+    /// Child-grain stub collector: given a set of matching `(rg_row, element_offset)` pairs (what a
+    /// Lucene child-scoped query would match), it consults the caller-supplied `child_base` exactly as
+    /// the real FFM collector does — setting bit `child_base[row - min_doc] + offset` — so the test
+    /// exercises the REAL coordinate math (`child_base` built from `value_offsets` under a non-Identity
+    /// PositionMap), not a shortcut. Rows whose `child_base` entry is `-1` (not in this batch) are skipped.
+    #[derive(Debug)]
+    struct ChildStubCollector {
+        /// (rg_row, element_offset) pairs the child-scoped query matches.
+        matches: Vec<(i32, i32)>,
+    }
+
+    impl RowGroupDocsCollector for ChildStubCollector {
+        fn collect_packed_u64_bitset(&self, _min: i32, _max: i32) -> Result<Vec<u64>, String> {
+            Err("ChildStubCollector is child-grain only".into())
+        }
+        fn collect_child_docs_batch(
+            &self,
+            min_doc: i32,
+            max_doc: i32,
+            child_base: &[i32],
+            total_children: usize,
+        ) -> Result<Vec<u64>, String> {
+            let mut bits = vec![0u64; total_children.div_ceil(64)];
+            for &(row, off) in &self.matches {
+                if row < min_doc || row >= max_doc {
+                    continue;
+                }
+                let base = child_base[(row - min_doc) as usize];
+                if base < 0 {
+                    continue; // row not delivered in this batch
+                }
+                let child_id = (base + off) as usize;
+                if child_id < total_children {
+                    bits[child_id / 64] |= 1u64 << (child_id % 64);
+                }
+            }
+            Ok(bits)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChildStubFactory {
+        matches: Vec<(i32, i32)>,
+    }
+
+    impl DelegatedBackendCollectorFactory for ChildStubFactory {
+        fn create(
+            &self,
+            _context_id: i64,
+            _provider_key: i32,
+            _writer_generation: i64,
+            _doc_min: i32,
+            _doc_max: i32,
+        ) -> Result<Arc<dyn RowGroupDocsCollector>, String> {
+            Ok(Arc::new(ChildStubCollector {
+                matches: self.matches.clone(),
+            }) as Arc<dyn RowGroupDocsCollector>)
+        }
+    }
+
     fn minimal_page_pruner() -> Arc<PagePruner> {
         // Build a 1-row-group parquet with no filters — page pruner becomes a no-op
         // (filter_row_ids returns input, candidate_row_ids returns [first_row, first_row+num_rows)).
@@ -721,18 +1109,20 @@ mod tests {
         let eval = SingleCollectorEvaluator::new(
             Some(collector),
             pruner,
-            None,
-            None,
-            None,
-            None,
-            CollectorCallStrategy::FullRange,
+            None, // arg3: pruning_predicate
+            None, // arg4: residual_expr
+            None, // arg5: page_prune_metrics
+            None, // arg6: ffm_collector_calls
+            None, // arg7: rg_pruned_by_peer
+            CollectorCallStrategy::FullRange, // arg8: call_strategy
             Arc::new(HashMap::new()),
             0,
             Arc::new(FfmDelegatedBackendCollectorFactory),
             0,
-            None,
-            None,
+            None, // arg13: bloom_config
+            None, // arg14: stats_prune_tree
             HashMap::new(),
+            None, // arg16: child_split
         );
 
         let rg = RowGroupInfo {
@@ -752,18 +1142,20 @@ mod tests {
         let eval = SingleCollectorEvaluator::new(
             Some(collector),
             pruner,
-            None,
-            None,
-            None,
-            None,
-            CollectorCallStrategy::FullRange,
+            None, // arg3: pruning_predicate
+            None, // arg4: residual_expr
+            None, // arg5: page_prune_metrics
+            None, // arg6: ffm_collector_calls
+            None, // arg7: rg_pruned_by_peer
+            CollectorCallStrategy::FullRange, // arg8: call_strategy
             Arc::new(HashMap::new()),
             0,
             Arc::new(FfmDelegatedBackendCollectorFactory),
             0,
-            None,
-            None,
+            None, // arg13: bloom_config
+            None, // arg14: stats_prune_tree
             HashMap::new(),
+            None, // arg16: child_split
         );
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
@@ -795,18 +1187,20 @@ mod tests {
         let eval = SingleCollectorEvaluator::new(
             Some(collector),
             pruner,
-            None,
-            None,
-            None,
-            None,
-            CollectorCallStrategy::FullRange,
+            None, // arg3: pruning_predicate
+            None, // arg4: residual_expr
+            None, // arg5: page_prune_metrics
+            None, // arg6: ffm_collector_calls
+            None, // arg7: rg_pruned_by_peer
+            CollectorCallStrategy::FullRange, // arg8: call_strategy
             Arc::new(HashMap::new()),
             0,
             Arc::new(FfmDelegatedBackendCollectorFactory),
             0,
-            None,
-            None,
+            None, // arg13: bloom_config
+            None, // arg14: stats_prune_tree
             HashMap::new(),
+            None, // arg16: child_split
         );
         assert!(eval.needs_row_mask());
     }
@@ -818,18 +1212,20 @@ mod tests {
         let eval = SingleCollectorEvaluator::new(
             Some(collector),
             pruner,
-            None,
-            None,
-            None,
-            None,
-            CollectorCallStrategy::FullRange,
+            None, // arg3: pruning_predicate
+            None, // arg4: residual_expr
+            None, // arg5: page_prune_metrics
+            None, // arg6: ffm_collector_calls
+            None, // arg7: rg_pruned_by_peer
+            CollectorCallStrategy::FullRange, // arg8: call_strategy
             Arc::new(HashMap::new()),
             0,
             Arc::new(FfmDelegatedBackendCollectorFactory),
             0,
-            None,
-            None,
+            None, // arg13: bloom_config
+            None, // arg14: stats_prune_tree
             HashMap::new(),
+            None, // arg16: child_split
         );
         let rg = RowGroupInfo {
             index: 0,
@@ -853,18 +1249,20 @@ mod tests {
         let eval = SingleCollectorEvaluator::new(
             Some(collector),
             pruner,
-            None,
-            None,
-            None,
-            None,
-            CollectorCallStrategy::FullRange,
+            None, // arg3: pruning_predicate
+            None, // arg4: residual_expr
+            None, // arg5: page_prune_metrics
+            None, // arg6: ffm_collector_calls
+            None, // arg7: rg_pruned_by_peer
+            CollectorCallStrategy::FullRange, // arg8: call_strategy
             Arc::new(HashMap::new()),
             0,
             Arc::new(FfmDelegatedBackendCollectorFactory),
             0,
-            None,
-            None,
+            None, // arg13: bloom_config
+            None, // arg14: stats_prune_tree
             HashMap::new(),
+            None, // arg16: child_split
         );
 
         let rg = RowGroupInfo {
@@ -890,18 +1288,20 @@ mod tests {
         let eval = SingleCollectorEvaluator::new(
             Some(collector),
             pruner,
-            None,
-            None,
-            None,
-            None,
-            CollectorCallStrategy::FullRange,
+            None, // arg3: pruning_predicate
+            None, // arg4: residual_expr
+            None, // arg5: page_prune_metrics
+            None, // arg6: ffm_collector_calls
+            None, // arg7: rg_pruned_by_peer
+            CollectorCallStrategy::FullRange, // arg8: call_strategy
             Arc::new(HashMap::new()),
             0,
             Arc::new(FfmDelegatedBackendCollectorFactory),
             0,
-            None,
-            Some(Arc::new(spt)),
+            None, // arg13: bloom_config
+            Some(Arc::new(spt)), // arg14: stats_prune_tree
             HashMap::from([(0, 0)]),
+            None, // arg16: child_split
         );
         let rg = RowGroupInfo {
             index: 0,
@@ -924,18 +1324,20 @@ mod tests {
         let eval = SingleCollectorEvaluator::new(
             Some(collector),
             pruner,
-            None,
-            None,
-            None,
-            None,
-            CollectorCallStrategy::FullRange,
+            None, // arg3: pruning_predicate
+            None, // arg4: residual_expr
+            None, // arg5: page_prune_metrics
+            None, // arg6: ffm_collector_calls
+            None, // arg7: rg_pruned_by_peer
+            CollectorCallStrategy::FullRange, // arg8: call_strategy
             Arc::new(HashMap::new()),
             0,
             Arc::new(FfmDelegatedBackendCollectorFactory),
             0,
-            None,
-            Some(Arc::new(spt)),
+            None, // arg13: bloom_config
+            Some(Arc::new(spt)), // arg14: stats_prune_tree
             HashMap::from([(0, 0)]),
+            None, // arg16: child_split
         );
         let rg = RowGroupInfo {
             index: 0,
@@ -958,18 +1360,20 @@ mod tests {
         let eval = SingleCollectorEvaluator::new(
             Some(collector),
             pruner,
-            None,
-            None,
-            None,
-            None,
-            CollectorCallStrategy::FullRange,
+            None, // arg3: pruning_predicate
+            None, // arg4: residual_expr
+            None, // arg5: page_prune_metrics
+            None, // arg6: ffm_collector_calls
+            None, // arg7: rg_pruned_by_peer
+            CollectorCallStrategy::FullRange, // arg8: call_strategy
             Arc::new(HashMap::new()),
             0,
             Arc::new(FfmDelegatedBackendCollectorFactory),
             0,
-            None,
-            None,
+            None, // arg13: bloom_config
+            None, // arg14: stats_prune_tree
             HashMap::new(),
+            None, // arg16: child_split
         );
         let rg = RowGroupInfo {
             index: 0,
@@ -982,6 +1386,315 @@ mod tests {
             .expect("should have matches");
         let got: Vec<u32> = prefetched.candidates.iter().collect();
         assert_eq!(got, vec![1u32, 5]);
+    }
+
+    // ── Child-grain split coordinate math ─────────────────────────────
+
+    use datafusion::arrow::array::{ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, StructArray};
+    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::arrow::datatypes::Fields;
+
+    /// One `LIST<STRUCT{author:Utf8, score:Int64}>` column wrapped in a RecordBatch named "comments".
+    fn comments_batch(rows: &[Vec<(&str, i64)>]) -> RecordBatch {
+        let mut authors: Vec<Option<String>> = Vec::new();
+        let mut scores: Vec<Option<i64>> = Vec::new();
+        let mut offsets: Vec<i32> = vec![0];
+        let mut acc = 0i32;
+        for row in rows {
+            for (a, s) in row {
+                authors.push(Some((*a).to_string()));
+                scores.push(Some(*s));
+            }
+            acc += row.len() as i32;
+            offsets.push(acc);
+        }
+        let sfields: Fields = Fields::from(vec![
+            Field::new("author", DataType::Utf8, true),
+            Field::new("score", DataType::Int64, true),
+        ]);
+        let struct_array = StructArray::new(
+            sfields.clone(),
+            vec![
+                Arc::new(StringArray::from(authors)) as ArrayRef,
+                Arc::new(Int64Array::from(scores)) as ArrayRef,
+            ],
+            None,
+        );
+        let list_field = Arc::new(Field::new("item", DataType::Struct(sfields), true));
+        let list = ListArray::new(
+            list_field.clone(),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(struct_array),
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "comments",
+            DataType::List(list_field),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(list) as ArrayRef]).unwrap()
+    }
+
+    fn split_json() -> String {
+        // comments.author='alice' (routed to Lucene, clause 0) AND comments.score>50 (native).
+        r#"{"op":"AND","args":[
+             {"lucene":0,"fallback":{"op":"=","args":[{"field":"author"},{"lit":"alice"}]}},
+             {"op":">","args":[{"field":"score"},{"lit":50}]}
+           ]}"#
+        .to_string()
+    }
+
+    fn child_split_eval(matches: Vec<(i32, i32)>) -> SingleCollectorEvaluator {
+        let annotation_id = 7;
+        // Child provider locks live on ChildSplitState. Pre-seed the lock so no FFM createProvider upcall
+        // happens in the unit test.
+        let mut child_locks = HashMap::new();
+        let lock: Arc<OnceLock<ProviderHandle>> = Arc::new(OnceLock::new());
+        lock.set(ProviderHandle::new_for_test(0)).ok();
+        child_locks.insert(annotation_id, lock);
+        SingleCollectorEvaluator::new(
+            None,
+            minimal_page_pruner(),
+            None,
+            None, // no non-nested residual
+            None,
+            None, // ffm_collector_calls
+            None, // rg_pruned_by_peer
+            CollectorCallStrategy::FullRange,
+            Arc::new(HashMap::new()), // parent-grain perf locks: none (child peers excluded)
+            0,
+            Arc::new(ChildStubFactory { matches }),
+            0,
+            None,
+            None,
+            HashMap::new(),
+            Some(ChildSplitState {
+                array_col_name: "comments".to_string(),
+                expr_json: split_json(),
+                clauses: vec![ChildClause {
+                    clause_idx: 0,
+                    annotation_id,
+                    path: Vec::new(), // top-level clause (single-level bridge)
+                }],
+                provider_locks: Arc::new(child_locks),
+            }),
+        )
+    }
+
+    fn state_for(rg_num_rows: usize) -> SingleCollectorState {
+        // No correctness Collector → candidates are the full universe (every row a candidate), which is
+        // what prefetch_rg seeds for a performance-only query. The collector_mask must then be all-true so
+        // the child-split AND is a no-op.
+        state_with_candidates(rg_num_rows, &(0..rg_num_rows).collect::<Vec<_>>())
+    }
+
+    /// Build the real 4-level composite shape `orgs: LIST<STRUCT{ divisions: LIST<STRUCT{ members:
+    /// LIST<STRUCT{mname:Utf8}> }> }>` (the top-level element is an ORG; the descent path from it is
+    /// `divisions → members`). `rows[root]` = that root's ORGS, org = Vec of divisions, division = Vec of
+    /// members (mname). Every level has its OWN offsets buffer, sized consistently so
+    /// `len(list) == len(child_struct)` at each level (the bug an earlier version had — orgs offsets that
+    /// ran past the orgs struct — is impossible here because each level's offsets are accumulated from its
+    /// own children only). Returns the top-level `orgs` ListArray.
+    fn deep_orgs_list(rows: &[Vec<Vec<Vec<&str>>>]) -> ListArray {
+        let mut mnames: Vec<Option<String>> = Vec::new();
+        let mut members_off: Vec<i32> = vec![0]; // indexed by division-flat
+        let mut divisions_off: Vec<i32> = vec![0]; // indexed by org-flat
+        let mut orgs_off: Vec<i32> = vec![0]; // indexed by root row
+        let (mut m, mut d, mut o) = (0i32, 0i32, 0i32);
+        for root in rows {
+            for org in root {
+                for div in org {
+                    for mn in div {
+                        mnames.push(Some((*mn).to_string()));
+                    }
+                    m += div.len() as i32;
+                    members_off.push(m);
+                }
+                d += org.len() as i32;
+                divisions_off.push(d);
+            }
+            o += root.len() as i32;
+            orgs_off.push(o);
+        }
+        let m_fields: Fields = Fields::from(vec![Field::new("mname", DataType::Utf8, true)]);
+        let members_struct = StructArray::new(m_fields.clone(), vec![Arc::new(StringArray::from(mnames)) as ArrayRef], None);
+        let members_item = Arc::new(Field::new("item", DataType::Struct(m_fields), true));
+        let members_list = ListArray::new(members_item.clone(), OffsetBuffer::new(members_off.into()), Arc::new(members_struct), None);
+        let d_fields: Fields = Fields::from(vec![Field::new("members", DataType::List(members_item), true)]);
+        let divisions_struct = StructArray::new(d_fields.clone(), vec![Arc::new(members_list) as ArrayRef], None);
+        let divisions_item = Arc::new(Field::new("item", DataType::Struct(d_fields), true));
+        let divisions_list = ListArray::new(divisions_item.clone(), OffsetBuffer::new(divisions_off.into()), Arc::new(divisions_struct), None);
+        let o_fields: Fields = Fields::from(vec![Field::new("divisions", DataType::List(divisions_item), true)]);
+        let orgs_struct = StructArray::new(o_fields.clone(), vec![Arc::new(divisions_list) as ArrayRef], None);
+        let orgs_item = Arc::new(Field::new("item", DataType::Struct(o_fields), true));
+        ListArray::new(orgs_item, OffsetBuffer::new(orgs_off.into()), Arc::new(orgs_struct), None)
+    }
+
+    #[test]
+    fn deep_child_base_composes_offsets_to_deepest_level() {
+        // 2-root example, ONE org each. root0.org has divisions [d0,d1]: d0.members=[m0,m1], d1.members=[m2].
+        // root1.org has division [d2]: d2.members=[m3,m4]. Flattened members: [m0 m1 m2 | m3 m4].
+        //   members_off=[0,2,3,5] divisions_off=[0,2,3] orgs_off=[0,1,2]. Composition ["divisions","members"]:
+        //   root0: orgs_off[0]=0 → divisions_off[0]=0 → members_off[0]=0.
+        //   root1: orgs_off[1]=1 → divisions_off[1]=2 → members_off[2]=3.
+        let orgs = deep_orgs_list(&[
+            vec![vec![vec!["m0", "m1"], vec!["m2"]]], // root0: 1 org, 2 divisions
+            vec![vec![vec!["m3", "m4"]]],             // root1: 1 org, 1 division
+        ]);
+        let state = state_for(2);
+        let pm = PositionMap::Identity { delivered_count: 2 };
+
+        let members_path = vec!["divisions".to_string(), "members".to_string()];
+        let (cb, total) = build_child_base_for_path(&orgs, &members_path, &state, &pm, 0, 2).unwrap();
+        assert_eq!(total, 5, "deepest (members) flattened count");
+        assert_eq!(cb, vec![0, 3], "root0 members start flat 0, root1 flat 3");
+
+        // Intermediate depth: path=["divisions"] → base in DIVISION-flat space; total = total divisions (3).
+        let div_path = vec!["divisions".to_string()];
+        let (cb_d, total_d) = build_child_base_for_path(&orgs, &div_path, &state, &pm, 0, 2).unwrap();
+        assert_eq!(total_d, 3, "total divisions across roots");
+        assert_eq!(cb_d, vec![0, 2], "root0 divisions start 0, root1 start 2");
+
+        // Empty path = top-level ORG bridge: base = orgs offsets, total = total orgs (2).
+        let (cb_top, total_top) = build_child_base_for_path(&orgs, &[], &state, &pm, 0, 2).unwrap();
+        assert_eq!(total_top, 2, "top-level orgs count");
+        assert_eq!(cb_top, vec![0, 1], "root0 org start 0, root1 org start 1");
+    }
+
+    #[test]
+    fn deep_child_base_handles_empty_intermediate_and_multi_org() {
+        // Stress: root0 has TWO orgs; org0 has an EMPTY division (no members) then a division with 2 members;
+        // org1 has one division with 1 member. root1 has ZERO orgs (empty top list). root2 has one org whose
+        // division has 3 members.
+        //   Members flattened: org0.div0=[] org0.div1=[m0,m1] org1.div0=[m2] | (root1: none) | root2.div0=[m3,m4,m5]
+        //   → [m0 m1 m2 m3 m4 m5] total=6.
+        //   members_off=[0,0,2,3,6] divisions_off: org0=2div,org1=1div,root2org=1div → [0,2,3,4]
+        //   orgs_off: root0=2 orgs, root1=0, root2=1 → [0,2,2,3]
+        //   ["divisions","members"] per root: root0: orgs_off[0]=0→divisions_off[0]=0→members_off[0]=0.
+        //                                     root1: orgs_off[1]=2→divisions_off[2]=3→members_off[3]=3.
+        //                                     root2: orgs_off[2]=2→divisions_off[2]=3→members_off[3]=3.
+        // NOTE root1 (empty orgs) gets base 3 = the SAME as root2's start; that is harmless because Lucene
+        // emits NO child bits for an empty root, so the coincident base is never indexed (monotonic-offset
+        // safety the doc comment promises).
+        let orgs = deep_orgs_list(&[
+            vec![vec![vec![], vec!["m0", "m1"]], vec![vec!["m2"]]], // root0: org0(div[],div[m0,m1]), org1(div[m2])
+            vec![],                                                  // root1: no orgs
+            vec![vec![vec!["m3", "m4", "m5"]]],                      // root2: org(div[m3,m4,m5])
+        ]);
+        let state = state_for(3);
+        let pm = PositionMap::Identity { delivered_count: 3 };
+        let members_path = vec!["divisions".to_string(), "members".to_string()];
+        let (cb, total) = build_child_base_for_path(&orgs, &members_path, &state, &pm, 0, 3).unwrap();
+        assert_eq!(total, 6, "6 members total across all roots");
+        assert_eq!(cb, vec![0, 3, 3], "root0→0, root1(empty)→3 (coincident, unused), root2→3");
+    }
+
+    /// State whose candidate mask has exactly `candidate_rows` set (RG-relative positions).
+    fn state_with_candidates(rg_num_rows: usize, candidate_rows: &[usize]) -> SingleCollectorState {
+        let mut candidates = RoaringBitmap::new();
+        for &r in candidate_rows {
+            candidates.insert(r as u32);
+        }
+        let packed = bitmap_to_packed_bits(&candidates, rg_num_rows as u32);
+        SingleCollectorState {
+            candidates,
+            mask_buffer: datafusion::arrow::buffer::Buffer::from_vec(packed),
+            mask_len: rg_num_rows,
+            rg_num_rows,
+            rg_first_row: 0,
+        }
+    }
+
+    #[test]
+    fn child_split_identity_full_rg() {
+        // 2 parents delivered in full (Identity). P0: alice@40, bob@90 (alice element is 40, not >50 →
+        // no single element satisfies both). P1: alice@70 (satisfies both). Lucene matches author=alice
+        // at (row0,off0) and (row1,off0). Expected [false, true].
+        let batch = comments_batch(&[vec![("alice", 40), ("bob", 90)], vec![("alice", 70)]]);
+        let eval = child_split_eval(vec![(0, 0), (1, 0)]);
+        let state = state_for(2);
+        let pm = PositionMap::Identity { delivered_count: 2 };
+        let mask = eval
+            .evaluate_child_split(eval.child_split.as_ref().unwrap(), &state, &pm, 0, 2, &batch)
+            .unwrap();
+        assert_eq!(mask, BooleanArray::from(vec![false, true]));
+    }
+
+    #[test]
+    fn child_split_runs_delivered_subset_preserves_correlation() {
+        // The RG has 4 parent rows but a co-delegated `status='x'` pruned it so parquet delivers only
+        // rows 1 and 3 (a Runs PositionMap). This is the exact case where value_offsets (batch-local)
+        // diverge from a whole-RG child prefix sum — the redesign's raison d'être.
+        //
+        // Delivered batch (2 rows): d0 = RG row 1 = [alice@70]; d1 = RG row 3 = [bob@30, alice@80].
+        // value_offsets = [0, 1, 3]. child_base must be [-1, 0, -1, 1] (RG rows 0,2 absent).
+        // Lucene matches author=alice at RG (row1, off0) and (row3, off1). For row1: alice@70 satisfies
+        // (alice AND >50) → true. For row3: alice is off1 with score 80 → element (alice,80) satisfies →
+        // true. Expected mask over DELIVERED rows [true, true].
+        let batch = comments_batch(&[vec![("alice", 70)], vec![("bob", 30), ("alice", 80)]]);
+        let eval = child_split_eval(vec![(1, 0), (3, 1)]);
+        let state = state_for(4);
+        // Runs: delivered d0 → rg 1, d1 → rg 3.
+        let pm = PositionMap::Runs {
+            runs: vec![(1, 0, 1), (3, 1, 1)],
+            delivered_count: 2,
+        };
+        let mask = eval
+            .evaluate_child_split(eval.child_split.as_ref().unwrap(), &state, &pm, 0, 2, &batch)
+            .unwrap();
+        assert_eq!(mask, BooleanArray::from(vec![true, true]));
+    }
+
+    #[test]
+    fn child_split_runs_wrong_element_offset_would_break_correlation() {
+        // Same delivered subset, but Lucene claims author=alice at RG (row3, off0) — that's bob@30, NOT
+        // alice. If child_base were miscomputed the intersection would silently pass; with correct
+        // coordinates, element off0 of row3 is (bob,30) which fails score>50, so row3 → false.
+        // Row1 still true. Expected [true, false].
+        let batch = comments_batch(&[vec![("alice", 70)], vec![("bob", 30), ("alice", 80)]]);
+        let eval = child_split_eval(vec![(1, 0), (3, 0)]);
+        let state = state_for(4);
+        let pm = PositionMap::Runs {
+            runs: vec![(1, 0, 1), (3, 1, 1)],
+            delivered_count: 2,
+        };
+        let mask = eval
+            .evaluate_child_split(eval.child_split.as_ref().unwrap(), &state, &pm, 0, 2, &batch)
+            .unwrap();
+        assert_eq!(mask, BooleanArray::from(vec![true, false]));
+    }
+
+    #[test]
+    fn child_split_on_batch_mask_honors_collector_candidates() {
+        // Full on_batch_mask path (not just evaluate_child_split): a correctness Collector coexists and
+        // narrowed candidates to rows {0} only (e.g. a text match() parent predicate delegated to Lucene,
+        // which is NOT in residual_expr). Even though BOTH P0 and P1 satisfy the nested predicate
+        // element-wise, the collector_mask must exclude P1. Expected mask [true, false].
+        let batch = comments_batch(&[vec![("alice", 70)], vec![("alice", 90)]]);
+        let eval = child_split_eval(vec![(0, 0), (1, 0)]); // Lucene says alice at both rows' elem 0
+        // candidates = {row 0} only → collector narrowed P1 out.
+        let state = state_with_candidates(2, &[0]);
+        let pm = PositionMap::Identity { delivered_count: 2 };
+        let mask = eval
+            .on_batch_mask(&state as &dyn std::any::Any, 0, &pm, 0, 2, &batch)
+            .unwrap()
+            .expect("child split produces a mask");
+        assert_eq!(mask, BooleanArray::from(vec![true, false]));
+    }
+
+    #[test]
+    fn child_split_on_batch_mask_full_universe_is_noop() {
+        // No correctness Collector → full-universe candidates → collector_mask all-true → the nested
+        // predicate alone decides. Same corpus as the Identity test: P0 no (alice@40 not>50), P1 yes.
+        let batch = comments_batch(&[vec![("alice", 40), ("bob", 90)], vec![("alice", 70)]]);
+        let eval = child_split_eval(vec![(0, 0), (1, 0)]);
+        let state = state_for(2); // full universe
+        let pm = PositionMap::Identity { delivered_count: 2 };
+        let mask = eval
+            .on_batch_mask(&state as &dyn std::any::Any, 0, &pm, 0, 2, &batch)
+            .unwrap()
+            .expect("child split produces a mask");
+        assert_eq!(mask, BooleanArray::from(vec![false, true]));
     }
 
     // Keep the `fmt` import used

@@ -31,7 +31,9 @@ use datafusion::{
     execution::object_store::ObjectStoreUrl,
     logical_expr::Expr,
     physical_expr::expressions::Column,
+    physical_expr::expressions::Literal,
     physical_expr::PhysicalExpr,
+    physical_expr::ScalarFunctionExpr,
     physical_optimizer::pruning::PruningPredicate,
     physical_plan::displayable,
     physical_plan::execute_stream,
@@ -53,7 +55,9 @@ use crate::helper::{
 };
 use crate::indexed_table::bool_tree::BoolNode;
 use crate::indexed_table::eval::bitmap_tree::{BitmapTreeEvaluator, CollectorLeafBitmaps};
-use crate::indexed_table::eval::single_collector::SingleCollectorEvaluator;
+use crate::indexed_table::eval::single_collector::{
+    ChildClause, ChildSplitState, SingleCollectorEvaluator,
+};
 use crate::indexed_table::eval::{CollectorCallStrategy, RowGroupBitsetSource, TreeBitsetSource};
 use crate::indexed_table::ffm_callbacks::{create_provider, FfmSegmentCollector, ProviderHandle};
 use crate::indexed_table::index::RowGroupDocsCollector;
@@ -428,6 +432,278 @@ fn extract_single_collector_residual(tree: &BoolNode) -> Option<BoolNode> {
     strip_collectors(tree)
 }
 
+/// Build the child-grain nested split state from a SingleCollector-classified tree, if the tree carries
+/// the child-split shape: a `nested_any_match_expr(arrayCol, json)` predicate whose `json` has
+/// `{"lucene": i}` holes, AND one `delegation_possible(nested_any_match_child(arrayCol, .., clauseIdx), id)`
+/// peer per hole. Returns `(ChildSplitState, child_annotation_ids)` — the second element is the set of
+/// annotation_ids that must be REMOVED from `performance_provider_locks` so `prefetch_rg` never consults a
+/// child-scoped query at parent grain (it would corrupt candidates); those peers are consulted at CHILD
+/// grain in `on_batch_mask` instead. Returns `None` when the tree has no child-split shape (the common
+/// case) — the caller then keeps the existing non-nested / superset-peer behavior unchanged.
+fn build_child_split(tree: &BoolNode) -> Option<(ChildSplitState, Vec<i32>)> {
+    // 1. Find the nested_any_match_expr predicate: array-column NAME (args[0] Column) + json (args[1] Utf8).
+    //    We carry the NAME, not the plan Column index, because the delivered batch is projected and its
+    //    column order differs from the full-table schema the index refers to.
+    let mut nested: Option<(String, String)> = None;
+    find_nested_expr_predicate(tree, &mut nested);
+    let (array_col_name, expr_json) = nested?;
+
+    // 2. Only engage if the json actually has {"lucene": i} holes — otherwise there's nothing to delegate
+    //    at child grain (a plain nested_any_match_expr runs the standard residual path).
+    let parsed: serde_json::Value = serde_json::from_str(&expr_json).ok()?;
+    if json_lucene_indices(&parsed).is_empty() {
+        return None;
+    }
+
+    // 3. Collect the child peers: each is a DelegationPossible whose original_expr is a
+    //    nested_any_match_child(.., clauseIdx) call. Pair clauseIdx → annotation_id.
+    let mut clauses: Vec<ChildClause> = Vec::new();
+    let mut child_annotation_ids: Vec<i32> = Vec::new();
+    collect_child_peers(tree, &mut clauses, &mut child_annotation_ids);
+    if clauses.is_empty() {
+        // json has {"lucene"} holes but no child peers reached us (e.g. Tree path demoted them). The UDF's
+        // "fallback" makes the plain path correct, so decline the split rather than half-wire it.
+        return None;
+    }
+
+    // 3b. Recover each clause's descent PATH from the JSON: the `{"nested":X}` heads above its `{"lucene":i}`
+    //     node. Empty for a top-level clause (original single-level bridge); ["divisions","teams","members"]
+    //     for a deep clause. The executor uses this to build the deep child_base in the clause's grain.
+    let mut clause_paths: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
+    json_lucene_paths(&parsed, &mut Vec::new(), &mut clause_paths);
+    for c in clauses.iter_mut() {
+        c.path = clause_paths.remove(&c.clause_idx).unwrap_or_default();
+    }
+
+    // Sort clauses by clause_idx and verify they form a dense 0..N set that covers every {"lucene": i} hole.
+    clauses.sort_by_key(|c| c.clause_idx);
+    let holes = json_lucene_indices(&parsed);
+    let dense: Vec<usize> = (0..clauses.len()).collect();
+    let clause_indices: Vec<usize> = clauses.iter().map(|c| c.clause_idx).collect();
+    if clause_indices != dense || holes.iter().any(|&h| h >= clauses.len()) {
+        log_debug!(
+            "child-split: clause/hole mismatch (clauses={:?}, holes={:?}) — declining split, plain path is correct",
+            clause_indices, holes
+        );
+        return None;
+    }
+
+    Some((
+        ChildSplitState {
+            array_col_name,
+            expr_json,
+            clauses,
+            // Filled by the caller (indexed_executor) with the query-scoped child provider-lock map.
+            provider_locks: Arc::new(std::collections::HashMap::new()),
+        },
+        child_annotation_ids,
+    ))
+}
+
+/// Strip the child-split parts from a residual `BoolNode`: the `nested_any_match_expr` predicate (the child
+/// branch of `on_batch_mask` owns it, evaluated with per-element Lucene verdicts) and every
+/// `nested_any_match_child` `DelegationPossible` peer (consulted at child grain, not natively). Returns the
+/// residual of genuinely non-nested conjuncts (e.g. a parent-column predicate) or `None` if nothing remains.
+fn strip_child_split_from_residual(node: &BoolNode) -> Option<BoolNode> {
+    match node {
+        BoolNode::Predicate(expr) => {
+            if let Some(sf) = (expr.as_ref() as &dyn std::any::Any).downcast_ref::<ScalarFunctionExpr>() {
+                if sf.name() == "nested_any_match_expr" {
+                    return None;
+                }
+            }
+            Some(node.clone())
+        }
+        BoolNode::DelegationPossible { original_expr, .. } => {
+            if let Some(sf) = (original_expr.as_ref() as &dyn std::any::Any).downcast_ref::<ScalarFunctionExpr>() {
+                if sf.name() == "nested_any_match_child" {
+                    return None;
+                }
+            }
+            Some(node.clone())
+        }
+        BoolNode::And(children) => {
+            let kept: Vec<BoolNode> = children.iter().filter_map(strip_child_split_from_residual).collect();
+            match kept.len() {
+                0 => None,
+                1 => Some(kept.into_iter().next().unwrap()),
+                _ => Some(BoolNode::And(kept)),
+            }
+        }
+        BoolNode::Or(children) => {
+            // A SingleCollector child split places the nested predicate and its peers under the top-level
+            // AND, never inside an OR (OR/NOT routes to the Tree path). So an OR subtree here is a pure
+            // non-nested predicate — keep it whole.
+            let kept: Vec<BoolNode> = children.iter().filter_map(strip_child_split_from_residual).collect();
+            if kept.len() == children.len() {
+                Some(BoolNode::Or(kept))
+            } else {
+                // Defensive: a child part was nested inside an OR (unexpected). Dropping one OR arm would
+                // change semantics, so keep the original subtree untouched rather than corrupt it.
+                Some(node.clone())
+            }
+        }
+        BoolNode::Not(child) => strip_child_split_from_residual(child).map(|c| BoolNode::Not(Box::new(c))),
+        BoolNode::Collector { .. } => Some(node.clone()),
+    }
+}
+
+/// DFS for the `nested_any_match_expr` predicate leaf; records `(array_col_name, json)` from its
+/// `ScalarFunctionExpr` operands (args[0] = Column, args[1] = Utf8 literal). The column NAME (not index) is
+/// carried because the delivered batch is projected — the plan's Column index would point at the wrong
+/// column. First match wins (a SingleCollector residual has at most one nested predicate over one array).
+fn find_nested_expr_predicate(node: &BoolNode, out: &mut Option<(String, String)>) {
+    if out.is_some() {
+        return;
+    }
+    match node {
+        BoolNode::And(children) | BoolNode::Or(children) => {
+            for c in children {
+                find_nested_expr_predicate(c, out);
+            }
+        }
+        BoolNode::Not(child) => find_nested_expr_predicate(child, out),
+        BoolNode::Predicate(expr) => {
+            if let Some(sf) = (expr.as_ref() as &dyn std::any::Any).downcast_ref::<ScalarFunctionExpr>() {
+                if sf.name() == "nested_any_match_expr" {
+                    let args = sf.args();
+                    if args.len() == 2 {
+                        if let (Some(col), Some(json)) =
+                            ((args[0].as_ref() as &dyn std::any::Any).downcast_ref::<Column>(), literal_utf8(&args[1]))
+                        {
+                            *out = Some((col.name().to_string(), json));
+                        }
+                    }
+                }
+            }
+        }
+        BoolNode::Collector { .. } | BoolNode::DelegationPossible { .. } => {}
+    }
+}
+
+/// DFS for child peers: `DelegationPossible` leaves whose `original_expr` is a
+/// `nested_any_match_child(arrayCol, field, op, value, clauseIdx)` call. Extracts `clauseIdx` (args[4],
+/// an Int32 literal) and pairs it with the leaf's `annotation_id`.
+fn collect_child_peers(node: &BoolNode, clauses: &mut Vec<ChildClause>, annotation_ids: &mut Vec<i32>) {
+    match node {
+        BoolNode::And(children) | BoolNode::Or(children) => {
+            for c in children {
+                collect_child_peers(c, clauses, annotation_ids);
+            }
+        }
+        BoolNode::Not(child) => collect_child_peers(child, clauses, annotation_ids),
+        BoolNode::DelegationPossible {
+            annotation_id,
+            original_expr,
+        } => {
+            if let Some(sf) = (original_expr.as_ref() as &dyn std::any::Any).downcast_ref::<ScalarFunctionExpr>() {
+                if sf.name() == "nested_any_match_child" {
+                    let args = sf.args();
+                    if args.len() == 5 {
+                        if let Some(clause_idx) = literal_i32(&args[4]) {
+                            clauses.push(ChildClause {
+                                clause_idx: clause_idx as usize,
+                                annotation_id: *annotation_id,
+                                // Filled by build_child_split via json_lucene_paths (empty = top-level clause).
+                                path: Vec::new(),
+                            });
+                            annotation_ids.push(*annotation_id);
+                        }
+                    }
+                }
+            }
+        }
+        BoolNode::Collector { .. } | BoolNode::Predicate(_) => {}
+    }
+}
+
+/// Return the set of `{"lucene": i}` indices referenced anywhere in the parsed nested-predicate JSON.
+/// Walks `args` (AND/OR/comparison operands), `fallback` (a `{"lucene"}` node's native subtree), AND
+/// `inner` (a `{"nested":X,"inner":...}` descent body) — the last is required for DEEP element-grain split
+/// (Phase C): a keyword clause N levels down is a `{"lucene":i}` node BURIED under N `{"nested"}` heads, so
+/// without descending into `inner` a deep hole is invisible and the split silently never engages (the node
+/// then correctly falls back to native eval — correct but un-accelerated).
+fn json_lucene_indices(node: &serde_json::Value) -> Vec<usize> {
+    let mut out = Vec::new();
+    fn walk(n: &serde_json::Value, out: &mut Vec<usize>) {
+        if let Some(idx) = n.get("lucene").and_then(|v| v.as_u64()) {
+            out.push(idx as usize);
+        }
+        if let Some(args) = n.get("args").and_then(|v| v.as_array()) {
+            for a in args {
+                walk(a, out);
+            }
+        }
+        if let Some(fb) = n.get("fallback") {
+            walk(fb, out);
+        }
+        if let Some(inner) = n.get("inner") {
+            walk(inner, out);
+        }
+    }
+    walk(node, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Map each `{"lucene": i}` node to its descent path — the ordered `{"nested":X}` heads enclosing it.
+/// A top-level `{"lucene"}` node maps to an empty path; a deep one to e.g. `["divisions","teams","members"]`.
+/// The executor uses this to build a deep `child_base` in the clause's own grain (see
+/// `single_collector::build_child_base_for_path`). Mirrors `json_lucene_indices`' traversal (args/fallback/
+/// inner) but tracks the nested prefix as it descends.
+fn json_lucene_paths(
+    node: &serde_json::Value,
+    prefix: &mut Vec<String>,
+    out: &mut std::collections::HashMap<usize, Vec<String>>,
+) {
+    if let Some(idx) = node.get("lucene").and_then(|v| v.as_u64()) {
+        out.insert(idx as usize, prefix.clone());
+        // A `{"lucene"}` node may also carry a "fallback"; it lives at the SAME grain, so keep the prefix.
+        if let Some(fb) = node.get("fallback") {
+            json_lucene_paths(fb, prefix, out);
+        }
+        return;
+    }
+    if let Some(head) = node.get("nested").and_then(|v| v.as_str()) {
+        prefix.push(head.to_string());
+        if let Some(inner) = node.get("inner") {
+            json_lucene_paths(inner, prefix, out);
+        }
+        prefix.pop();
+        return;
+    }
+    if let Some(args) = node.get("args").and_then(|v| v.as_array()) {
+        for a in args {
+            json_lucene_paths(a, prefix, out);
+        }
+    }
+}
+
+fn literal_utf8(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
+    let lit = (expr.as_ref() as &dyn std::any::Any).downcast_ref::<Literal>()?;
+    match lit.value() {
+        datafusion::common::ScalarValue::Utf8(Some(s))
+        | datafusion::common::ScalarValue::Utf8View(Some(s))
+        | datafusion::common::ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn literal_i32(expr: &Arc<dyn PhysicalExpr>) -> Option<i32> {
+    let lit = (expr.as_ref() as &dyn std::any::Any).downcast_ref::<Literal>()?;
+    match lit.value() {
+        datafusion::common::ScalarValue::Int32(Some(v)) => Some(*v),
+        datafusion::common::ScalarValue::Int64(Some(v)) => i32::try_from(*v).ok(),
+        // clauseIdx is emitted as a STRING literal (isthmus variadic type-uniformity — see the rewriter's
+        // tryDirectEqualityChildRewrite). Parse it back to an index.
+        datafusion::common::ScalarValue::Utf8(Some(s))
+        | datafusion::common::ScalarValue::Utf8View(Some(s))
+        | datafusion::common::ScalarValue::LargeUtf8(Some(s)) => s.trim().parse::<i32>().ok(),
+        _ => None,
+    }
+}
+
 // ── Placeholder provider used only for substrait consume pass ─────────
 
 struct PlaceholderProvider {
@@ -484,6 +760,56 @@ mod tests {
 
     fn is_predicate(node: &BoolNode) -> bool {
         matches!(node, BoolNode::Predicate(_))
+    }
+
+    // ── json_lucene_paths / json_lucene_indices (Phase C deep-clause path recovery) ─────────────
+    // The JSON shapes here are EXACTLY what the Java rewriter's wrapLeafWithLuceneNode emits, so these
+    // tests are the cross-side contract check: Java places {"lucene":i} at the deepest inner position under
+    // its {"nested"} heads; the Rust executor must recover the same descent path.
+
+    #[test]
+    fn json_lucene_paths_recovers_mixed_top_and_deep() {
+        // A fused predicate with a TOP-LEVEL keyword split (clause 0, no descent) AND a DEEP keyword split
+        // (clause 1, 3 levels down) — the exact `orgs.oname='acme' AND ...members.mname='al'` mixed shape.
+        let json = serde_json::json!({
+            "op": "AND",
+            "args": [
+                {"lucene": 0, "fallback": {"op":"=","args":[{"field":"oname"},{"lit":"acme"}]}},
+                {"nested":"divisions","inner":{"nested":"teams","inner":{"nested":"members","inner":
+                    {"lucene": 1, "fallback": {"op":"=","args":[{"field":"mname"},{"lit":"al"}]}}}}},
+                {"nested":"divisions","inner":{"nested":"teams","inner":{"nested":"members","inner":
+                    {"op":">","args":[{"field":"age"},{"lit":35}]}}}}
+            ]
+        });
+        // Both holes discovered (top-level + buried-under-descent).
+        assert_eq!(json_lucene_indices(&json), vec![0, 1]);
+        let mut paths = std::collections::HashMap::new();
+        json_lucene_paths(&json, &mut Vec::new(), &mut paths);
+        assert_eq!(paths.get(&0), Some(&vec![]), "clause 0 is top-level → empty path");
+        assert_eq!(
+            paths.get(&1),
+            Some(&vec!["divisions".to_string(), "teams".to_string(), "members".to_string()]),
+            "clause 1 is 3 levels deep"
+        );
+    }
+
+    #[test]
+    fn json_lucene_paths_deep_fused_same_prefix() {
+        // Two deep keyword clauses on the SAME path fused into one descent (fuseByNestedPrefix): both
+        // {"lucene"} nodes sit under the shared members descent as AND args — each still recovers the full path.
+        let json = serde_json::json!({
+            "nested":"divisions","inner":{"nested":"teams","inner":{"nested":"members","inner":
+                {"op":"AND","args":[
+                    {"lucene":0,"fallback":{"op":"=","args":[{"field":"mname"},{"lit":"al"}]}},
+                    {"lucene":1,"fallback":{"op":"=","args":[{"field":"role"},{"lit":"lead"}]}}
+                ]}}}
+        });
+        assert_eq!(json_lucene_indices(&json), vec![0, 1]);
+        let mut paths = std::collections::HashMap::new();
+        json_lucene_paths(&json, &mut Vec::new(), &mut paths);
+        let deep = vec!["divisions".to_string(), "teams".to_string(), "members".to_string()];
+        assert_eq!(paths.get(&0), Some(&deep));
+        assert_eq!(paths.get(&1), Some(&deep));
     }
 
     // ── extract_single_collector_residual ─────────────────────────────
@@ -1021,7 +1347,20 @@ async unsafe fn execute_indexed_with_context_inner(
     //   `on_batch_mask` using arrow kernels; no pushdown needed.
     let pushdown_predicate: Option<Arc<dyn PhysicalExpr>> = match &classification {
         FilterClass::SingleCollector => extraction.as_ref().and_then(|e| {
-            let residual_bool = extract_single_collector_residual(&e.tree);
+            let residual_bool = extract_single_collector_residual(&e.tree).and_then(|b| {
+                // When a child-grain split is active, strip the nested_any_match_expr predicate AND the
+                // child peers (delegation_possible(nested_any_match_child(...))) from the pushdown
+                // predicate — exactly as the evaluator's residual is stripped. Otherwise parquet's
+                // with_predicate pushdown (row-granular mode) would evaluate the nested_any_match_child
+                // stub, whose Rust UDF body fails loud, erroring the query. The child branch of
+                // on_batch_mask is authoritative for the nested predicate; only genuinely non-nested
+                // conjuncts belong in pushdown.
+                if build_child_split(&e.tree).is_some() {
+                    strip_child_split_from_residual(&b)
+                } else {
+                    Some(b)
+                }
+            });
             residual_bool
                 .as_ref()
                 .and_then(residual_bool_to_physical_expr)
@@ -1143,22 +1482,58 @@ async unsafe fn execute_indexed_with_context_inner(
                     None => None,
                 };
 
+            // Child-grain nested split: detect the `nested_any_match_expr` + `nested_any_match_child`-peer
+            // shape (behind the Java-side child_grain_split flag). When present, the child peers are
+            // consulted at CHILD grain in `on_batch_mask`, NOT at parent grain in `prefetch_rg`, and the
+            // nested UDF predicate is evaluated there with per-element Lucene verdicts. `None` → unchanged.
+            let child_split_shape = build_child_split(&extraction.tree);
+            let child_annotation_ids: Vec<i32> = child_split_shape
+                .as_ref()
+                .map(|(_, ids)| ids.clone())
+                .unwrap_or_default();
+
             // Performance-delegated provider locks (lazy). Built ONCE per query,
             // shared across all per-(segment×chunk) closures via Arc::clone — so
             // multiple DataFusion threads racing to populate the same Lucene
             // Weight do so once per (query × annotation_id), not per chunk.
             // Drop releases the Lucene Weight via `releaseProvider`.
-            let performance_provider_locks: Arc<
-                std::collections::HashMap<i32, Arc<std::sync::OnceLock<ProviderHandle>>>,
-            > = {
+            //
+            // A per-leaf lock is created for EVERY delegation_possible leaf, then split into two disjoint
+            // maps: the parent-grain map (drives `prefetch_rg`'s opportunistic peer consult) EXCLUDES the
+            // child-split peers, because consulting a child-scoped query at parent grain would set child-
+            // docId bits misread as row bits and corrupt `candidates &=`; the child-grain map (carried in
+            // ChildSplitState) holds exactly the child peers, consulted at child grain in `on_batch_mask`.
+            let (performance_provider_locks, child_provider_locks): (
+                Arc<std::collections::HashMap<i32, Arc<std::sync::OnceLock<ProviderHandle>>>>,
+                Arc<std::collections::HashMap<i32, Arc<std::sync::OnceLock<ProviderHandle>>>>,
+            ) = {
                 let leaves = extraction.tree.delegation_possible_leaves();
-                let mut map = std::collections::HashMap::with_capacity(leaves.len());
+                let mut parent_map = std::collections::HashMap::new();
+                let mut child_map = std::collections::HashMap::new();
                 for (annotation_id, _expr) in &leaves {
-                    map.entry(*annotation_id)
-                        .or_insert_with(|| Arc::new(std::sync::OnceLock::new()));
+                    let lock = Arc::new(std::sync::OnceLock::new());
+                    if child_annotation_ids.contains(annotation_id) {
+                        child_map.entry(*annotation_id).or_insert(lock);
+                    } else {
+                        parent_map.entry(*annotation_id).or_insert(lock);
+                    }
                 }
-                Arc::new(map)
+                (Arc::new(parent_map), Arc::new(child_map))
             };
+
+            // Assemble the final ChildSplitState with its own provider-lock map attached.
+            let child_split: Option<
+                crate::indexed_table::eval::single_collector::ChildSplitState,
+            > = child_split_shape.map(|(mut state, _ids)| {
+                state.provider_locks = Arc::clone(&child_provider_locks);
+                log_debug!(
+                    "child-split ENGAGED: array_col={} clauses={} child_annotation_ids={:?}",
+                    state.array_col_name,
+                    state.clauses.len(),
+                    child_annotation_ids
+                );
+                state
+            });
 
             // Extract the residual (non-Collector children of top-level
             // AND) as a BoolNode and convert to PhysicalExpr. Used for:
@@ -1171,7 +1546,19 @@ async unsafe fn execute_indexed_with_context_inner(
             // needed (unlike bool_tree_to_pruning_expr which handles arbitrary
             // trees). DelegationPossible leaves contribute their original_expr
             // to the residual so DF gets to evaluate them natively.
-            let residual_bool = extract_single_collector_residual(&extraction.tree);
+            //
+            // When a child split is active, strip the nested_any_match_expr predicate and the child peers
+            // from the residual: the child branch of `on_batch_mask` owns the nested predicate (evaluated
+            // with per-element Lucene verdicts) and ANDs the remaining residual itself. Leaving the nested
+            // UDF in `residual_expr` would double-evaluate it and, via pushdown, misalign.
+            let residual_bool = extract_single_collector_residual(&extraction.tree)
+                .and_then(|b| {
+                    if child_split.is_some() {
+                        strip_child_split_from_residual(&b)
+                    } else {
+                        Some(b)
+                    }
+                });
             let residual_expr = residual_bool
                 .as_ref()
                 .and_then(residual_bool_to_physical_expr);
@@ -1238,6 +1625,7 @@ async unsafe fn execute_indexed_with_context_inner(
                             residual_expr.clone(),
                             Some(PagePruneMetrics::from_stream_metrics(stream_metrics)),
                             stream_metrics.ffm_collector_calls.clone(),
+                            stream_metrics.rg_pruned_by_peer.clone(),
                             call_strategy,
                             Arc::clone(&performance_provider_locks),
                             segment.writer_generation,
@@ -1246,6 +1634,9 @@ async unsafe fn execute_indexed_with_context_inner(
                             bloom_config,
                             stats_prune_tree.cloned(),
                             chunk.row_group_indices.iter().enumerate().map(|(pos, &idx)| (idx, pos)).collect(),
+                            // Child-grain nested split state, built once per query (step c wires this).
+                            // None → non-nested / superset-peer behavior, unchanged.
+                            child_split.clone(),
                         ));
                         Ok(eval)
                     },

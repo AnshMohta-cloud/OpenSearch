@@ -425,6 +425,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_tree_single_collector(
                     ),
                 ),
                 stream_metrics.ffm_collector_calls.clone(),
+                None, // arg7: rg_pruned_by_peer
                 call_strategy,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 segment.writer_generation,
@@ -433,6 +434,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_tree_single_collector(
                 None,
                     None,
                     std::collections::HashMap::new(),
+                    None,
             ));
             let _ = segment;
             Ok(eval)

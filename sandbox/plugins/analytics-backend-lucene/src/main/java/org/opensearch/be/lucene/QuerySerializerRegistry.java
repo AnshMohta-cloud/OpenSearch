@@ -20,6 +20,7 @@ import org.opensearch.be.lucene.serializers.MatchPhrasePrefixSerializer;
 import org.opensearch.be.lucene.serializers.MatchPhraseSerializer;
 import org.opensearch.be.lucene.serializers.MatchSerializer;
 import org.opensearch.be.lucene.serializers.MultiMatchSerializer;
+import org.opensearch.be.lucene.serializers.NestedAnyMatchChildSerializer;
 import org.opensearch.be.lucene.serializers.NestedAnyMatchSerializer;
 import org.opensearch.be.lucene.serializers.NotEqualsSerializer;
 import org.opensearch.be.lucene.serializers.QuerySerializer;
@@ -60,7 +61,8 @@ final class QuerySerializerRegistry {
         Map.entry(ScalarFunction.LESS_THAN_OR_EQUAL, new ComparisonSerializer()),
         Map.entry(ScalarFunction.REGEXP, new RegexpSerializer()),
         Map.entry(ScalarFunction.SARG_PREDICATE, new SargSerializer()),
-        Map.entry(ScalarFunction.NESTED_ANY_MATCH, new NestedAnyMatchSerializer())
+        Map.entry(ScalarFunction.NESTED_ANY_MATCH, new NestedAnyMatchSerializer()),
+        Map.entry(ScalarFunction.NESTED_ANY_MATCH_CHILD, new NestedAnyMatchChildSerializer())
     );
 
     private QuerySerializerRegistry() {}

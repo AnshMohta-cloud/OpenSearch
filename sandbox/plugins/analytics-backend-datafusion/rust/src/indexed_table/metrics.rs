@@ -56,6 +56,9 @@ pub struct StreamMetrics {
     /// Collector leaf per RG. This is the highest per-query cost
     /// component, useful for tuning backend query shapes.
     pub ffm_collector_calls: Option<Count>,
+    /// RGs skipped because the parent-grain Lucene performance peer's row bitset emptied candidates
+    /// (the observable Lucene-driven row-group prune signal). Exposed as `rg_pruned_by_peer`.
+    pub rg_pruned_by_peer: Option<Count>,
     /// Count of output `RecordBatch`es emitted from `poll_next`.
     /// Divergence from `parquet_batches_received` indicates refinement
     /// stage filtering (empty batches dropped).
@@ -147,6 +150,7 @@ impl StreamMetrics {
             pages_total: None,
             page_pruning_unavailable: None,
             ffm_collector_calls: None,
+            rg_pruned_by_peer: None,
             batches_produced: None,
             parquet_batches_received: None,
             position_map_identity: None,
@@ -198,6 +202,8 @@ pub struct PartitionMetrics {
     pub position_map_runs: Count,
     pub prefetch_wait_time: Time,
     pub prefetch_wait_count: Count,
+    /// RGs skipped because the parent-grain Lucene performance peer's row bitset emptied candidates.
+    pub rg_pruned_by_peer: Count,
     pub coalesce_time: Time,
     pub batches_pre_coalesce: Count,
     pub build_mask_time: Time,
@@ -234,6 +240,7 @@ impl PartitionMetrics {
             pages_total: counter("pages_total"),
             page_pruning_unavailable: counter("page_pruning_unavailable"),
             ffm_collector_calls: counter("ffm_collector_calls"),
+            rg_pruned_by_peer: counter("rg_pruned_by_peer"),
             batches_produced: counter("batches_produced"),
             parquet_batches_received: counter("parquet_batches_received"),
             position_map_identity: counter("position_map_identity"),
@@ -285,6 +292,7 @@ impl PartitionMetrics {
             pages_total: Some(self.pages_total),
             page_pruning_unavailable: Some(self.page_pruning_unavailable),
             ffm_collector_calls: Some(self.ffm_collector_calls),
+            rg_pruned_by_peer: Some(self.rg_pruned_by_peer),
             batches_produced: Some(self.batches_produced),
             parquet_batches_received: Some(self.parquet_batches_received),
             position_map_identity: Some(self.position_map_identity),
