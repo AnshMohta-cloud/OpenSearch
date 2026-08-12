@@ -166,9 +166,17 @@ public class LuceneMerger implements Merger {
             MergePolicy.OneMerge oneMerge = strategy.createOneMerge(matchingSegments, rowIdMapping, mergeInput.newWriterGeneration());
             indexWriter.executeMerge(oneMerge, mergeInput.newWriterGeneration());
 
-            // Build the merged WriterFileSet from the output segment info
+            // Build the merged WriterFileSet from the output segment info.
+            // numRows must be the LOGICAL row count (one per root document), not the physical
+            // Lucene maxDoc(): a nested document is one logical row but occupies root + N child
+            // block docs. We compute it as the sum of the input segments' logical numRows, exactly
+            // as NativeParquetMergeStrategy does — this keeps the primary (Parquet) and secondary
+            // (Lucene) row counts identical post-merge, which the composite merge parity check
+            // relies on. For flat (non-nested) segments this equals maxDoc(), so behavior is
+            // unchanged for the existing Mustang path.
             SegmentCommitInfo mergedInfo = oneMerge.getMergeInfo();
-            WriterFileSet mergedFileSet = buildMergedFileSet(mergedInfo, mergeInput.newWriterGeneration());
+            long mergedLogicalRows = sumLogicalRows(segments);
+            WriterFileSet mergedFileSet = buildMergedFileSet(mergedInfo, mergeInput.newWriterGeneration(), mergedLogicalRows);
 
             // Delegate RowIdMapping production to the strategy
             RowIdMapping outputMapping = strategy.buildRowIdMapping(oneMerge, mergeInput);
@@ -207,15 +215,36 @@ public class LuceneMerger implements Merger {
 
     /**
      * Builds a {@link WriterFileSet} from the merged segment info.
+     *
+     * @param logicalRows the logical (root) row count of the merged segment; for nested segments
+     *                    this is smaller than {@code mergedInfo.info.maxDoc()} because a nested
+     *                    document occupies root + N child block docs but is one logical row.
      */
-    private WriterFileSet buildMergedFileSet(SegmentCommitInfo mergedInfo, long writerGeneration) throws IOException {
+    private WriterFileSet buildMergedFileSet(SegmentCommitInfo mergedInfo, long writerGeneration, long logicalRows) throws IOException {
         WriterFileSet.Builder builder = WriterFileSet.builder()
             .directory(storeDirectory)
             .writerGeneration(writerGeneration)
-            .addNumRows(mergedInfo.info.maxDoc());
+            .addNumRows(logicalRows);
         for (String file : mergedInfo.files()) {
             builder.addFile(file);
         }
         return builder.build();
+    }
+
+    /**
+     * Sums the logical (root) row counts across the input segments for this data format. Each input
+     * {@link WriterFileSet#numRows()} is already the logical row count (see {@code LuceneWriter}),
+     * so the merged segment's logical row count is their sum — a merge neither creates nor destroys
+     * logical rows. Mirrors {@code NativeParquetMergeStrategy}'s sum-of-inputs computation.
+     */
+    private long sumLogicalRows(List<Segment> segments) {
+        long total = 0;
+        for (Segment segment : segments) {
+            WriterFileSet wfs = segment.dfGroupedSearchableFiles().get(dataFormat.name());
+            if (wfs != null) {
+                total += wfs.numRows();
+            }
+        }
+        return total;
     }
 }

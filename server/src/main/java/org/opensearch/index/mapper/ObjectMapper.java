@@ -427,9 +427,11 @@ public class ObjectMapper extends Mapper implements Cloneable {
                 if (type.equals(CONTENT_TYPE)) {
                     builder.nested = Nested.NO;
                 } else if (type.equals(NESTED_CONTENT_TYPE)) {
-                    if (isPluggableDataFormatEnabled(parserContext.getSettings())) {
-                        throw new MapperParsingException("nested type is not supported with pluggable data format on field [" + name + "]");
-                    }
+                    // Nested mappings are supported under the pluggable (composite) data format: the Lucene
+                    // secondary stores each nested document as a child block joined to its root, and the
+                    // Parquet primary stores it as a LIST<STRUCT> column, correlated by __row_id__. An earlier
+                    // guard (#22364) rejected nested outright while composite ingestion was unimplemented; it is
+                    // now implemented, so no guard is needed here.
                     nested = true;
                 } else {
                     throw new MapperParsingException(
@@ -1085,9 +1087,13 @@ public class ObjectMapper extends Mapper implements Cloneable {
 
     @Override
     public void canDeriveSource() {
-        if (!this.enabled.value() || this.nested.isNested()) {
-            throw new UnsupportedOperationException("Derived source is not supported for " + name() + " field as it is disabled/nested");
+        if (this.enabled.value() == false) {
+            throw new UnsupportedOperationException("Derived source is not supported for " + name() + " field as it is disabled");
         }
+        // Nested object mappers are permitted under derived-source mode: the composite (pluggable)
+        // data format derives nested source from the Parquet LIST<STRUCT> columns, not from Lucene
+        // stored fields. The per-child-field validation below still runs to catch unsupported leaf
+        // types within the nested object.
         for (final Mapper mapper : this.mappers.values()) {
             mapper.canDeriveSource();
         }

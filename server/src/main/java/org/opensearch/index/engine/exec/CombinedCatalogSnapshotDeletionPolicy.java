@@ -188,6 +188,9 @@ public class CombinedCatalogSnapshotDeletionPolicy implements CatalogSnapshotDel
                 if (segmentRows == -1) {
                     segmentRows = numRows;
                 } else if (segmentRows != numRows) {
+                    // Each format's WriterFileSet.numRows() is the LOGICAL row count (Parquet rows) — nested
+                    // segments reconcile because LuceneWriter reports its ROOT count, not physical block docs.
+                    // A mismatch here is a genuine cross-format inconsistency and must fail the commit.
                     throw new IllegalStateException(
                         "Segment [gen="
                             + segment.generation()

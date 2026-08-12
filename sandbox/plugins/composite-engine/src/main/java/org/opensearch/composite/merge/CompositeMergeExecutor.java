@@ -69,7 +69,11 @@ public class CompositeMergeExecutor {
                             + "] returned null — possible concurrent merge consumed segments"
                     );
                 }
-                // Verify secondary merged row count matches primary
+                // Verify secondary merged row count matches primary. Both formats report the
+                // LOGICAL row count (one per root document): the Parquet primary packs a nested
+                // document into a single LIST<STRUCT> row, and the Lucene secondary reports its
+                // root-document count (not the physical root + N child block docs). A mismatch
+                // here is therefore a genuine cross-format inconsistency and must abort the merge.
                 if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() != null) {
                     long primaryRows = primaryResult.mergedFiles().numRows();
                     long secondaryRows = secondaryResult.mergedFiles().numRows();

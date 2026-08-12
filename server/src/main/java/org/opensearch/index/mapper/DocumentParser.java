@@ -607,6 +607,13 @@ final class DocumentParser {
         ObjectMapper.Nested nested = mapper.nested();
         if (nested.isNested()) {
             context = nestedContext(context, mapper);
+            // Pluggable/composite mode: also signal the nested-child boundary to the pluggable
+            // DocumentInput(s) (e.g. the Lucene secondary builds a nested doc block, Parquet begins a new
+            // LIST<STRUCT> element). Gated so vanilla indices are unaffected. The signal stream mirrors the
+            // parse walk exactly, so every format sees children in identical order (the ordering invariant).
+            if (context.indexSettings().isPluggableDataFormatEnabled()) {
+                context.documentInput().startNestedChild(mapper.fullPath());
+            }
         }
 
         // if we are at the end of the previous object, advance
@@ -623,6 +630,11 @@ final class DocumentParser {
         // restore the enable path flag
         if (nested.isNested()) {
             nested(context, nested);
+            // Symmetric close of the startNestedChild signal above (same gate) — closes the innermost open
+            // child so the pluggable DocumentInput lands it in post-order (children before their parent).
+            if (context.indexSettings().isPluggableDataFormatEnabled()) {
+                context.documentInput().endNestedChild();
+            }
         }
     }
 
@@ -840,6 +852,13 @@ final class DocumentParser {
             // We just need to store the id as indexed field, so that IndexWriter#deleteDocuments(term) can then
             // delete it when the root document is deleted too.
             nestedDoc.add(new Field(IdFieldMapper.NAME, idField.binaryValue(), IdFieldMapper.Defaults.NESTED_FIELD_TYPE));
+        } else if (context.indexSettings().isPluggableDataFormatEnabled()) {
+            // In pluggable/composite mode, IdFieldMapper.preParse routes _id into the columnar DocumentInput
+            // (not context.doc()), so the classic Lucene _id field is legitimately absent on the parent
+            // Document. The real nested block is built by the pluggable DocumentInput via
+            // startNestedChild/endNestedChild — this vanilla ParseContext.Document tree is vestigial for the
+            // composite write path. Skip the _id-copy; child deletion is handled by block-aware rollback in
+            // LuceneWriter, not by per-child _id terms.
         } else {
             throw new IllegalStateException("The root document of a nested document should have an _id field");
         }

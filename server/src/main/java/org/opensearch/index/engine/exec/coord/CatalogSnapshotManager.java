@@ -704,6 +704,10 @@ public class CatalogSnapshotManager implements Closeable {
                     expected = rows;
                     referenceFormat = entry.getKey();
                 } else if (rows != expected) {
+                    // Cross-format row-count parity. Each format's WriterFileSet.numRows() is the LOGICAL row
+                    // count (Parquet rows), so nested and flat segments reconcile identically: LuceneWriter
+                    // reports its ROOT (logical) count, not the physical block doc count. A genuine mismatch
+                    // here still indicates a real cross-format inconsistency and must fail.
                     throw new IllegalStateException(
                         String.format(
                             Locale.ROOT,

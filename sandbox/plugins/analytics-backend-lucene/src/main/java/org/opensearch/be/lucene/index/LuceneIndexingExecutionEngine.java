@@ -19,6 +19,7 @@ import org.apache.lucene.index.MergeIndexWriter;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.index.Terms;
 import org.apache.lucene.misc.store.HardlinkCopyDirectoryWrapper;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.store.Directory;
@@ -375,7 +376,16 @@ public class LuceneIndexingExecutionEngine implements IndexingExecutionEngine<Lu
                             if (!writerGenerations.contains(writerGen)) {
                                 continue;
                             }
-                            long numDocs = segReader.maxDoc();
+                            // numRows must be the LOGICAL row count (one per root document), not the physical
+                            // Lucene maxDoc(): a nested document is stored as a block of root + N child docs,
+                            // so maxDoc() overcounts by the number of nested children. Children (and only
+                            // children) carry the _nested_path field, so the root count is
+                            // maxDoc() - docCount(_nested_path). This keeps the Lucene secondary's numRows equal
+                            // to the Parquet primary's logical row count, which the cross-format parity check
+                            // requires. For a flat (non-nested) segment there are no _nested_path docs, so this
+                            // equals maxDoc() and behavior is unchanged for the existing Mustang path.
+                            long childDocs = nestedChildDocCount(segReader);
+                            long numDocs = segReader.maxDoc() - childDocs;
 
                             WriterFileSet.Builder wfsBuilder = WriterFileSet.builder()
                                 .directory(sharedDir)
@@ -413,6 +423,18 @@ public class LuceneIndexingExecutionEngine implements IndexingExecutionEngine<Lu
             stats.incRefreshTotal();
             stats.addRefreshTimeMillis(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - refreshStart));
         }
+    }
+
+    /**
+     * Returns the number of nested child documents in a segment — i.e. the number of docs that carry
+     * the {@code _nested_path} field. Only nested children carry it (root and flat docs do not), so
+     * {@code maxDoc() - nestedChildDocCount()} yields the logical (root) row count. Uses
+     * {@link Terms#getDocCount()}, which is O(1) segment metadata, so this adds no per-doc cost. Returns
+     * 0 for a flat segment (no {@code _nested_path} terms).
+     */
+    private static long nestedChildDocCount(SegmentReader segReader) throws IOException {
+        Terms terms = segReader.terms(DocumentInput.NESTED_PATH_FIELD);
+        return terms == null ? 0L : terms.getDocCount();
     }
 
     @Override

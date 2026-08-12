@@ -94,6 +94,15 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
     /** Segment info attribute key storing the writer generation for post-addIndexes correlation. */
     public static final String WRITER_GENERATION_ATTRIBUTE = "writer_generation";
 
+    /**
+     * Lucene parent field for nested document-block support. Declaring it via
+     * {@code IndexWriterConfig.setParentField} lets {@code addDocuments} blocks (children + root) coexist
+     * with index sorting: the block-aware sorter keeps each parent+children block contiguous and in
+     * root-{@code __row_id__} order through sorted merges, preserving the Lucene-docId ↔ Parquet-row
+     * correspondence the reader relies on. Name must not collide with any mapped field.
+     */
+    public static final String NESTED_PARENT_FIELD = "__nested_parent";
+
     /** Large RAM buffer to avoid intermediate segment flushes within a single writer in production. */
     private static final double RAM_BUFFER_SIZE_MB = 256.0;
 
@@ -105,7 +114,20 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
     private final IndexWriter indexWriter;
     private final Set<LuceneWriter> registry;
     private long mappingVersion;
+    /**
+     * Physical Lucene doc count — advances by the whole block (N children + 1 root) per nested doc, by 1 per
+     * flat doc. This is the docId cursor and what the flushed segment's {@code maxDoc()} must equal.
+     */
     private volatile long docCount;
+    /**
+     * LOGICAL doc count (== Parquet rows) — advances by exactly 1 per {@link #addDoc} call, flat or nested.
+     * For a flat-only segment {@code logicalRowCount == docCount}; with nested blocks it is the ROOT count
+     * ({@code < docCount}). This is what {@code WriterFileSet.numRows()} reports so it reconciles with the
+     * Parquet primary's logical row count in the cross-format parity checks.
+     */
+    private volatile long logicalRowCount;
+    /** Physical size of the most recently written block (1 for a flat doc), for block-aware {@link #rollbackTo}. */
+    private volatile int lastBlockSize;
     private volatile boolean flushed;
     private volatile WriterState state = WriterState.ACTIVE;
 
@@ -138,6 +160,8 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         this.dataFormat = dataFormat;
         this.stats = stats;
         this.docCount = 0;
+        this.logicalRowCount = 0;
+        this.lastBlockSize = 0;
         this.registry = registry;
 
         // Create an isolated temp directory for this writer's segment
@@ -161,6 +185,10 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         if (indexSort != null) {
             iwc.setMergePolicy(new LogByteSizeMergePolicy());
             iwc.setIndexSort(indexSort);
+            // Nested support: declaring the parent field is what allows document blocks (addDocuments)
+            // to be used together with index sorting — Lucene keeps each parent+children block contiguous
+            // through the sorted merge instead of scattering children away from their root.
+            iwc.setParentField(NESTED_PARENT_FIELD);
         } else {
             // We are taking control here hence not allowing any merge to happen automatically.
             iwc.setMergePolicy(NoMergePolicy.INSTANCE);
@@ -228,24 +256,47 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
             if (state != WriterState.ACTIVE) {
                 throw new IllegalStateException("addDoc requires ACTIVE state but was " + state);
             }
-            // Defense-in-depth: CompositeWriter enforces rowId == docCount at the multiplexer
-            // layer, but we re-check here so a single-format Lucene path is also protected.
-            if (input.getRowId() != docCount) {
-                throw new IllegalStateException("rowId [" + input.getRowId() + "] does not match doc count [" + docCount + "]");
+            // A nested doc is written as a BLOCK of (children..., root) via addDocuments; a flat doc is a
+            // single addDocument. `docCount` counts LUCENE docs (it must advance by the whole block so the
+            // next block starts at the right docId), while `rowId` counts LOGICAL docs (Parquet rows) and
+            // advances by 1 per logical doc. For a FLAT doc these coincide, so we keep the strict
+            // rowId == docCount defense-in-depth check; for a nested block they legitimately diverge
+            // (root docId = docCount + blockSize - 1 != rowId), so that invariant does not apply.
+            boolean nested = input.hasNestedChildren();
+            // Defense-in-depth: the caller's rowId must equal our LOGICAL row count (Parquet rows), NOT the
+            // physical docCount. They coincide for a flat-only stream, but once a nested block writes N+1
+            // physical docs the two diverge — comparing against logicalRowCount keeps the check correct for
+            // flat docs AND flat/nested docs that follow a nested block. Applies uniformly to flat and nested.
+            if (input.getRowId() != logicalRowCount) {
+                throw new IllegalStateException(
+                    "rowId [" + input.getRowId() + "] does not match logical row count [" + logicalRowCount + "]"
+                );
             }
+            int blockSize = nested ? input.getDocumentBlock().size() : 1;
             try {
-                indexWriter.addDocument(input.getFinalInput());
+                if (nested) {
+                    // Contiguous Lucene block: children first (post-order), root last. The root carries
+                    // __row_id__ / _primary_term; children carry _nested_path. This is what block-join needs.
+                    indexWriter.addDocuments(input.getDocumentBlock());
+                } else {
+                    indexWriter.addDocument(input.getFinalInput());
+                }
             } catch (IOException | IllegalArgumentException e) {
-                // Lucene's IndexWriter may have consumed a docId before throwing; advance our
-                // counter to match so rollbackTo can tombstone the partial slot, and
-                // retire to preserve the docId == rowId invariant for subsequent writes.
-                docCount++;
+                // Lucene's IndexWriter may have consumed docId(s) before throwing; advance the physical
+                // counter by the whole block so rollbackTo can tombstone the partial slot(s) and the docId
+                // invariant for subsequent writes is preserved. The logical row was NOT admitted, so
+                // logicalRowCount is not advanced (the failed rowId can be retried/rolled back cleanly).
+                docCount += blockSize;
+                lastBlockSize = blockSize;
                 state = WriterState.PENDING_ROLLBACK;
                 stats.incDocsIndexedFailures();
                 return new WriteResult.Failure(e, -1L, -1L, -1L);
             }
-            long currentDocId = docCount;
-            docCount++;
+            // The root doc is the LAST doc in the block; report its docId as the write's docId.
+            long currentDocId = docCount + blockSize - 1;
+            docCount += blockSize;
+            logicalRowCount++; // exactly one LOGICAL doc admitted (a whole nested block counts as one row)
+            lastBlockSize = blockSize;
             stats.addDocsIndexed(1);
             return new WriteResult.Success(1L, 1L, currentDocId);
         }, stats::addIndexTimeMillis);
@@ -256,20 +307,49 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         if (state != WriterState.PENDING_ROLLBACK && state != WriterState.ACTIVE) {
             throw new IllegalStateException("rollbackTo requires ACTIVE or PENDING_ROLLBACK state but was " + state);
         }
-        if (rowCount > docCount) {
-            throw new IllegalStateException("Cannot rollback to " + rowCount + ": only " + docCount + " docs admitted");
+        // `rowCount` is a LOGICAL row count (Parquet rows), matching CompositeWriter's acceptedRows — NOT the
+        // physical Lucene docCount (which is larger when nested blocks were written). Compare against
+        // logicalRowCount throughout.
+        if (rowCount > logicalRowCount) {
+            throw new IllegalStateException(
+                "Cannot rollback to " + rowCount + ": only " + logicalRowCount + " logical rows admitted"
+            );
         }
-        if (rowCount == docCount) {
+        if (rowCount == logicalRowCount) {
             state = WriterState.RETIRED_FLUSHABLE;
             return;
         }
-        if (docCount - rowCount != 1) {
+        // Contract (see Writer#rollbackTo): exactly one in-flight logical doc is rolled back. For a flat doc
+        // that is one physical Lucene doc; for a nested doc it is the whole trailing block (children + root =
+        // lastBlockSize physical docs). Deleting only the root by its __row_id__ would orphan the child docs
+        // (they carry no __row_id__), breaking block-join, so we delete the whole trailing docId range.
+        if (logicalRowCount - rowCount != 1) {
             throw new IllegalStateException(
-                "rollbackTo supports rolling back exactly 1 doc, but asked to roll back " + (docCount - rowCount)
+                "rollbackTo supports rolling back exactly 1 logical row, but asked to roll back "
+                    + (logicalRowCount - rowCount)
             );
         }
-        indexWriter.deleteDocuments(NumericDocValuesField.newSlowExactQuery(DocumentInput.ROW_ID_FIELD, rowCount));
-        docCount = rowCount;
+        int blockSize = lastBlockSize <= 0 ? 1 : lastBlockSize;
+        if (blockSize == 1) {
+            // Flat (or single-doc) row — delete by its __row_id__ exactly as before. The tombstone is
+            // expunged by the reordering/forceMerge in flush(), so the segment ends at maxDoc == docCount.
+            indexWriter.deleteDocuments(NumericDocValuesField.newSlowExactQuery(DocumentInput.ROW_ID_FIELD, rowCount));
+        } else {
+            // Nested block — the rolled-back logical row is the whole trailing block occupying the contiguous
+            // docId range [docCount - blockSize, docCount). Deleting only the root by its __row_id__ would
+            // orphan the child docs (they carry no __row_id__), breaking block-join, so delete every docId in
+            // the block via tryDeleteDocument against a single point-in-time reader. Tombstones are expunged by
+            // the forceMerge in flush(), leaving maxDoc == docCount (post-decrement).
+            long firstDoc = docCount - blockSize;
+            try (DirectoryReader reader = DirectoryReader.open(indexWriter)) {
+                for (long d = firstDoc; d < docCount; d++) {
+                    indexWriter.tryDeleteDocument(reader, (int) d);
+                }
+            }
+        }
+        docCount -= blockSize;
+        logicalRowCount = rowCount;
+        lastBlockSize = 0;
         state = WriterState.RETIRED_FLUSHABLE;
     }
 
@@ -327,12 +407,14 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
                     );
                 }
                 RowIdMapping mapping = flushInput.rowIdMapping();
-                if (mapping.size() != docCount) {
+                // The mapping remaps __row_id__ values, which exist only on root/logical docs — so it is
+                // sized in LOGICAL rows, matching logicalRowCount (== docCount for a flat-only segment).
+                if (mapping.size() != logicalRowCount) {
                     throw new IllegalStateException(
                         "RowIdMapping size ["
                             + mapping.size()
-                            + "] does not match document count ["
-                            + docCount
+                            + "] does not match logical row count ["
+                            + logicalRowCount
                             + "] for writer generation ["
                             + writerGeneration
                             + "]"
@@ -406,11 +488,14 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
                 rewriteSegmentInfoWithSort(segmentInfos, segmentInfo);
             }
 
-            // Build the WriterFileSet pointing to the temp directory
+            // Build the WriterFileSet pointing to the temp directory. numRows is the LOGICAL row count
+            // (== Parquet rows), NOT the physical Lucene doc count — for a nested segment they differ
+            // (docCount counts children + roots), and the cross-format parity checks compare this against
+            // the Parquet primary's logical row count. For a flat-only segment logicalRowCount == docCount.
             WriterFileSet.Builder wfsBuilder = WriterFileSet.builder()
                 .directory(tempDirectory)
                 .writerGeneration(writerGeneration)
-                .addNumRows(docCount);
+                .addNumRows(logicalRowCount);
 
             // Add all files in the segment
             for (String file : directory.listAll()) {
@@ -476,20 +561,20 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
                 );
             }
             int maxDoc = leaf.maxDoc();
+            // Block-aware invariant. Nested documents are written as blocks (children first, root last), so
+            // the old "every docId has __row_id__ == docId" no longer holds: child docs carry only
+            // _nested_path (no __row_id__), and a root sits at docId = blockStart + blockSize - 1. The design
+            // invariant we validate instead: child docs (no __row_id__) are skipped, and ROOT docs (those
+            // WITH __row_id__) must carry sequential row-ids 0,1,2,... in ascending doc order. For a flat
+            // segment every doc is a root, so this reduces exactly to the original per-docId check.
+            long expectedRootRowId = 0;
             for (int docId = 0; docId < maxDoc; docId++) {
-                if (rowIdDV.advanceExact(docId) == false) {
-                    throw new AssertionError(
-                        "Doc ["
-                            + docId
-                            + "] missing "
-                            + LuceneDocumentInput.ROW_ID_FIELD
-                            + " for writer generation ["
-                            + writerGeneration
-                            + "]"
-                    );
+                boolean hasRowId = rowIdDV.advanceExact(docId);
+                if (hasRowId == false) {
+                    continue; // nested child doc — legitimately has no __row_id__ (only roots carry it)
                 }
                 long rowId = rowIdDV.nextValue();
-                if (rowId != docId) {
+                if (rowId != expectedRootRowId) {
                     throw new AssertionError(
                         "Non-sequential "
                             + LuceneDocumentInput.ROW_ID_FIELD
@@ -498,12 +583,13 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
                             + " (got "
                             + rowId
                             + ", expected "
-                            + docId
+                            + expectedRootRowId
                             + ") for writer generation ["
                             + writerGeneration
                             + "]"
                     );
                 }
+                expectedRootRowId++;
             }
             return true;
         } catch (IOException e) {
