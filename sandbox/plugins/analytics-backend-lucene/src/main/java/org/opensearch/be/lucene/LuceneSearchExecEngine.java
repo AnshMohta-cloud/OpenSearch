@@ -21,19 +21,12 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreMode;
-import org.apache.lucene.search.Scorer;
-import org.apache.lucene.search.Weight;
-import org.apache.lucene.search.join.BitSetProducer;
-import org.apache.lucene.util.BitSet;
 import org.opensearch.analytics.backend.EngineResultStream;
 import org.opensearch.analytics.backend.SearchExecEngine;
 import org.opensearch.analytics.backend.ShardScanExecutionContext;
@@ -89,34 +82,22 @@ final class LuceneSearchExecEngine implements SearchExecEngine<ShardScanExecutio
         // filter with a parents filter (FieldExistsQuery on the block-join parent field). On a non-nested
         // index there is no parent field, so the query is used unchanged and behaviour is identical.
         // Grep: NESTED count-fastpath.
+        // Count via IndexSearcher.count(), identical to how vanilla OpenSearch counts a nested query
+        // (size:0 search / _count over the block-join): TotalHitCount over the block-join scorer, which
+        // honors liveDocs and needs no bespoke rollup. parentScopedCountQuery scopes the count to logical
+        // parent docs — and for a pure ToParentBlockJoinQuery it returns the bare block-join unwrapped
+        // (fix #2), so the count runs on the single-clause block-join path exactly like vanilla's.
+        Query countQuery = parentScopedCountQuery(state.searcher(), state.filterQuery());
         long countStartNanos = System.nanoTime();
-        long count;
-        String countPath;
-        // Fast path: a pure nested block-join count() counts DISTINCT ROOT docs that have >=1 matching
-        // innermost child. Instead of IndexSearcher.count() — which has no fast Weight.count() for a
-        // ToParentBlockJoinQuery and walks every child block up through each of the N nesting levels via
-        // Scorer/TwoPhaseIterator machinery — we iterate the innermost child postings once and map each
-        // child docId up to its enclosing root in O(1) via the cached parentDocIds array (the same
-        // segment-lifetime cache RowIdTranslator builds). O(matching children), no per-level roll-up,
-        // independent of how many parents match. Returns -1 when the shape isn't a pure single block-join
-        // (mixed/flat/MatchAll), and we fall back to the exact searcher.count() below. See project_mustang_latency #2.
-        long fast = parentScopedBlockJoinCount(state.searcher(), state.filterQuery());
-        if (fast >= 0) {
-            count = fast;
-            countPath = "parent-bitset-fastpath";
-        } else {
-            Query countQuery = parentScopedCountQuery(state.searcher(), state.filterQuery());
-            count = state.searcher().count(countQuery);
-            countPath = "searcher.count";
-        }
+        long count = state.searcher().count(countQuery);
         long countMs = (System.nanoTime() - countStartNanos) / 1_000_000L;
         LOGGER.info(
-            "[NESTED] lucene-count shardId={} count_ms={} count={} path={} originalQuery={} columns={}",
+            "[NESTED] lucene-count shardId={} count_ms={} count={} originalQuery={} countQuery={} columns={}",
             context.getShardId(),
             countMs,
             count,
-            countPath,
             state.filterQuery(),
+            countQuery,
             state.outputColumnNames()
         );
         BufferAllocator allocator = context.getAllocator();
@@ -187,59 +168,6 @@ final class LuceneSearchExecEngine implements SearchExecEngine<ShardScanExecutio
         return new BooleanQuery.Builder().add(filterQuery, BooleanClause.Occur.MUST)
             .add(parents, BooleanClause.Occur.FILTER)
             .build();
-    }
-
-    /**
-     * Fast parent-scoped count for a PURE nested block-join filter: counts distinct root docs that have
-     * at least one matching innermost child, by iterating the child query's per-leaf scorer once and rolling
-     * each child docId up to its enclosing root via the cached {@code parentDocIds} array. This avoids the
-     * per-level block-join roll-up and the Scorer/TwoPhaseIterator overhead of {@code IndexSearcher.count()}.
-     *
-     * <p>Returns {@code -1} (caller falls back to the exact {@code searcher.count()}) unless the filter is a
-     * single {@link OpenSearchToParentBlockJoinQuery} — the shape a lone nested-equality predicate serializes
-     * to. That shape is a pure existence roll-up with no cross-level correlation (the serializer stacks one
-     * {@code NestedQueryBuilder} per level over a single leaf term), so "distinct roots of matching innermost
-     * children" is exactly the logical-document count. Any other shape (mixed/flat/MatchAll, or a query that
-     * can match child docs directly) is NOT safe here and takes the exact path.
-     *
-     * <p><b>Correctness:</b> the returned value equals {@code searcher.count(bareBlockJoin)} for this shape —
-     * a root is counted once iff its block contains >=1 child matching the innermost child query, regardless
-     * of nesting depth. The child query is scored per leaf (the same child postings the block-join would
-     * traverse) and each match is mapped to its root by binary/forward search into {@code parentDocIds}
-     * (children precede their root and arrive in ascending docId order, so a monotonic cursor is O(1) amortized).
-     */
-    private static long parentScopedBlockJoinCount(IndexSearcher searcher, Query filterQuery) throws IOException {
-        if ((filterQuery instanceof OpenSearchToParentBlockJoinQuery) == false) {
-            return -1L;
-        }
-        // Score only the innermost child query, then roll each matching child straight to its enclosing
-        // root with a single BitSet.nextSetBit — the same primitive Lucene's block-join scorer uses. Because
-        // children precede their root and the root is the block's highest docId, nextSetBit(childDoc) is the
-        // root for a match at ANY nesting depth: no per-level roll-up needed. The parent bitset is the shared
-        // segment-lifetime cache (warmed at refresh); count = distinct roots with >=1 matching child.
-        Query childQuery = ((OpenSearchToParentBlockJoinQuery) filterQuery).getChildQuery();
-        Weight childWeight = searcher.createWeight(searcher.rewrite(childQuery), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
-        BitSetProducer rootParents = new CachingParentBitSetProducer(
-            new FieldExistsQuery(org.opensearch.index.mapper.SeqNoFieldMapper.PRIMARY_TERM_NAME)
-        );
-        long total = 0;
-        for (LeafReaderContext leaf : searcher.getIndexReader().leaves()) {
-            BitSet parents = rootParents.getBitSet(leaf);
-            Scorer scorer = childWeight.scorer(leaf);
-            if (parents == null || scorer == null) {
-                continue; // no roots or no matches in this leaf
-            }
-            DocIdSetIterator it = scorer.iterator();
-            int lastRoot = -1;
-            for (int childDoc = it.nextDoc(); childDoc != DocIdSetIterator.NO_MORE_DOCS; childDoc = it.nextDoc()) {
-                int root = parents.nextSetBit(childDoc); // child -> enclosing root, one lookup, any depth
-                if (root != DocIdSetIterator.NO_MORE_DOCS && root != lastRoot) {
-                    total++;
-                    lastRoot = root;
-                }
-            }
-        }
-        return total;
     }
 
     private static Schema buildSchema(List<String> columnNames) {
