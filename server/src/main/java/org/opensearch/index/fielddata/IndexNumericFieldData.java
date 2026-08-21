@@ -248,6 +248,14 @@ public abstract class IndexNumericFieldData implements IndexFieldData<LeafNumeri
         if (targetNumericType != getNumericType()) {
             source.disableSkipping(); // disable skipping logic for cast of sort field
         }
+        if (nested != null) {
+            // Nested sort compares values in ROOT-docId space (each root's selected child value), but a
+            // DocValuesSkipper is built in CHILD-docId space, so pruning with it skips the wrong docs.
+            // Lucene's NumericComparator requires Pruning.NONE whenever getNumericDocValues is overridden
+            // (as it is for nested). Scalar sort reads the raw field doc values in the skipper's own space,
+            // so it stays enabled — only nested is disabled.
+            source.disableSkipping();
+        }
         return source;
     }
 

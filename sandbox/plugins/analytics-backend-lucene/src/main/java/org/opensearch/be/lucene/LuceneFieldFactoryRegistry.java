@@ -10,7 +10,7 @@ package org.opensearch.be.lucene;
 
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.SortedNumericDocValuesField;
+import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.util.BytesRef;
@@ -87,7 +87,15 @@ public final class LuceneFieldFactoryRegistry {
     private void registerMetaFields() {
         register(IdFieldMapper.CONTENT_TYPE, ID_FIELD_FACTORY);
         register(SeqNoFieldMapper.CONTENT_TYPE, SEQ_NO_FIELD_FACTORY);
-        register(SeqNoFieldMapper.PRIMARY_TERM_NAME, (d, ft, v, lft) -> d.add(new SortedNumericDocValuesField(ft.name(), (long) v)));
+        // _primary_term must be NUMERIC (single-valued) doc values — matching vanilla
+        // SeqNoFieldMapper.emptySeqID() — because every reader accesses it via
+        // getNumericDocValues(_primary_term) and the nested parent filter is
+        // Queries.newNonNestedFilter() == FieldExistsQuery(_primary_term), which expects
+        // DocValuesType.NUMERIC. A SortedNumericDocValuesField here is a DV-type mismatch:
+        // getNumericDocValues returns null (CombinedDocValues even throws), and the parent
+        // BitSet comes back empty, blocking reuse of the vanilla cached parent bitset for
+        // nested block-join. No reader consumes _primary_term as sorted-numeric.
+        register(SeqNoFieldMapper.PRIMARY_TERM_NAME, (d, ft, v, lft) -> d.add(new NumericDocValuesField(ft.name(), (long) v)));
         register(SourceFieldMapper.CONTENT_TYPE, (d, ft, v, lft) -> d.add(new Field(ft.name(), (BytesRef) v, lft)));
         // pending routing and ignored field handling
     }

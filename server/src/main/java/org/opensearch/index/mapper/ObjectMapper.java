@@ -33,7 +33,9 @@
 package org.opensearch.index.mapper;
 
 import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.util.BitSet;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -1087,24 +1089,142 @@ public class ObjectMapper extends Mapper implements Cloneable {
 
     @Override
     public void canDeriveSource() {
+        // Entry points without composite context apply the strict (vanilla) rule: a nested object cannot
+        // derive its source. The composite path calls the overload below with the pluggable flag set.
+        canDeriveSource(false);
+    }
+
+    /**
+     * Validates that this object's source can be derived, given whether the enclosing index uses the
+     * pluggable (composite) data format (Parquet primary + Lucene secondary).
+     *
+     * <p>A nested object can only derive its source on the composite path, where the composite leaf reader
+     * implements {@link DerivedSourceNestedNavigator} and rebuilds the nested arrays from the columnar
+     * LIST&lt;STRUCT&gt; data. On a vanilla index the child values live in separate Lucene block docs rather
+     * than at the root doc, so derived source cannot reconstruct them; nested is rejected there, matching
+     * upstream behavior. The per-child validation still runs to catch unsupported leaf types.
+     *
+     * @param pluggableDataFormatEnabled {@code true} when the index uses the pluggable (composite) data format
+     */
+    public void canDeriveSource(boolean pluggableDataFormatEnabled) {
         if (this.enabled.value() == false) {
             throw new UnsupportedOperationException("Derived source is not supported for " + name() + " field as it is disabled");
         }
-        // Nested object mappers are permitted under derived-source mode: the composite (pluggable)
-        // data format derives nested source from the Parquet LIST<STRUCT> columns, not from Lucene
-        // stored fields. The per-child-field validation below still runs to catch unsupported leaf
-        // types within the nested object.
+        if (this.nested.isNested() && pluggableDataFormatEnabled == false) {
+            throw new UnsupportedOperationException("Derived source is not supported for " + name() + " field as it is nested");
+        }
         for (final Mapper mapper : this.mappers.values()) {
-            mapper.canDeriveSource();
+            if (mapper instanceof ObjectMapper objectMapper) {
+                objectMapper.canDeriveSource(pluggableDataFormatEnabled);
+            } else {
+                mapper.canDeriveSource();
+            }
         }
     }
 
     @Override
     public void deriveSource(XContentBuilder builder, LeafReader leafReader, int docId) throws IOException {
+        // Composite (columnar-backed) path: a nested object is stored as a LIST<STRUCT> column plus a
+        // Lucene block of {children..., ROOT}. Rebuild it as a JSON array of element objects by walking
+        // the block via the reader's parent/child bitsets. This override is only entered for a nested
+        // object whose enclosing parent is the ROOT — top-level, or reached through plain sub-objects,
+        // which do not shift block boundaries; nested-under-nested is handled by emitNestedArray, which
+        // threads the correct element boundary. Vanilla readers don't implement the navigator, so their
+        // behavior (below) is unchanged.
+        if (nested.isNested() && leafReader instanceof DerivedSourceNestedNavigator navigator) {
+            int lowerBound = docId == 0 ? -1 : navigator.parentDocs().prevSetBit(docId - 1);
+            emitNestedArray(builder, navigator, leafReader, lowerBound, docId);
+            return;
+        }
         builder.startObject(simpleName());
         for (final Mapper mapper : this.mappers.values()) {
             mapper.deriveSource(builder, leafReader, docId);
         }
         builder.endObject();
+    }
+
+    /**
+     * Emits this nested object as a JSON array {@code "simpleName": [ {..}, {..} ]}. Elements are the
+     * child docs of this object's {@code _nested_path} that fall in {@code (lowerBound, upperBound)} —
+     * i.e. the children of the single enclosing parent element whose doc is {@code upperBound} and whose
+     * previous-sibling / parent boundary is {@code lowerBound}. Depth-independent: the boundary
+     * arithmetic is identical at any nesting level; only the path's child bitset differs.
+     *
+     * <p>If the enclosing parent has no children of this path, the field is omitted, mirroring the
+     * flat-field "omit on empty" behavior of {@link FieldValueFetcher#write}.
+     */
+    private void emitNestedArray(
+        XContentBuilder builder,
+        DerivedSourceNestedNavigator navigator,
+        LeafReader leafReader,
+        int lowerBound,
+        int upperBound
+    ) throws IOException {
+        BitSet childBits = navigator.childDocs(nestedTypeFilter());
+        int first = nextChildInRange(childBits, lowerBound + 1, upperBound);
+        if (first == DocIdSetIterator.NO_MORE_DOCS) {
+            return;
+        }
+        builder.startArray(simpleName());
+        int previousBoundary = lowerBound;
+        for (int child = first; child != DocIdSetIterator.NO_MORE_DOCS; child = nextChildInRange(childBits, child + 1, upperBound)) {
+            builder.startObject();
+            emitElementContents(builder, navigator, leafReader, child, previousBoundary);
+            builder.endObject();
+            previousBoundary = child;
+        }
+        builder.endArray();
+    }
+
+    /**
+     * Next set bit of {@code childBits} in the half-open range {@code [start, upperBound)}, or
+     * {@link DocIdSetIterator#NO_MORE_DOCS} when {@code start >= upperBound}.
+     *
+     * <p>Guards the precondition of Lucene's {@link BitSet#nextSetBit(int, int)}: its
+     * {@code nextSetBitInRange} asserts {@code start < upperBound} (and, with assertions disabled, would
+     * scan out of range) even though the answer for {@code start >= upperBound} is unambiguously "no more
+     * bits". A nested element's children are the set bits strictly inside {@code (lowerBound, upperBound)}
+     * where {@code upperBound} is the element's OWN doc (blocks are laid out {@code children..., ROOT}, so
+     * the element never carries this path's child bit). The scan cursor therefore legitimately reaches
+     * {@code upperBound} whenever the last child is adjacent to its parent (e.g. the final component right
+     * before its part) — clamp that to NO_MORE_DOCS instead of tripping the assertion.
+     */
+    private static int nextChildInRange(BitSet childBits, int start, int upperBound) {
+        return start < upperBound ? childBits.nextSetBit(start, upperBound) : DocIdSetIterator.NO_MORE_DOCS;
+    }
+
+    /**
+     * Emits the body of ONE nested element (the object between {@code startObject}/{@code endObject})
+     * located at Lucene doc {@code elementDocId}, whose block lower boundary (previous sibling or parent
+     * boundary) is {@code lowerBound}.
+     *
+     * <ul>
+     *   <li>A leaf field is read at {@code elementDocId}; the composite reader's nested doc-values
+     *       iterator resolves the element's {@code (row, offset)} from that docId and formats the value
+     *       through the field's own mapper — identical fidelity to a scalar derived field.</li>
+     *   <li>A deeper nested object recurses via {@link #emitNestedArray}, bounded by
+     *       {@code (lowerBound, elementDocId)} so it sees only THIS element's descendants.</li>
+     *   <li>A plain (non-nested) sub-object is emitted inline and its contents recurse with the SAME
+     *       boundary — plain objects don't create block boundaries.</li>
+     * </ul>
+     */
+    private void emitElementContents(
+        XContentBuilder builder,
+        DerivedSourceNestedNavigator navigator,
+        LeafReader leafReader,
+        int elementDocId,
+        int lowerBound
+    ) throws IOException {
+        for (final Mapper mapper : this.mappers.values()) {
+            if (mapper instanceof ObjectMapper objectMapper && objectMapper.nested().isNested()) {
+                objectMapper.emitNestedArray(builder, navigator, leafReader, lowerBound, elementDocId);
+            } else if (mapper instanceof ObjectMapper objectMapper) {
+                builder.startObject(objectMapper.simpleName());
+                objectMapper.emitElementContents(builder, navigator, leafReader, elementDocId, lowerBound);
+                builder.endObject();
+            } else {
+                mapper.deriveSource(builder, leafReader, elementDocId);
+            }
+        }
     }
 }

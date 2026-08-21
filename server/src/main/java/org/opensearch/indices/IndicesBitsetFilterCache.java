@@ -128,9 +128,29 @@ public class IndicesBitsetFilterCache
         final Weight weight = searcher.createWeight(searcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1f);
         Scorer s = weight.scorer(context);
         if (s == null) {
+            // [DSL-TRACE] parent-bitset build returned NO scorer -> empty bitset for this query on this leaf.
+            // For newNonNestedFilter()==FieldExistsQuery(_primary_term) this means the field is ABSENT or the
+            // wrong doc-values type (e.g. SORTED_NUMERIC when NUMERIC is expected) -> parent bitset broken.
+            org.apache.logging.log4j.LogManager.getLogger(IndicesBitsetFilterCache.class).info(
+                "[DSL-TRACE] parentBitset: query={} maxDoc={} -> scorer=NULL (bitset EMPTY)",
+                query, context.reader().maxDoc());
             return null;
         } else {
-            return BitSet.of(s.iterator(), context.reader().maxDoc());
+            BitSet bs = BitSet.of(s.iterator(), context.reader().maxDoc());
+            // [DSL-TRACE] Report the built bitset: cardinality = number of docs matched (for the parent filter
+            // this must equal the number of PARENT/root docs), and the first set doc ids so we can eyeball
+            // that they are the roots (root is LAST in each block: child,child,ROOT).
+            int card = bs.cardinality();
+            StringBuilder firstIds = new StringBuilder();
+            int shown = 0;
+            for (int d = bs.nextSetBit(0); d != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS
+                && shown < 40; d = (d + 1 >= bs.length() ? org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS : bs.nextSetBit(d + 1)), shown++) {
+                firstIds.append(d).append(',');
+            }
+            org.apache.logging.log4j.LogManager.getLogger(IndicesBitsetFilterCache.class).info(
+                "[DSL-TRACE] parentBitset: query={} maxDoc={} cardinality={} bitsetId={} setDocIds=[{}{}]",
+                query, context.reader().maxDoc(), card, System.identityHashCode(bs), firstIds, card > 40 ? "..." : "");
+            return bs;
         }
     }
 

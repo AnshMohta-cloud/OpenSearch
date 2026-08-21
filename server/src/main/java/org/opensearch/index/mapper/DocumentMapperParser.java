@@ -206,8 +206,12 @@ public class DocumentMapperParser {
         checkNoRemainingFields(mapping, parserContext.indexVersionCreated(), "Root mapping definition has unsupported parameters: ");
 
         final DocumentMapper documentMapper = docBuilder.build(mapperService);
-        if (mapperService.getIndexSettings().isDerivedSourceEnabled()) {
-            documentMapper.root().canDeriveSource();
+        final IndexSettings indexSettings = mapperService.getIndexSettings();
+        if (indexSettings.isDerivedSourceEnabled()) {
+            // A nested object can only derive its source on the pluggable (composite) data format, where the
+            // composite leaf reader rebuilds it from the columnar data; on a vanilla index derived source does
+            // not support nested. Pass that context so the check allowlists composite indices only.
+            documentMapper.root().canDeriveSource(indexSettings.isPluggableDataFormatEnabled());
         }
         return documentMapper;
     }

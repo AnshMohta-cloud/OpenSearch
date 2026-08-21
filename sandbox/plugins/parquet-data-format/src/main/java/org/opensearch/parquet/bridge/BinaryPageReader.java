@@ -24,6 +24,18 @@ public interface BinaryPageReader {
     /** Reads all binary values for one repeated row. */
     byte[][] readRepeatedBytesAtRow(long row) throws IOException;
 
+    /**
+     * Views the single binary element at position {@code offset} within {@code row}'s repeated list as a
+     * zero-copy {@link org.apache.lucene.util.BytesRef} into the resident decoded page — O(1), no per-row
+     * {@code byte[][]} allocation. Used by the nested keyword iterator, which needs exactly one element
+     * (the child's) per doc.
+     *
+     * @param dst a reused {@code BytesRef} to point at the element's bytes (bytes/offset/length set on hit)
+     * @return the number of elements in {@code row}'s list (so callers can bounds-check {@code offset});
+     *         {@code dst} is updated only when {@code 0 <= offset < returned count}
+     */
+    int readRepeatedBytesAt(long row, int offset, org.apache.lucene.util.BytesRef dst) throws IOException;
+
     /** Reads one value using the resident batch, returning {@code null} when absent. */
     default byte[] readBytesAtRow(long row) throws IOException {
         PageCache page = cache();

@@ -507,6 +507,16 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
         public Query termQuery(Object value, QueryShardContext context) {
             failIfNotIndexedAndNoDocValues();
             checkToDisableCaching(context);
+            // [DSL-TRACE] STAGE 2 (keyword) — ROUTING. Depth-INDEPENDENT: this is the leaf field-type's own
+            // decision, identical whether name() is a top-level keyword or a deeply-nested child leaf like
+            // a.b.c.author. isSearchable=true -> Lucene inverted-index term match (ConstantScore(TermQuery),
+            // served by Lucene postings incl. the child docs of a nested block); isSearchable=false ->
+            // doc-values-only (SortedSet range, read from the Parquet ordinals column). name() shows the
+            // full dotted path so we can confirm routing holds at every depth.
+            org.apache.logging.log4j.LogManager.getLogger(KeywordFieldMapper.class).info(
+                "[DSL-TRACE] termQuery KEYWORD field='{}' isSearchable={} hasDocValues={} -> {}",
+                name(), isSearchable(), hasDocValues(),
+                isSearchable() ? "LUCENE postings (ConstantScore TermQuery)" : "DOC-VALUES-ONLY (reads Parquet ordinals)");
             if (isSearchable()) {
                 Query query = super.termQuery(value, context);
                 if (!this.useSimilarity) {

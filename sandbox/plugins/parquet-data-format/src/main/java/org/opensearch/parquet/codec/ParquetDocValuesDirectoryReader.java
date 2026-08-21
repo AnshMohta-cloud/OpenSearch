@@ -11,6 +11,7 @@ package org.opensearch.parquet.codec;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FilterDirectoryReader;
 import org.apache.lucene.index.LeafReader;
+import org.opensearch.index.cache.bitset.BitsetFilterCache;
 import org.opensearch.index.mapper.MapperService;
 
 import java.io.IOException;
@@ -34,23 +35,27 @@ public final class ParquetDocValuesDirectoryReader extends FilterDirectoryReader
     // Dedicated stats channel, NOT the class-named logger, so the per-query summary can be toggled
     // in isolation (logger.org.opensearch.parquet.stats.query=TRACE) without turning on any other
     private final MapperService mapperService;
+    private final BitsetFilterCache bitsetFilterCache;
 
-    private ParquetDocValuesDirectoryReader(DirectoryReader in, MapperService mapperService) throws IOException {
-        super(in, new ParquetSubReaderWrapper(mapperService));
+    private ParquetDocValuesDirectoryReader(DirectoryReader in, MapperService mapperService, BitsetFilterCache bitsetFilterCache)
+        throws IOException {
+        super(in, new ParquetSubReaderWrapper(mapperService, bitsetFilterCache));
         this.mapperService = mapperService;
+        this.bitsetFilterCache = bitsetFilterCache;
     }
 
     /**
      * Wraps {@code in} so Parquet-resident doc values become visible to Lucene query/aggregation
      * code paths.
      */
-    public static DirectoryReader wrap(DirectoryReader in, MapperService mapperService) throws IOException {
-        return new ParquetDocValuesDirectoryReader(in, mapperService);
+    public static DirectoryReader wrap(DirectoryReader in, MapperService mapperService, BitsetFilterCache bitsetFilterCache)
+        throws IOException {
+        return new ParquetDocValuesDirectoryReader(in, mapperService, bitsetFilterCache);
     }
 
     @Override
     protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
-        return new ParquetDocValuesDirectoryReader(in, mapperService);
+        return new ParquetDocValuesDirectoryReader(in, mapperService, bitsetFilterCache);
     }
 
     @Override
@@ -92,15 +97,17 @@ public final class ParquetDocValuesDirectoryReader extends FilterDirectoryReader
     /** Per-leaf wrapper that swaps in {@link ParquetDocValuesLeafReader} when applicable. */
     private static final class ParquetSubReaderWrapper extends SubReaderWrapper {
         private final MapperService mapperService;
+        private final BitsetFilterCache bitsetFilterCache;
 
-        private ParquetSubReaderWrapper(MapperService mapperService) {
+        private ParquetSubReaderWrapper(MapperService mapperService, BitsetFilterCache bitsetFilterCache) {
             this.mapperService = mapperService;
+            this.bitsetFilterCache = bitsetFilterCache;
         }
 
         @Override
         public LeafReader wrap(LeafReader reader) {
             try {
-                return ParquetDocValuesLeafReader.wrapIfApplicable(reader, mapperService);
+                return ParquetDocValuesLeafReader.wrapIfApplicable(reader, mapperService, bitsetFilterCache);
             } catch (IOException e) {
                 // SubReaderWrapper.wrap cannot throw checked exceptions; surface as unchecked so
                 // the search fails loudly rather than silently dropping Parquet doc values.

@@ -36,6 +36,10 @@ import java.util.Arrays;
  */
 public final class DataFusionColumnReader implements Closeable, NumericPageReader, BinaryPageReader {
 
+    private static final org.apache.logging.log4j.Logger DSL_LOG = org.apache.logging.log4j.LogManager.getLogger(
+        DataFusionColumnReader.class
+    );
+
     private static final long CLOSED_HANDLE = -1L;
 
     /**
@@ -188,6 +192,16 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
     @Override
     public void loadPageContaining(long row) throws IOException {
         ensureOpen();
+        // [DSL-TRACE] PAGE MISS on column '{}' at row {} -> crossing FFM into Rust/DataFusion to DECODE a
+        // Parquet page batch. This is the actual Parquet byte read (the "direct parquet read"). Note it is
+        // a single-column, forward cursor decode — NOT a DataFusion query plan (no predicate/agg pushdown).
+        DSL_LOG.info(
+            "[DSL-TRACE] loadPageContaining column='{}' row={} repeated={} type={} -> decode Parquet page (FFM->Rust)",
+            column,
+            row,
+            repeated,
+            type
+        );
         PageCache current = cache;
         if (current != null && row < current.firstRow) {
             reopen();
@@ -435,6 +449,26 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
     }
 
     @Override
+    public int readRepeatedLongAt(long row, int offset, long[] out) throws IOException {
+        if (repeated == false || type.isPrimitive() == false) {
+            throw new IOException("Column " + column + " is not a repeated primitive");
+        }
+        PageCache page = pageFor(row);
+        int relativeRow = Math.toIntExact(row - page.firstRow);
+        int start = page.listOffsets[relativeRow];
+        int count = page.listOffsets[relativeRow + 1] - start;
+        // O(1): index the single element directly in the resident decoded page. listOffsets are ELEMENT
+        // indices into page.values, so the child's value is at element (start + offset). Use elementAt() —
+        // an absolute element index — NOT valueAt(), which subtracts firstRow for single-valued row lookups
+        // and would underflow to a negative index on any batch past the first (firstRow > 0). Matches the
+        // element-indexed bulk readRepeatedLongsAtRow path. No per-row copy.
+        if (offset >= 0 && offset < count) {
+            out[0] = page.elementAt(start + offset);
+        }
+        return count;
+    }
+
+    @Override
     public byte[][] readRepeatedBytesAtRow(long row) throws IOException {
         if (repeated == false || type.isPrimitive()) {
             throw new IOException("Column " + column + " is not repeated binary");
@@ -450,6 +484,28 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
             values[element - firstElement] = Arrays.copyOfRange(page.byteBuf, start, end);
         }
         return values;
+    }
+
+    @Override
+    public int readRepeatedBytesAt(long row, int offset, org.apache.lucene.util.BytesRef dst) throws IOException {
+        if (repeated == false || type.isPrimitive()) {
+            throw new IOException("Column " + column + " is not repeated binary");
+        }
+        PageCache page = pageFor(row);
+        int relativeRow = Math.toIntExact(row - page.firstRow);
+        int firstElement = page.listOffsets[relativeRow];
+        int count = page.listOffsets[relativeRow + 1] - firstElement;
+        // O(1), zero-copy: point BytesRef straight at the element's slice of the resident byteBuf. byteOffsets
+        // are per-ELEMENT (CSR) into byteBuf, so element (firstElement + offset) is the child's value. No
+        // byte[][] allocation — the whole point vs readRepeatedBytesAtRow.
+        if (offset >= 0 && offset < count) {
+            int element = firstElement + offset;
+            int start = page.byteOffsets[element];
+            dst.bytes = page.byteBuf;
+            dst.offset = start;
+            dst.length = page.byteOffsets[element + 1] - start;
+        }
+        return count;
     }
 
     /** The resident batch containing {@code row}, loading (and reopening if backward) on a miss. */

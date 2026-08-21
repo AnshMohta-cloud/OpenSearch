@@ -27,6 +27,9 @@ import org.opensearch.parquet.bridge.DataFusionColumnReader;
 import org.opensearch.parquet.bridge.ParquetFileMetadata;
 import org.opensearch.parquet.bridge.RustBridge;
 import org.opensearch.parquet.codec.cache.BufferPool;
+import org.opensearch.parquet.codec.iter.NestedParquetBinaryDocValues;
+import org.opensearch.parquet.codec.iter.NestedParquetNumericDocValues;
+import org.opensearch.parquet.codec.iter.NestedParquetSortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetBinaryDocValues;
 import org.opensearch.parquet.codec.iter.ParquetNumericDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
@@ -174,7 +177,16 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
 
         ParquetFileMetadata metadata = RustBridge.getFileMetadata(parquetFile.toString());
         this.parquetRowCount = metadata.numRows();
-        if (parquetRowCount != maxDoc) {
+        // Identity invariant (flat segments): one Lucene doc per Parquet row, so docId == row and the
+        // scalar DocValues iterators address rows by docId directly. A NESTED segment breaks this on
+        // purpose — one logical document is a block of {children..., ROOT} Lucene docs but a single
+        // Parquet row (nested leaves are LIST columns), so maxDoc > numRows. That case is valid: nested
+        // leaf reads go through NestedElementResolver (docId -> row via __row_id__ on the root, + element
+        // offset), never docId-as-row. So only enforce the identity when the mapping has NO nested objects.
+        boolean nestedMapping = mapperService != null
+            && mapperService.documentMapper() != null
+            && mapperService.documentMapper().hasNestedObjects();
+        if (parquetRowCount != maxDoc && nestedMapping == false) {
             throw new IllegalStateException(
                 String.format(
                     Locale.ROOT,
@@ -196,6 +208,15 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     public NumericDocValues getNumeric(FieldInfo field) throws IOException {
         ensureOpen();
         validate(field, DocValuesType.NUMERIC);
+        // [DSL-TRACE] A numeric field (e.g. price/views range filter, avg(price) agg, sort price) is being
+        // read from Parquet AS Lucene NumericDocValues. This is the seam: numeric columns live ONLY in
+        // Parquet on a composite index; OpenSearch reads them through this producer, one column at a time.
+        logger.info(
+            "[DSL-TRACE] getNumeric field='{}' -> opening Parquet column cursor (maxDoc={}, parquetRows={})",
+            field.getName(),
+            maxDoc,
+            parquetRowCount
+        );
         return new ParquetNumericDocValues(dataFusionReaderFor(field, false), maxDoc);
     }
 
@@ -204,6 +225,69 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         ensureOpen();
         validate(field, DocValuesType.SORTED_NUMERIC);
         return new ParquetSortedNumericDocValues(dataFusionReaderFor(field, true), maxDoc);
+    }
+
+    /**
+     * Numeric doc values for a NESTED leaf, addressed in Lucene child-docId space. The leaf is a repeated
+     * (LIST) Parquet column; {@code resolver} maps each child docId to its {@code (row, element-offset)} and
+     * the returned iterator reads that single element. Depth-independent (the native reader flattens any
+     * depth to one value per child). Callers pass a resolver bound to this field's nested path.
+     *
+     * <p>{@code physicalColumn} is the Parquet physical leaf path (with the synthetic {@code list.element}
+     * group levels, e.g. {@code orders.list.element.total}); the OpenSearch dotted field name does not match
+     * a nested leaf column in the file, so the caller supplies the physical path (see the leaf reader).
+     */
+    public NumericDocValues getNestedNumeric(FieldInfo field, String physicalColumn, NestedElementResolver resolver) throws IOException {
+        ensureOpen();
+        validate(field, DocValuesType.NUMERIC);
+        logger.info(
+            "[DSL-TRACE] getNestedNumeric field='{}' physical='{}' -> opening repeated Parquet column cursor "
+                + "(maxDoc={}, parquetRows={})",
+            field.getName(),
+            physicalColumn,
+            maxDoc,
+            parquetRowCount
+        );
+        // Numeric leaf: share the cached column reader (keyed by physical path), same as the flat numeric path.
+        return new NestedParquetNumericDocValues(dataFusionReaderFor(field, physicalColumn, true), resolver, maxDoc, field.getName());
+    }
+
+    /**
+     * Sorted (keyword) doc values for a NESTED leaf, addressed in Lucene child-docId space. Mirrors
+     * {@link #getNestedNumeric} for byte values via the repeated binary reader.
+     */
+    public SortedDocValues getNestedSorted(FieldInfo field, String physicalColumn, NestedElementResolver resolver) throws IOException {
+        ensureOpen();
+        validate(field, DocValuesType.SORTED);
+        logger.info(
+            "[DSL-TRACE] getNestedSorted field='{}' physical='{}' -> opening repeated Parquet ordinals cursor "
+                + "(maxDoc={}, parquetRows={})",
+            field.getName(),
+            physicalColumn,
+            maxDoc,
+            parquetRowCount
+        );
+        // Keyword leaf: dedicated cursor (keyed by physical path), same policy as the flat sorted path.
+        return new NestedParquetSortedDocValues(binaryReaderFor(field, physicalColumn, true), resolver, maxDoc);
+    }
+
+    /**
+     * Binary doc values for a NESTED leaf (opaque {@code BYTE_ARRAY}, no ordinals), addressed in Lucene
+     * child-docId space. Mirrors {@link #getNestedSorted} but returns raw bytes verbatim via the repeated
+     * binary reader; {@code resolver} maps each child docId to its {@code (row, offset)} element.
+     */
+    public BinaryDocValues getNestedBinary(FieldInfo field, String physicalColumn, NestedElementResolver resolver) throws IOException {
+        ensureOpen();
+        validate(field, DocValuesType.BINARY);
+        logger.info(
+            "[DSL-TRACE] getNestedBinary field='{}' physical='{}' -> opening repeated Parquet binary cursor "
+                + "(maxDoc={}, parquetRows={})",
+            field.getName(),
+            physicalColumn,
+            maxDoc,
+            parquetRowCount
+        );
+        return new NestedParquetBinaryDocValues(binaryReaderFor(field, physicalColumn, true), resolver, maxDoc);
     }
 
     @Override
@@ -217,6 +301,15 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     public SortedDocValues getSorted(FieldInfo field) throws IOException {
         ensureOpen();
         validate(field, DocValuesType.SORTED);
+        // [DSL-TRACE] A keyword field (e.g. category, used by terms() agg bucketing) is being read from
+        // Parquet AS Lucene SortedDocValues (ordinals). Keyword lives in BOTH: inverted index in Lucene
+        // (for term match) + ordinals column in Parquet (for aggs/sort) — this is the Parquet-ordinals read.
+        logger.info(
+            "[DSL-TRACE] getSorted field='{}' -> opening Parquet ordinals cursor (maxDoc={}, parquetRows={})",
+            field.getName(),
+            maxDoc,
+            parquetRowCount
+        );
         return new ParquetSortedDocValues(binaryReaderFor(field, false), maxDoc);
     }
 
@@ -253,6 +346,35 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
             return null;
         }
         return new ParquetDocValuesSkipper(dataFusionReaderFor(field, false).pageIndex(), maxDoc);
+    }
+
+    /**
+     * Page index of a NESTED leaf's repeated Parquet column (the {@code list.element} physical path),
+     * from the shared cached column reader. The leaf reader uses it to build the block-join docId tiling
+     * ({@code firstDocIdOf}) that {@link #getNestedSkipper} needs, and to size the skipper. Shares the same
+     * cached reader (keyed by physical path) that {@link #getNestedNumeric} opens, so no extra file handle.
+     */
+    public org.opensearch.parquet.codec.cache.ColumnPageIndex repeatedPageIndex(FieldInfo field, String physicalColumn) throws IOException {
+        ensureOpen();
+        return dataFusionReaderFor(field, physicalColumn, true).pageIndex();
+    }
+
+    /**
+     * A {@link DocValuesSkipper} for a NESTED numeric leaf, addressed in Lucene child-docId space. Uses the
+     * same per-page value min/max as the flat {@link #getSkipper}, but maps each page to a doc-ID interval
+     * via {@code firstDocIdOf} (block-join tiling) instead of assuming docId == row, and reports no per-page
+     * density so Lucene always applies an inner per-doc check (see {@link ParquetDocValuesSkipper}).
+     *
+     * <p>Integer-shaped columns only (INT32/INT64/BOOL), matching {@link #getSkipper}'s gate; returns
+     * {@code null} for other physical types (their raw-bits order is not numeric order).
+     */
+    public DocValuesSkipper getNestedSkipper(FieldInfo field, String physicalColumn, int[] firstDocIdOf) throws IOException {
+        ensureOpen();
+        ParquetPhysicalType phys = physicalType(field);
+        if (phys != ParquetPhysicalType.INT32 && phys != ParquetPhysicalType.INT64 && phys != ParquetPhysicalType.BOOL) {
+            return null;
+        }
+        return new ParquetDocValuesSkipper(dataFusionReaderFor(field, physicalColumn, true).pageIndex(), maxDoc, firstDocIdOf);
     }
 
     /**
@@ -371,12 +493,20 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         return nonNull;
     }
 
-    private synchronized BinaryPageReader binaryReaderFor(FieldInfo field, boolean repeated) throws IOException {
-        // Sorted iterators need instance-scoped cursors (shared producers are accessed
-        // concurrently), so each gets a dedicated reader with instance-unique pool slots.
+    private BinaryPageReader binaryReaderFor(FieldInfo field, boolean repeated) throws IOException {
+        return binaryReaderFor(field, field.getName(), repeated);
+    }
+
+    /**
+     * A dedicated (non-shared) binary reader for one streaming iterator, opened on {@code column} (the
+     * Parquet physical path — equal to the field name for flat fields, the {@code list.element} path for
+     * nested leaves). Dedicated because sorted iterators need instance-scoped cursors (see the class-level
+     * note): concurrent segment-search slices would ping-pong a shared forward cursor's PageCache.
+     */
+    private synchronized BinaryPageReader binaryReaderFor(FieldInfo field, String column, boolean repeated) throws IOException {
         DataFusionColumnReader reader = DataFusionColumnReader.open(
             parquetFile,
-            field.getName(),
+            column,
             physicalType(field),
             repeated,
             bufferPool,
@@ -386,18 +516,27 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         return reader;
     }
 
-    private synchronized DataFusionColumnReader dataFusionReaderFor(FieldInfo field, boolean repeated) throws IOException {
-        DataFusionColumnReader reader = dataFusionColumnReaders.get(field.getName());
+    private DataFusionColumnReader dataFusionReaderFor(FieldInfo field, boolean repeated) throws IOException {
+        return dataFusionReaderFor(field, field.getName(), repeated);
+    }
+
+    /**
+     * A shared (cached) column reader keyed by the Parquet physical {@code column} path — equal to the field
+     * name for flat fields, the {@code list.element} path for nested leaves. Sharing lets multiple accessors
+     * of the same column reuse one decode cursor + PageCache.
+     */
+    private synchronized DataFusionColumnReader dataFusionReaderFor(FieldInfo field, String column, boolean repeated) throws IOException {
+        DataFusionColumnReader reader = dataFusionColumnReaders.get(column);
         if (reader == null) {
             reader = DataFusionColumnReader.open(
                 parquetFile,
-                field.getName(),
+                column,
                 physicalType(field),
                 repeated,
                 bufferPool,
                 dataFusionInitialBatchSize
             );
-            dataFusionColumnReaders.put(field.getName(), reader);
+            dataFusionColumnReaders.put(column, reader);
         }
         return reader;
     }

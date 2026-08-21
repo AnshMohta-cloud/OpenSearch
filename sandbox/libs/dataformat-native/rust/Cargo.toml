@@ -118,24 +118,27 @@ parquet = { git = "https://github.com/bharath-techie/arrow-rs.git", rev = "38b2f
 parquet-variant = { git = "https://github.com/bharath-techie/arrow-rs.git", rev = "38b2f7a6a7f58d0dde9f932be1497444f7646a4c" }
 parquet-variant-compute = { git = "https://github.com/bharath-techie/arrow-rs.git", rev = "38b2f7a6a7f58d0dde9f932be1497444f7646a4c" }
 parquet-variant-json = { git = "https://github.com/bharath-techie/arrow-rs.git", rev = "38b2f7a6a7f58d0dde9f932be1497444f7646a4c" }
-datafusion-common = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-common-runtime = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-datasource = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-datasource-parquet = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-doc = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-execution = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-expr = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-expr-common = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-functions = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-functions-aggregate-common = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-functions-window-common = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-macros = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-physical-expr = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-physical-expr-adapter = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-physical-expr-common = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-physical-plan = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-pruning = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
-datafusion-session = { git = "https://github.com/bharath-techie/datafusion.git", rev = "376902b53a502b19cd0cf5e4e72e4f705ce5d5cd" }
+# TEMP-LOCAL: datafusion pinned to a LOCAL clone of bharath's fork carrying the
+# record-aligned per-page fix for repeated leaves (projected_pages), on top of
+# bharath rev 376902b. Repoint to the pushed "our repo" commit before sharing.
+datafusion-common = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-common-runtime = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-datasource = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-datasource-parquet = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-doc = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-execution = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-expr = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-expr-common = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-functions = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-functions-aggregate-common = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-functions-window-common = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-macros = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-physical-expr = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-physical-expr-adapter = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-physical-expr-common = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-physical-plan = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-pruning = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
+datafusion-session = { git = "file:///Volumes/workplace/datafusion-fork", rev = "de892a04b4ec1abf8c6fa86e7ff98a791f63123d" }
 
 [profile.release]
 lto = true

@@ -99,9 +99,25 @@ public final class PageCache {
         return (word & (1L << (idx & 63))) != 0L;
     }
 
-    /** Returns the raw {@code long} bits for a primitive value at the given global row. */
+    /**
+     * Returns the raw {@code long} bits for a <b>single-valued</b> primitive at the given global row.
+     * {@link #values} is indexed by row-within-page here, so the page-relative index is {@code row - firstRow}.
+     */
     public long valueAt(long row) {
-        long idx = row - firstRow;
+        return elementAt(row - firstRow);
+    }
+
+    /**
+     * Returns the raw {@code long} bits for the primitive at absolute element index {@code idx} within this
+     * page's decoded {@link #values} buffer — no {@code firstRow} adjustment.
+     *
+     * <p>For <b>repeated</b> columns {@link #values} is the flattened element buffer and callers already hold
+     * the batch-local element index (e.g. {@code listOffsets[relativeRow] + offset}); subtracting {@code firstRow}
+     * (as {@link #valueAt(long)} does for single-valued rows) would underflow for any page with
+     * {@code firstRow > 0} — i.e. every batch past the first. This is the element-indexed read matching the bulk
+     * {@code DataFusionColumnReader#readRepeatedLongsAtRow} path.
+     */
+    public long elementAt(long idx) {
         return switch (valueKind) {
             case KIND_LONG -> values.getAtIndex(ValueLayout.JAVA_LONG, idx);
             case KIND_INT -> values.getAtIndex(ValueLayout.JAVA_INT, idx);

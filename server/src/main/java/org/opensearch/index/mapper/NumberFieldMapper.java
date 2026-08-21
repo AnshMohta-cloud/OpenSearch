@@ -1242,6 +1242,15 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
                 if (context.indexSortedOnField(field)) {
                     dvQuery = new IndexSortSortedNumericDocValuesRangeQuery(field, l, u, dvQuery);
                 }
+                // [DSL-TRACE] STAGE 2 — QUERY ROUTING for numeric field. isSearchable=false (composite POC
+                // hack: numeric fields report non-searchable), so we SKIP the BKD/points branch and return a
+                // DOC-VALUES-ONLY range query (SortedNumericDocValuesField.newSlowRangeQuery). That means this
+                // predicate is evaluated by reading the Parquet column as DocValues (see getNumeric), NOT the
+                // Lucene inverted/points index. This is why numeric filters land on Parquet.
+                org.apache.logging.log4j.LogManager.getLogger(NumberFieldMapper.class).info(
+                    "[DSL-TRACE] rangeQuery INTEGER field='{}' range=[{},{}] isSearchable={} hasDocValues={} -> {}",
+                    field, l, u, isSearchable, hasDocValues,
+                    isSearchable ? "points+DV (Lucene BKD)" : "DOC-VALUES-ONLY (reads Parquet column)");
                 return dvQuery;
             }
 

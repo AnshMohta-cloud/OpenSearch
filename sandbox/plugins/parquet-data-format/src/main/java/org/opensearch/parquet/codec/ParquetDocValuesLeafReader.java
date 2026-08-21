@@ -8,6 +8,8 @@
 
 package org.opensearch.parquet.codec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.StoredFieldsReader;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValues;
@@ -28,12 +30,22 @@ import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Query;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.util.BitSet;
+import org.apache.lucene.util.BitSetIterator;
+import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.index.SequentialStoredFieldsLeafReader;
+import org.opensearch.common.lucene.search.Queries;
+import org.opensearch.index.cache.bitset.BitsetFilterCache;
 import org.opensearch.index.engine.dataformat.DocumentInput;
+import org.opensearch.index.mapper.DerivedSourceNestedNavigator;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.index.mapper.ObjectMapper;
+import org.opensearch.parquet.codec.cache.ColumnPageIndex;
 import org.opensearch.parquet.codec.iter.ParquetDictionarySortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetUninvertedSortedDocValues;
@@ -82,9 +94,18 @@ import java.util.Map;
  * passes the underlying segment's stored-fields reader straight through, and the derived-source
  * layer still synthesizes {@code _source} from doc values on top of it.
  */
-public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeafReader {
+public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeafReader implements DerivedSourceNestedNavigator {
+
+    private static final Logger logger = LogManager.getLogger(ParquetDocValuesLeafReader.class);
 
     private final MapperService mapperService;
+
+    /**
+     * Vanilla's node-level parent/child block-join bitset cache, or {@code null} when none is wired (e.g. a
+     * unit-test reader). Reused for nested source assembly so we consume the SAME cached bitsets
+     * {@code ToParentBlockJoinQuery} and inner_hits use, instead of building our own. See {@link #bits}.
+     */
+    private final BitsetFilterCache bitsetFilterCache;
 
     /** Lazily constructed Parquet producer for this segment; null until first DV access. */
     private ParquetDocValuesProducer producer;
@@ -96,6 +117,9 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     /** Field name -> synthetic FieldInfo for Parquet-resident DV fields served by this reader. */
     private final Map<String, FieldInfo> parquetFields;
 
+    /** Nested-leaf page→first-child-docId tilings ({@code firstDocIdOf}), built once per field. See {@link #nestedFirstDocIdOf}. */
+    private final Map<String, int[]> nestedFirstDocIdOfByField = new HashMap<>();
+
     /** The segment read state used to build the producer (captured at construction). */
     private final SegmentReadState segmentReadState;
 
@@ -104,12 +128,14 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     private ParquetDocValuesLeafReader(
         LeafReader in,
         MapperService mapperService,
+        BitsetFilterCache bitsetFilterCache,
         SegmentReadState segmentReadState,
         Map<String, FieldInfo> parquetFields,
         FieldInfos mergedFieldInfos
     ) {
         super(in);
         this.mapperService = mapperService;
+        this.bitsetFilterCache = bitsetFilterCache;
         this.segmentReadState = segmentReadState;
         this.parquetFields = parquetFields;
         this.mergedFieldInfos = mergedFieldInfos;
@@ -120,7 +146,8 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      * segment and the mapping declares at least one Parquet-codec-supported field that is missing
      * doc values in the Lucene segment. Otherwise returns {@code in} unwrapped.
      */
-    public static LeafReader wrapIfApplicable(LeafReader in, MapperService mapperService) throws IOException {
+    public static LeafReader wrapIfApplicable(LeafReader in, MapperService mapperService, BitsetFilterCache bitsetFilterCache)
+        throws IOException {
         SegmentReader segmentReader;
         try {
             segmentReader = Lucene.segmentReader(in);
@@ -183,7 +210,7 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
         }
 
         FieldInfos mergedInfos = new FieldInfos(merged.toArray(new FieldInfo[0]));
-        return new ParquetDocValuesLeafReader(in, mapperService, state, parquetFields, mergedInfos);
+        return new ParquetDocValuesLeafReader(in, mapperService, bitsetFilterCache, state, parquetFields, mergedInfos);
     }
 
     /**
@@ -260,8 +287,15 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      * Falls back to identity when the segment has no {@code __row_id__} field.
      */
     private RowIdResolver newRowIdResolver() throws IOException {
-        // The write path GUARANTEES rowId == docId in every finished segment: row ids are rewritten to
-        // sequential 0..maxDoc-1 after any sort/merge (SequentialRowIdProducer) and verified by
+        // Nested segment: docId != Parquet row in general. Only ROOT docs carry __row_id__ (children carry
+        // only _nested_path — see LuceneWriter), and roots sit interleaved among their children, so the
+        // identity shortcut below is unsafe. Flat/root fields are still read at ROOT docIds during _source
+        // reconstruction (the hit is always a root), so translate each docId through its __row_id__ value.
+        if (mapperService.documentMapper() != null && mapperService.documentMapper().hasNestedObjects()) {
+            return rowIdResolverForNested();
+        }
+        // Flat segment: the write path GUARANTEES rowId == docId in every finished segment: row ids are
+        // rewritten to sequential 0..maxDoc-1 after any sort/merge (SequentialRowIdProducer) and verified by
         // LuceneWriter.assertRowIdsSequential. So the per-doc __row_id__ lookup is pure waste here — it
         // re-reads a value that always equals the docId. Skip it: use the no-op IDENTITY resolver.
         //
@@ -286,6 +320,197 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             }
         }
         return true;
+    }
+
+    // ── Nested-leaf support ──
+    // A field whose enclosing object is `nested` is stored as a repeated (LIST) Parquet leaf: one value per
+    // nested child, addressed by (row, element-offset), not by docId. For such fields we build a
+    // NestedElementResolver from two block-join bitsets — the ROOT (parent) bitset and this path's child
+    // bitset — and route the DV getters to the producer's nested iterators. Both bitsets come from vanilla's
+    // node-level BitsetFilterCache (the same instances ToParentBlockJoinQuery and inner_hits use), so nothing
+    // is scanned or duplicated here; see bits(Query).
+
+    /**
+     * The Parquet PHYSICAL leaf path for an OpenSearch nested field name. Parquet materializes a nested
+     * object as a {@code LIST<STRUCT>}, so the physical schema inserts the synthetic group levels
+     * {@code list.element} at every nested-object boundary. Example (depth 2):
+     * {@code orders.items.price} → {@code orders.list.element.items.list.element.price}.
+     *
+     * <p>Depth-independent: walks the dotted segments left-to-right, and after each prefix that is itself a
+     * nested object appends {@code list.element} before the next segment. The native reader matches on this
+     * physical {@code ColumnDescriptor.path()} string; the flat dotted name does not exist for nested leaves.
+     */
+    private String parquetPhysicalPath(String field) {
+        String[] parts = field.split("\\.");
+        StringBuilder physical = new StringBuilder(parts[0]);
+        StringBuilder prefix = new StringBuilder(parts[0]);
+        for (int i = 1; i < parts.length; i++) {
+            ObjectMapper om = mapperService.getObjectMapper(prefix.toString());
+            if (om != null && om.nested().isNested()) {
+                physical.append(".list.element");
+            }
+            physical.append('.').append(parts[i]);
+            prefix.append('.').append(parts[i]);
+        }
+        return physical.toString();
+    }
+
+    /**
+     * The deepest {@code nested} {@link ObjectMapper} enclosing {@code field}, or {@code null} if the field
+     * is not under any nested object. Depth-independent: walks the dotted path and picks the longest nested
+     * prefix, so it works for {@code a.b} and {@code a.b.c.d.e} identically.
+     */
+    private ObjectMapper nestedParentOf(String field) {
+        int dot = field.lastIndexOf('.');
+        while (dot > 0) {
+            String prefix = field.substring(0, dot);
+            ObjectMapper om = mapperService.getObjectMapper(prefix);
+            if (om != null && om.nested().isNested()) {
+                return om;
+            }
+            dot = field.lastIndexOf('.', dot - 1);
+        }
+        return null;
+    }
+
+    /**
+     * The per-segment block-join bitset for {@code filter}, taken from vanilla's node-level
+     * {@link BitsetFilterCache} when one is wired — the SAME cached instance {@code ToParentBlockJoinQuery}
+     * and inner_hits path resolution use, so no bitset is built or duplicated here. This wrapper's core cache
+     * key delegates to the underlying segment ({@link #getCoreCacheHelper()}), so the lookup resolves to that
+     * shared entry. Falls back to an uncached one-off build only when no cache is available (e.g. a unit-test
+     * reader with no index cache). Never {@code null}: a filter matching nothing yields an empty set.
+     */
+    private BitSet bits(Query filter) throws IOException {
+        boolean reuseCache = bitsetFilterCache != null;
+        BitSet bitSet = reuseCache
+            ? bitsetFilterCache.getBitSetProducer(filter).getBitSet(getContext())
+            : BitsetFilterCache.bitsetFromQuery(filter, getContext());
+        if (bitSet == null) {
+            bitSet = new FixedBitSet(maxDoc());
+        }
+        // [DSL-TRACE] Reuse proof: with reuseCache=true this BitSet is served from vanilla's node-level
+        // BitsetFilterCache. Compare bitsetId here against the "parentBitset ... bitsetId=" line
+        // IndicesBitsetFilterCache logs when it BUILDS a bitset (query phase / inner_hits) — a matching id
+        // proves the SAME cached instance is reused, not rebuilt. coreKey ties it to this segment.
+        Object coreKey = in.getCoreCacheHelper() != null ? in.getCoreCacheHelper().getKey() : null;
+        logger.info(
+            "[DSL-TRACE] ParquetLeaf.bits: reuseCache={} filter={} maxDoc={} cardinality={} bitsetId={} coreKey={}",
+            reuseCache,
+            filter,
+            maxDoc(),
+            bitSet.cardinality(),
+            System.identityHashCode(bitSet),
+            System.identityHashCode(coreKey)
+        );
+        return bitSet;
+    }
+
+    // ── DerivedSourceNestedNavigator ──
+    // Exposes the block-join bitsets so the mapper layer can reconstruct nested arrays for derived _source
+    // without depending on this plugin. Both come from vanilla's cached BitsetFilterCache (see bits) — the
+    // same instances ToParentBlockJoinQuery and inner_hits path resolution use; no new bitset is built here.
+
+    @Override
+    public BitSet parentDocs() throws IOException {
+        // Roots carry _primary_term (written on roots only); newNonNestedFilter() == FieldExistsQuery(_primary_term).
+        logger.info("[DSL-TRACE] ParquetLeaf.parentDocs() invoked (derived-source ROOT/parent bitset via vanilla cache)");
+        return bits(Queries.newNonNestedFilter());
+    }
+
+    @Override
+    public BitSet childDocs(Query nestedTypeFilter) throws IOException {
+        logger.info(
+            "[DSL-TRACE] ParquetLeaf.childDocs() invoked filter={} (derived-source child bitset via vanilla cache)",
+            nestedTypeFilter
+        );
+        return bits(nestedTypeFilter);
+    }
+
+    /**
+     * Builds a {@link NestedElementResolver} for a leaf under nested object {@code nestedParent}. Composes the
+     * existing row resolver (child's enclosing root -> {@code __row_id__}) with the ROOT (parent) bitset and
+     * this nested path's child bitset — both from vanilla's cached {@link BitsetFilterCache}.
+     */
+    private NestedElementResolver newNestedResolver(ObjectMapper nestedParent) throws IOException {
+        logger.info(
+            "[DSL-TRACE] ParquetLeaf.newNestedResolver: nestedParent={} childFilter={} (building nested DV resolver from cached bitsets)",
+            nestedParent.name(),
+            nestedParent.nestedTypeFilter()
+        );
+        return new NestedElementResolver(
+            rowIdResolverForNested(),
+            bits(Queries.newNonNestedFilter()),
+            bits(nestedParent.nestedTypeFilter())
+        );
+    }
+
+    /**
+     * Row resolver used INSIDE the nested resolver to map a ROOT docId to its Parquet row. Unlike the flat
+     * path, a nested segment is not docId==row overall, but roots still carry {@code __row_id__}; read it.
+     */
+    private RowIdResolver rowIdResolverForNested() throws IOException {
+        SortedNumericDocValues rowId = in.getSortedNumericDocValues(DocumentInput.ROW_ID_FIELD);
+        if (rowId == null) {
+            return RowIdResolver.IDENTITY;
+        }
+        // Forward-only cursor over __row_id__; callers (the resolver) pass non-decreasing ROOT docIds.
+        return docId -> {
+            if (rowId.advanceExact(docId) == false) {
+                throw new IllegalStateException("root docId " + docId + " has no __row_id__ value");
+            }
+            return rowId.nextValue();
+        };
+    }
+
+    /**
+     * The nested block-join docId tiling for {@code field}'s repeated Parquet column: {@code firstDocIdOf[p]}
+     * is the child-docId at which page {@code p}'s first row's block begins, so page {@code p} owns doc range
+     * {@code [firstDocIdOf[p], firstDocIdOf[p+1]-1]}. Length {@code pageCount + 1}; {@code [0] == 0} and
+     * {@code [pageCount] == maxDoc}, strictly ascending. Cached per field (built once per segment).
+     *
+     * <p>Built by walking the ROOT (parent) block-join bitset once, in ascending root/row order: children
+     * precede their root (root last), so a page that starts at row {@code r > 0} begins one doc past the ROOT
+     * of row {@code r-1}, i.e. {@code firstDocIdOf[p] = ROOT_{firstRowOf(p)-1} + 1}. O(totalRows), reusing
+     * vanilla's cached bitset (no new scan). The {@code __row_id__ == root-index} invariant is asserted under -ea.
+     */
+    private synchronized int[] nestedFirstDocIdOf(String field) throws IOException {
+        int[] cached = nestedFirstDocIdOfByField.get(field);
+        if (cached != null) {
+            return cached;
+        }
+        ColumnPageIndex pageIndex = producer().repeatedPageIndex(parquetFieldInfo(field), parquetPhysicalPath(field));
+        int pageCount = pageIndex.pageCount();
+        int[] firstDocIdOf = new int[pageCount + 1];
+        firstDocIdOf[0] = 0;                 // page 0 begins at row 0, whose block starts at docId 0
+        firstDocIdOf[pageCount] = maxDoc();  // sentinel: one past the last doc (root of the last row)
+        if (pageCount > 1) {
+            BitSet rootBits = bits(Queries.newNonNestedFilter());
+            DocIdSetIterator roots = new BitSetIterator(rootBits, rootBits.cardinality());
+            int rootIndex = 0;
+            int rootDoc = roots.nextDoc(); // ROOT of row 0 (root index 0)
+            for (int p = 1; p < pageCount; p++) {
+                long targetRow = pageIndex.firstRowOf(p) - 1; // page p begins one doc past this row's ROOT
+                while (rootIndex < targetRow) {
+                    rootDoc = roots.nextDoc();
+                    rootIndex++;
+                }
+                assert rootDoc != DocIdSetIterator.NO_MORE_DOCS : "ran out of ROOT docs before row " + targetRow;
+                firstDocIdOf[p] = rootDoc + 1;
+                assert rowIdMatches(rootDoc, targetRow) : "ROOT docId " + rootDoc + " does not carry __row_id__ " + targetRow;
+            }
+        }
+        nestedFirstDocIdOfByField.put(field, firstDocIdOf);
+        return firstDocIdOf;
+    }
+
+    /** -ea check mirroring the write-path invariant: the ROOT at {@code rootDoc} carries {@code __row_id__ == expectedRow}. */
+    private boolean rowIdMatches(int rootDoc, long expectedRow) throws IOException {
+        SortedNumericDocValues rowId = in.getSortedNumericDocValues(DocumentInput.ROW_ID_FIELD);
+        if (rowId == null) {
+            return true; // no row-id field => identity by definition
+        }
+        return rowId.advanceExact(rootDoc) && rowId.nextValue() == expectedRow;
     }
 
     @Override
@@ -327,6 +552,25 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             FieldInfo asNumeric = fi.getDocValuesType() == DocValuesType.NUMERIC
                 ? fi
                 : newDocValuesFieldInfo(field, fi.number, DocValuesType.NUMERIC, fi.docValuesSkipIndexType());
+            ObjectMapper nestedParent = nestedParentOf(field);
+            if (nestedParent != null) {
+                // [SKIPPER-VERIFY] the Parquet DV value path for this nested numeric IS being built (once per
+                // segment per query). Its presence — paired with the skipper's advance() log — distinguishes
+                // "range query ran through Parquet doc-values" from "range query used the BKD/points path".
+                logger.info(
+                    "[SKIPPER-VERIFY] getSortedNumericDocValues NESTED field={} skipIndexType={}",
+                    field,
+                    fi.docValuesSkipIndexType()
+                );
+                // Nested leaf: read the child element at (row, offset) from the repeated Parquet column.
+                // Already single-valued per child, so wrap with DocValues.singleton for unwrapSingleton.
+                NumericDocValues nested = producer().getNestedNumeric(
+                    asNumeric,
+                    parquetPhysicalPath(field),
+                    newNestedResolver(nestedParent)
+                );
+                return DocValues.singleton(nested);
+            }
             NumericDocValues numeric = producer().getNumeric(asNumeric);
             RowIdResolver resolver = newRowIdResolver();
             NumericDocValues remapped = resolver == RowIdResolver.IDENTITY
@@ -341,6 +585,12 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     public BinaryDocValues getBinaryDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.BINARY) {
+            ObjectMapper nestedParent = nestedParentOf(field);
+            if (nestedParent != null) {
+                // Nested binary leaf: read the child's single element (raw bytes) at (row, offset) from the
+                // repeated Parquet column — O(1), zero-copy, no ordinals (mirrors flat ParquetBinaryDocValues).
+                return producer().getNestedBinary(fi, parquetPhysicalPath(field), newNestedResolver(nestedParent));
+            }
             RowIdResolver resolver = newRowIdResolver();
             BinaryDocValues binary = producer().getBinary(fi);
             return resolver == RowIdResolver.IDENTITY ? binary : RowIdRemappingDocValues.binary(binary, resolver, maxDoc());
@@ -412,6 +662,16 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             FieldInfo asSorted = fi.getDocValuesType() == DocValuesType.SORTED
                 ? fi
                 : newDocValuesFieldInfo(field, fi.number, DocValuesType.SORTED, fi.docValuesSkipIndexType());
+            ObjectMapper nestedParent = nestedParentOf(field);
+            if (nestedParent != null) {
+                // Nested keyword leaf: read the child element at (row, offset) from the repeated Parquet
+                // column, as streaming per-doc ordinals (upgraded to dictionary ordinals when in budget).
+                SortedDocValues nested = withDictionaryOrdinals(
+                    field,
+                    producer().getNestedSorted(asSorted, parquetPhysicalPath(field), newNestedResolver(nestedParent))
+                );
+                return DocValues.singleton(nested);
+            }
             SortedDocValues sorted = withDictionaryOrdinals(field, producer().getSorted(asSorted));
             RowIdResolver resolver = newRowIdResolver();
             SortedDocValues remapped = resolver == RowIdResolver.IDENTITY
@@ -426,14 +686,42 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     public DocValuesSkipper getDocValuesSkipper(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {
+            boolean nested = nestedParentOf(field) != null;
             if (fi.docValuesSkipIndexType() == DocValuesSkipIndexType.NONE) {
+                // [SKIPPER-VERIFY] Lucene asked for a skipper but this field carries no skip index -> none served.
+                logger.info("[SKIPPER-VERIFY] getDocValuesSkipper field={} nested={} skipIndexType=NONE -> null", field, nested);
                 return null;
+            }
+            // Nested leaf (repeated LIST): docId != row, so map each page's row range to a docId range
+            // via the block-join tiling and serve a nested-aware skipper. The native reader now enumerates
+            // a repeated column's real per-page min/max (record-aligned page emission in projected_pages),
+            // so the per-page stats are trustworthy; getNestedSkipper opens the repeated reader by the
+            // physical list.element path and reports no per-page density (forcing an inner per-doc check).
+            if (nested) {
+                DocValuesSkipper sk = producer().getNestedSkipper(fi, parquetPhysicalPath(field), nestedFirstDocIdOf(field));
+                logger.info(
+                    "[SKIPPER-VERIFY] getDocValuesSkipper field={} nested=true skipIndexType={} -> {}",
+                    field,
+                    fi.docValuesSkipIndexType(),
+                    sk == null ? "null" : "NESTED skipper"
+                );
+                return sk;
             }
             // Doc IDs and Parquet rows coincide (IDENTITY resolver — see newRowIdResolver), so
             // page row ranges are directly valid as skipper doc ID intervals.
-            return producer().getSkipper(fi);
+            DocValuesSkipper sk = producer().getSkipper(fi);
+            logger.info(
+                "[SKIPPER-VERIFY] getDocValuesSkipper field={} nested=false skipIndexType={} -> {}",
+                field,
+                fi.docValuesSkipIndexType(),
+                sk == null ? "null" : "flat skipper"
+            );
+            return sk;
         }
-        return in.getDocValuesSkipper(field);
+        // [SKIPPER-VERIFY] non-parquet field -> delegate to the wrapped Lucene reader.
+        DocValuesSkipper sk = in.getDocValuesSkipper(field);
+        logger.info("[SKIPPER-VERIFY] getDocValuesSkipper field={} (non-parquet) -> {}", field, sk == null ? "null" : "delegate");
+        return sk;
     }
 
     @Override

@@ -253,6 +253,12 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
 
     @Override
     public LeafBucketCollector getLeafCollector(LeafReaderContext ctx, LeafBucketCollector sub) throws IOException {
+        // [DSL-TRACE] STAGE 4a — TERMS agg bucketing. getGlobalOrds() opens the keyword field's
+        // SortedSetDocValues (ordinals). On a composite index those ordinals come from the Parquet column
+        // (getSorted/getSortedSet), ranked against the Lucene sidecar term dictionary. Buckets are keyed by
+        // ordinal; the avg sub-agg then runs per bucket.
+        org.apache.logging.log4j.LogManager.getLogger(GlobalOrdinalsStringTermsAggregator.class).info(
+            "[DSL-TRACE] terms agg '{}' getLeafCollector -> opening keyword ordinals (Parquet-backed SortedSetDV)", name());
         SortedSetDocValues globalOrds = this.getGlobalOrds(ctx);
         collectionStrategy.globalOrdsReady(globalOrds);
         SortedDocValues singleValues = DocValues.unwrapSingleton(globalOrds);

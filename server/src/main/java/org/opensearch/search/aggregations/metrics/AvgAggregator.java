@@ -128,6 +128,11 @@ class AvgAggregator extends NumericMetricsAggregator.SingleValue implements Star
         }
 
         final BigArrays bigArrays = context.bigArrays();
+        // [DSL-TRACE] STAGE 4b — AVG metric aggregator. valuesSource.doubleValues() below opens the numeric
+        // value source, which on a composite index resolves to the Parquet column read as DocValues
+        // (getNumeric). The avg (sum/count) is computed by this standard aggregator over those values.
+        org.apache.logging.log4j.LogManager.getLogger(AvgAggregator.class).info(
+            "[DSL-TRACE] avg agg '{}' getLeafCollector -> opening numeric doubleValues (Parquet-backed DV)", name());
         final SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
         final CompensatedSum kahanSummation = new CompensatedSum(0, 0);
 

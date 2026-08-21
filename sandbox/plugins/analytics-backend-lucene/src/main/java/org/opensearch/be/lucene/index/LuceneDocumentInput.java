@@ -110,8 +110,25 @@ public class LuceneDocumentInput implements DocumentInput<Document> {
     public void addField(MappedFieldType fieldType, Object value) {
         Set<FieldTypeCapabilities.Capability> capabilities = fieldType.getCapabilityMap().getOrDefault(LucenePlugin.DATA_FORMAT, Set.of());
         if (capabilities.isEmpty()) {
-            // nothing to support on this format for this field.
-            return;
+            // The field carries no per-format capability entry for Lucene. This happens for SYNTHETIC
+            // metadata carrier types (e.g. PrimaryTermFieldType) that are never routed through
+            // DataFormatPlugin.assignCapabilities — only registered MetadataFieldMappers are — so their
+            // capabilityMap stays the constructor default (empty). Fall back to what THIS format itself
+            // declares it supports for this type name via LuceneDataFormat.supportedFields(). This lets
+            // _primary_term (declared COLUMNAR_STORAGE in LuceneDataFormat) be written to Lucene as it is
+            // in vanilla — required so the nested parent filter FieldExistsQuery(_primary_term) has a
+            // non-empty bitset. If the format does not declare the type either, the field is genuinely
+            // not ours and we skip it.
+            capabilities = LucenePlugin.DATA_FORMAT.supportedFields()
+                .stream()
+                .filter(ftc -> ftc.fieldType().equals(fieldType.typeName()))
+                .findFirst()
+                .map(FieldTypeCapabilities::capabilities)
+                .orElse(Set.of());
+            if (capabilities.isEmpty()) {
+                // nothing to support on this format for this field.
+                return;
+            }
         }
         if (value == null) {
             throw new IllegalArgumentException(

@@ -66,7 +66,6 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
-import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -331,7 +330,11 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
             if (indexService.getIndexSettings().isPluggableDataFormatEnabled() == false) {
                 return null;
             }
-            return reader -> ParquetDocValuesDirectoryReader.wrap(reader, indexService.mapperService());
+            return reader -> ParquetDocValuesDirectoryReader.wrap(
+                reader,
+                indexService.mapperService(),
+                indexService.cache().bitsetFilterCache()
+            );
         });
     }
 }

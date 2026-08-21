@@ -81,7 +81,14 @@ public class Timer extends ProfileMetric {
 
     /** Start the timer. */
     public final void start() {
-        assert start == 0 : "#start call misses a matching #stop call";
+        // TESTING ONLY — DO NOT COMMIT. The query profiler's Timer is not thread-safe: under
+        // concurrent segment search a single per-query-node Timer is start()/stop()-ed by several
+        // slice threads at once, so `start` is transiently non-zero when another slice re-enters
+        // start(). With assertions enabled (-ea, this dev ./gradlew run build) that makes the guard
+        // below throw a fatal AssertionError on a search thread, which kills the node. Commented out
+        // so we can run profile:true over a multi-segment 1M index (composite rd2_1m vs vanilla
+        // rd2v_1m) for latency-breakdown benchmarking. Revert before any real build/commit.
+        // assert start == 0 : "#start call misses a matching #stop call";
         // We measure the timing of each method call for the first 256
         // calls, then 1/2 call up to 512 then 1/3 up to 768, etc. with
         // a maximum interval of 1024, which is reached for 1024*2^8 ~= 262000

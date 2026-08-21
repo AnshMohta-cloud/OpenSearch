@@ -28,4 +28,14 @@ public interface NumericPageReader {
      * calls must not allocate: this runs once per document on the hot path.
      */
     void readRepeatedLongsAtRow(long row, LongsRef dst) throws IOException;
+
+    /**
+     * Returns the single element value at position {@code offset} within {@code row}'s repeated list,
+     * indexing directly into the resident decoded page — O(1), no per-row copy. Used by the nested
+     * numeric iterator, which needs exactly one element (the child's) per doc, not the whole list.
+     *
+     * @return the number of elements in {@code row}'s list (so callers can bounds-check {@code offset});
+     *         the value is written to {@code out[0]} only when {@code 0 <= offset < returned count}.
+     */
+    int readRepeatedLongAt(long row, int offset, long[] out) throws IOException;
 }

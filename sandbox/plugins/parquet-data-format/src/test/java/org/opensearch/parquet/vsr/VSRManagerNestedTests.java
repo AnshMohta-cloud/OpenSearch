@@ -8,7 +8,6 @@
 
 package org.opensearch.parquet.vsr;
 
-import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
@@ -213,7 +212,11 @@ public class VSRManagerNestedTests extends ParquetBaseTests {
         doc.endNestedChild();
 
         // comment struct = { author: utf8, replies: LIST<STRUCT<text>> }
-        Field repliesChild = new Field("replies", FieldType.nullable(ArrowType.List.INSTANCE), List.of(structElement(List.of(utf8("text")))));
+        Field repliesChild = new Field(
+            "replies",
+            FieldType.nullable(ArrowType.List.INSTANCE),
+            List.of(structElement(List.of(utf8("text"))))
+        );
         try (ListVector comments = newListOfStructRaw("comments", List.of(utf8("author"), repliesChild))) {
             invokeWriteChildList(comments, 0, "comments", doc.getNestedChildren());
             comments.setValueCount(1);

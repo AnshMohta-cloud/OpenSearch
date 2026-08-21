@@ -19,7 +19,7 @@ use std::sync::{Arc, Weak};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float32Array, Float64Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
-    StringArray, StringViewArray,
+    StringArray, StringViewArray, StructArray,
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -761,15 +761,16 @@ unsafe fn copy_binary_values_out(
     Ok(())
 }
 
-fn repeated_value_count(array: &dyn Array) -> Result<usize, String> {
-    if let Some(array) = array.as_any().downcast_ref::<ListArray>() {
-        let offsets = array.value_offsets();
-        return Ok((offsets[array.len()] - offsets[0]) as usize);
+/// Descends one list level: returns `(child_values, absolute_element_offsets)`. Handles List and
+/// LargeList (i32/i64 offsets, normalized to i64). Errors on any other array type.
+fn list_level(array: &dyn Array) -> Result<(ArrayRef, Vec<i64>), String> {
+    if let Some(a) = array.as_any().downcast_ref::<ListArray>() {
+        let offs = a.value_offsets();
+        return Ok((a.values().clone(), offs.iter().map(|&o| o as i64).collect()));
     }
-    if let Some(array) = array.as_any().downcast_ref::<LargeListArray>() {
-        let offsets = array.value_offsets();
-        return usize::try_from(offsets[array.len()] - offsets[0])
-            .map_err(|_| "df_docvalues: repeated value count does not fit usize".to_string());
+    if let Some(a) = array.as_any().downcast_ref::<LargeListArray>() {
+        let offs = a.value_offsets();
+        return Ok((a.values().clone(), offs.to_vec()));
     }
     Err(format!(
         "df_docvalues: expected List or LargeList Arrow array, got {}",
@@ -777,52 +778,82 @@ fn repeated_value_count(array: &dyn Array) -> Result<usize, String> {
     ))
 }
 
+/// Flattens a nested repeated leaf to `(leaf_values, top_row_offsets)`.
+///
+/// A nested leaf column projects to `List<Struct<...more List/Struct...leaf>>` (any depth). This
+/// descends to the primitive/binary leaf, composing the list-level offsets so that
+/// `top_row_offsets[i]..top_row_offsets[i+1]` are the leaf-value indices belonging to top-level row `i`
+/// — exactly what the Java side (NestedElementResolver) indexes with (row, offsetInRow). Depth-independent
+/// (a loop over levels). Cost is O(total list boundaries), pure offset arithmetic + one final `values`
+/// slice — no per-element materialization, so latency tracks the flat scalar path.
+///
+/// Rules per level, starting at the top `List`:
+///   * `List`  → record boundaries, compose with the running top-row offsets, descend into values.
+///   * `Struct`→ descend into its single (leaf-projected) child; struct adds no repetition, offsets unchanged.
+///   * leaf    → stop; slice the leaf to the covered element range and rebase offsets to 0.
+fn flatten_repeated_leaf(array: &dyn Array) -> Result<(ArrayRef, Vec<i64>), String> {
+    // Top level MUST be a list (a repeated column). Its per-top-row boundaries seed the composition.
+    let (mut current, mut top_offsets) = list_level(array)?;
+
+    loop {
+        match current.data_type() {
+            DataType::List(_) | DataType::LargeList(_) => {
+                // Compose: each top-row boundary maps through this inner list's offsets. The inner
+                // offsets are absolute into the inner child; remap every top boundary to the child index.
+                let (child, inner_offsets) = list_level(current.as_ref())?;
+                top_offsets = top_offsets
+                    .iter()
+                    .map(|&b| inner_offsets[b as usize])
+                    .collect();
+                current = child;
+            }
+            DataType::Struct(_) => {
+                // Leaf projection prunes sibling struct children, so the struct carries exactly the child
+                // on the path to our leaf. Descend into it; a struct is not repeated, so offsets are unchanged.
+                let s = current
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| "df_docvalues: struct downcast failed".to_string())?;
+                if s.num_columns() != 1 {
+                    return Err(format!(
+                        "df_docvalues: expected leaf-projected struct with 1 child, got {}",
+                        s.num_columns()
+                    ));
+                }
+                current = s.column(0).clone();
+            }
+            _ => {
+                // Primitive/binary leaf reached. Slice to the covered element range and rebase offsets.
+                let start = *top_offsets.first().unwrap_or(&0);
+                let end = *top_offsets.last().unwrap_or(&start);
+                let leaf = current.slice(start as usize, (end - start) as usize);
+                let rebased = top_offsets.iter().map(|&o| o - start).collect();
+                return Ok((leaf, rebased));
+            }
+        }
+    }
+}
+
+fn repeated_value_count(array: &dyn Array) -> Result<usize, String> {
+    let (leaf, _) = flatten_repeated_leaf(array)?;
+    Ok(leaf.len())
+}
+
 fn repeated_values(array: &dyn Array) -> Result<ArrayRef, String> {
-    if let Some(array) = array.as_any().downcast_ref::<ListArray>() {
-        let offsets = array.value_offsets();
-        let start = offsets[0] as usize;
-        let end = offsets[array.len()] as usize;
-        return Ok(array.values().slice(start, end - start));
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeListArray>() {
-        let offsets = array.value_offsets();
-        let start = usize::try_from(offsets[0])
-            .map_err(|_| "df_docvalues: negative repeated value offset".to_string())?;
-        let end = usize::try_from(offsets[array.len()])
-            .map_err(|_| "df_docvalues: repeated value offset does not fit usize".to_string())?;
-        return Ok(array.values().slice(start, end - start));
-    }
-    Err(format!(
-        "df_docvalues: expected List or LargeList Arrow array, got {}",
-        array.data_type()
-    ))
+    let (leaf, _) = flatten_repeated_leaf(array)?;
+    Ok(leaf)
 }
 
 unsafe fn write_repeated_offsets(
     array: &dyn Array,
     out_row_offsets: *mut i32,
 ) -> Result<(), String> {
-    if let Some(array) = array.as_any().downcast_ref::<ListArray>() {
-        let offsets = array.value_offsets();
-        let base = offsets[0];
-        for (idx, offset) in offsets.iter().enumerate() {
-            *out_row_offsets.add(idx) = *offset - base;
-        }
-        return Ok(());
+    let (_, top_offsets) = flatten_repeated_leaf(array)?;
+    for (idx, offset) in top_offsets.iter().enumerate() {
+        *out_row_offsets.add(idx) = i32::try_from(*offset)
+            .map_err(|_| "df_docvalues: repeated row offset exceeds i32".to_string())?;
     }
-    if let Some(array) = array.as_any().downcast_ref::<LargeListArray>() {
-        let offsets = array.value_offsets();
-        let base = offsets[0];
-        for (idx, offset) in offsets.iter().enumerate() {
-            *out_row_offsets.add(idx) = i32::try_from(*offset - base)
-                .map_err(|_| "df_docvalues: repeated row offset exceeds i32".to_string())?;
-        }
-        return Ok(());
-    }
-    Err(format!(
-        "df_docvalues: expected List or LargeList Arrow array, got {}",
-        array.data_type()
-    ))
+    Ok(())
 }
 
 /// Shared entry-point prologue: resolves a live cursor handle.

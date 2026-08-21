@@ -48,6 +48,11 @@ public class DerivedSourceLeafReader extends SequentialStoredFieldsLeafReader {
 
     @Override
     public StoredFields storedFields() throws IOException {
+        // [DSL-TRACE] STAGE 5 — FETCH. Composite indices do NOT store _source; it is DERIVED here, rebuilt
+        // per hit from the (Parquet-backed) doc values via sourceProvider. So the top-N hits' _source is
+        // reconstructed column-by-column from Parquet, not read from a stored field.
+        org.apache.logging.log4j.LogManager.getLogger(DerivedSourceLeafReader.class).info(
+            "[DSL-TRACE] fetch: deriving _source from doc values (Parquet-backed) for this leaf");
         return new DerivedSourceStoredFieldsReader.DerivedSourceStoredFields(in.storedFields(), sourceProvider);
     }
 

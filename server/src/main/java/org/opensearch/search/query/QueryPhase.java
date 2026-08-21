@@ -148,12 +148,63 @@ public class QueryPhase {
             LOGGER.trace("{}", new SearchContextSourcePrinter(searchContext));
         }
 
+        // [DSL-TRACE] STAGE 1 — QUERY PHASE ENTRY. The rewritten Lucene query is built; this is where the
+        // whole search pipeline begins for one shard. `query` is the combined BooleanQuery; note which
+        // sub-queries are Lucene (TermQuery on postings) vs doc-values (SortedNumericDocValuesField range
+        // over Parquet columns — see NumberFieldMapper.rangeQuery). aggs/sort/size follow below.
+        // [DSL-TRACE] STAGE 1 — QUERY PHASE ENTRY. Log the rewritten query tree verbatim. The Lucene-vs-Parquet
+        // split is NOT decided by any router here — it EMERGES from execution: whichever clause's Scorer reads
+        // Parquet-backed DocValues will emit the getNumeric/getSorted/loadPageContaining lines below; a clause
+        // served by the Lucene inverted/points index emits none. So read the split from those DOWNSTREAM logs,
+        // not from the query class names printed here (a keyword can carry BOTH a postings index and a Parquet
+        // DV column; IndexOrDocValuesQuery even picks points-vs-DV per-segment at runtime).
+        LOGGER.info(
+            "[DSL-TRACE] === QueryPhase START shard={} size={} hasAggs={} sort={} query={}",
+            searchContext.shardTarget(),
+            searchContext.size(),
+            searchContext.aggregations() != null,
+            searchContext.sort() == null ? "score" : searchContext.sort().sort,
+            searchContext.query()
+        );
+
         final AggregationProcessor aggregationProcessor = queryPhaseSearcher.aggregationProcessor(searchContext);
         // Pre-process aggregations as late as possible. In the case of a DFS_Q_T_F
         // request, preProcess is called on the DFS phase phase, this is why we pre-process them
         // here to make sure it happens during the QUERY phase
         aggregationProcessor.preProcess(searchContext);
         boolean rescore = executeInternal(searchContext, queryPhaseSearcher);
+        // [DSL-TRACE] QUERY PHASE DONE. Report totalHits AND the actual matched docIds (the shard-local
+        // Lucene docIds the collectors kept, up to `size`). For a NESTED query these are the PARENT/root
+        // docIds emitted by ToParentBlockJoinQuery (root is the LAST doc of each block, e.g. children...,ROOT),
+        // NOT child docIds. This is the docId space the FETCH phase then resolves to _source — and the
+        // number to line up against Parquet rows: a matched parent docId must map to its logical Parquet
+        // row (via __row_id__), which is exactly what the current maxDoc==numRows identity gets wrong for
+        // nested segments. Logging these makes the docId->row work concrete.
+        {
+            org.apache.lucene.search.TopDocs td = searchContext.queryResult().topDocs() == null
+                ? null : searchContext.queryResult().topDocs().topDocs;
+            String matched;
+            if (searchContext.size() == 0) {
+                // size:0 uses a count-only collector (TotalHitCountCollector) — no scoreDocs are kept,
+                // so there is nothing to list. Use size>0 to see the matched (parent/root) docIds.
+                matched = "<size:0 count-only — no top docs collected; use size>0 to list matched parent docIds>";
+            } else {
+                StringBuilder sb = new StringBuilder("[");
+                if (td != null && td.scoreDocs != null) {
+                    int shown = 0;
+                    for (org.apache.lucene.search.ScoreDoc sd : td.scoreDocs) {
+                        if (shown++ >= 50) { sb.append("..."); break; }
+                        if (shown > 1) sb.append(',');
+                        sb.append(sd.doc);
+                    }
+                }
+                matched = sb.append(']').toString();
+            }
+            LOGGER.info("[DSL-TRACE] === QueryPhase DONE shard={} totalHits={} matchedTopDocIds={} (nested: these are PARENT/root docIds)",
+                searchContext.shardTarget(),
+                td == null ? "?" : td.totalHits.value(),
+                matched);
+        }
 
         if (rescore) { // only if we do a regular search
             rescoreProcessor.process(searchContext);
