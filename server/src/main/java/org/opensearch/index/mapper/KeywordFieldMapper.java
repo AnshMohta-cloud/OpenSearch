@@ -513,10 +513,14 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
             // served by Lucene postings incl. the child docs of a nested block); isSearchable=false ->
             // doc-values-only (SortedSet range, read from the Parquet ordinals column). name() shows the
             // full dotted path so we can confirm routing holds at every depth.
-            org.apache.logging.log4j.LogManager.getLogger(KeywordFieldMapper.class).info(
-                "[DSL-TRACE] termQuery KEYWORD field='{}' isSearchable={} hasDocValues={} -> {}",
-                name(), isSearchable(), hasDocValues(),
-                isSearchable() ? "LUCENE postings (ConstantScore TermQuery)" : "DOC-VALUES-ONLY (reads Parquet ordinals)");
+            org.apache.logging.log4j.LogManager.getLogger(KeywordFieldMapper.class)
+                .info(
+                    "[DSL-TRACE] termQuery KEYWORD field='{}' isSearchable={} hasDocValues={} -> {}",
+                    name(),
+                    isSearchable(),
+                    hasDocValues(),
+                    isSearchable() ? "LUCENE postings (ConstantScore TermQuery)" : "DOC-VALUES-ONLY (reads Parquet ordinals)"
+                );
             if (isSearchable()) {
                 Query query = super.termQuery(value, context);
                 if (!this.useSimilarity) {

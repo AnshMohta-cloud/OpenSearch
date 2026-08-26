@@ -249,7 +249,15 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
             parquetRowCount
         );
         // Numeric leaf: share the cached column reader (keyed by physical path), same as the flat numeric path.
-        return new NestedParquetNumericDocValues(dataFusionReaderFor(field, physicalColumn, true), resolver, maxDoc, field.getName());
+        var columnReader = dataFusionReaderFor(field, physicalColumn, true);
+        // A leaf with no nulls holds exactly one value per nested child, so the iterator can navigate by the
+        // path child bitset and skip per-doc (row, offset) resolution + value decode on the predicate/count
+        // path (the value is read lazily only for boundary pages and aggregations). A missing page index or an
+        // unknown null count (-1) is treated conservatively as "may have nulls" → the safe decode-and-confirm
+        // path. See NestedParquetNumericDocValues#advance.
+        var pageIndex = columnReader.pageIndex();
+        boolean columnHasNulls = (pageIndex == null) || pageIndex.anyNulls();
+        return new NestedParquetNumericDocValues(columnReader, resolver, maxDoc, field.getName(), columnHasNulls);
     }
 
     /**
@@ -368,13 +376,20 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      * <p>Integer-shaped columns only (INT32/INT64/BOOL), matching {@link #getSkipper}'s gate; returns
      * {@code null} for other physical types (their raw-bits order is not numeric order).
      */
-    public DocValuesSkipper getNestedSkipper(FieldInfo field, String physicalColumn, int[] firstDocIdOf) throws IOException {
+    public DocValuesSkipper getNestedSkipper(
+        FieldInfo field,
+        String physicalColumn,
+        ParquetDocValuesSkipper.IntArrayLoader firstDocIdOfLoader
+    ) throws IOException {
         ensureOpen();
         ParquetPhysicalType phys = physicalType(field);
         if (phys != ParquetPhysicalType.INT32 && phys != ParquetPhysicalType.INT64 && phys != ParquetPhysicalType.BOOL) {
             return null;
         }
-        return new ParquetDocValuesSkipper(dataFusionReaderFor(field, physicalColumn, true).pageIndex(), maxDoc, firstDocIdOf);
+        // Pass the loader (not a built array): the skipper materializes firstDocIdOf lazily on first
+        // advance(), so this factory — reached during Lucene's rewrite for the global min/max probe —
+        // never triggers the O(totalRows) parent-bitset walk. See ParquetDocValuesSkipper (Fix A).
+        return new ParquetDocValuesSkipper(dataFusionReaderFor(field, physicalColumn, true).pageIndex(), maxDoc, firstDocIdOfLoader);
     }
 
     /**

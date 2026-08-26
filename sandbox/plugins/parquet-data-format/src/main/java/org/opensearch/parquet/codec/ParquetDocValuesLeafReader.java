@@ -30,11 +30,9 @@ import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
-import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.util.BitSet;
-import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.index.SequentialStoredFieldsLeafReader;
@@ -45,6 +43,7 @@ import org.opensearch.index.mapper.DerivedSourceNestedNavigator;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.ObjectMapper;
+import org.opensearch.indices.IndicesBitsetFilterCache;
 import org.opensearch.parquet.codec.cache.ColumnPageIndex;
 import org.opensearch.parquet.codec.iter.ParquetDictionarySortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
@@ -116,9 +115,6 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
 
     /** Field name -> synthetic FieldInfo for Parquet-resident DV fields served by this reader. */
     private final Map<String, FieldInfo> parquetFields;
-
-    /** Nested-leaf page→first-child-docId tilings ({@code firstDocIdOf}), built once per field. See {@link #nestedFirstDocIdOf}. */
-    private final Map<String, int[]> nestedFirstDocIdOfByField = new HashMap<>();
 
     /** The segment read state used to build the producer (captured at construction). */
     private final SegmentReadState segmentReadState;
@@ -467,41 +463,47 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      * The nested block-join docId tiling for {@code field}'s repeated Parquet column: {@code firstDocIdOf[p]}
      * is the child-docId at which page {@code p}'s first row's block begins, so page {@code p} owns doc range
      * {@code [firstDocIdOf[p], firstDocIdOf[p+1]-1]}. Length {@code pageCount + 1}; {@code [0] == 0} and
-     * {@code [pageCount] == maxDoc}, strictly ascending. Cached per field (built once per segment).
+     * {@code [pageCount] == maxDoc}, strictly ascending.
      *
-     * <p>Built by walking the ROOT (parent) block-join bitset once, in ascending root/row order: children
-     * precede their root (root last), so a page that starts at row {@code r > 0} begins one doc past the ROOT
-     * of row {@code r-1}, i.e. {@code firstDocIdOf[p] = ROOT_{firstRowOf(p)-1} + 1}. O(totalRows), reusing
-     * vanilla's cached bitset (no new scan). The {@code __row_id__ == root-index} invariant is asserted under -ea.
+     * <p>Derived in O(pageCount) from the segment's {@code row -> root-docId} map ({@link #parentDocIdByRow()}):
+     * children precede their root (root last), so a page starting at row {@code r > 0} begins one doc past row
+     * {@code r-1}'s ROOT, i.e. {@code firstDocIdOf[p] = parentDocId[firstRowOf(p) - 1] + 1}. That map is a
+     * co-load of the ROOT block-join bitset in the node bitset cache, <b>pre-warmed at refresh</b> alongside
+     * that bitset (once per segment, before the reader is searchable), so this method reads it as a cache hit
+     * rather than triggering the O(totalRows) parent-bitset walk on the query path. The per-field derivation is
+     * cheap enough to run per query, so it is not itself cached. The {@code __row_id__ == root-index} invariant
+     * is asserted under -ea.
      */
-    private synchronized int[] nestedFirstDocIdOf(String field) throws IOException {
-        int[] cached = nestedFirstDocIdOfByField.get(field);
-        if (cached != null) {
-            return cached;
-        }
+    private int[] nestedFirstDocIdOf(String field) throws IOException {
         ColumnPageIndex pageIndex = producer().repeatedPageIndex(parquetFieldInfo(field), parquetPhysicalPath(field));
         int pageCount = pageIndex.pageCount();
         int[] firstDocIdOf = new int[pageCount + 1];
         firstDocIdOf[0] = 0;                 // page 0 begins at row 0, whose block starts at docId 0
         firstDocIdOf[pageCount] = maxDoc();  // sentinel: one past the last doc (root of the last row)
         if (pageCount > 1) {
-            BitSet rootBits = bits(Queries.newNonNestedFilter());
-            DocIdSetIterator roots = new BitSetIterator(rootBits, rootBits.cardinality());
-            int rootIndex = 0;
-            int rootDoc = roots.nextDoc(); // ROOT of row 0 (root index 0)
+            int[] parentDocId = parentDocIdByRow();
             for (int p = 1; p < pageCount; p++) {
-                long targetRow = pageIndex.firstRowOf(p) - 1; // page p begins one doc past this row's ROOT
-                while (rootIndex < targetRow) {
-                    rootDoc = roots.nextDoc();
-                    rootIndex++;
-                }
-                assert rootDoc != DocIdSetIterator.NO_MORE_DOCS : "ran out of ROOT docs before row " + targetRow;
+                int targetRow = Math.toIntExact(pageIndex.firstRowOf(p) - 1); // page p begins one doc past this row's ROOT
+                int rootDoc = parentDocId[targetRow];
                 firstDocIdOf[p] = rootDoc + 1;
                 assert rowIdMatches(rootDoc, targetRow) : "ROOT docId " + rootDoc + " does not carry __row_id__ " + targetRow;
             }
         }
-        nestedFirstDocIdOfByField.put(field, firstDocIdOf);
         return firstDocIdOf;
+    }
+
+    /**
+     * The segment's {@code row -> root-docId} map: {@code parentDocIdByRow[r]} is the Lucene docId of row
+     * {@code r}'s block-join ROOT. Served from the node bitset cache as a co-load of the ROOT block-join bitset
+     * (see {@link BitsetFilterCache#getParentDocIdByRow}) — pre-warmed at refresh alongside that bitset, so this
+     * is a cache hit rather than an O(totalRows) parent-bitset walk on the query path. Falls back to a one-off
+     * build from the ROOT bitset only when no cache is wired (e.g. a unit-test reader with no index cache).
+     */
+    private int[] parentDocIdByRow() throws IOException {
+        if (bitsetFilterCache != null) {
+            return bitsetFilterCache.getParentDocIdByRow(getContext());
+        }
+        return IndicesBitsetFilterCache.buildParentDocIdByRow(bits(Queries.newNonNestedFilter()));
     }
 
     /** -ea check mirroring the write-path invariant: the ROOT at {@code rootDoc} carries {@code __row_id__ == expectedRow}. */
@@ -522,6 +524,16 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     public NumericDocValues getNumericDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.NUMERIC) {
+            ObjectMapper nestedParent = nestedParentOf(field);
+            if (nestedParent != null) {
+                // Nested numeric leaf. This getter is the one FieldExistsQuery uses for a NUMERIC-typed field
+                // (i.e. an `exists` predicate inside a nested query), so it must resolve the leaf the same way
+                // the SORTED_NUMERIC/BINARY/SORTED getters do: the value lives in a repeated Parquet column
+                // addressed by the physical list.element path — the flat dotted name has no leaf column in the
+                // file. Read the child element at (row, offset) via the nested resolver. Already addressed in
+                // child-docId space, so no RowIdRemapping wrap (mirrors getSortedNumericDocValues' nested branch).
+                return producer().getNestedNumeric(fi, parquetPhysicalPath(field), newNestedResolver(nestedParent));
+            }
             RowIdResolver resolver = newRowIdResolver();
             NumericDocValues numeric = producer().getNumeric(fi);
             // IDENTITY (the guaranteed case — see newRowIdResolver) means docId == Parquet row, so the
@@ -602,9 +614,23 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     public SortedDocValues getSortedDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.SORTED) {
+            ObjectMapper nestedParent = nestedParentOf(field);
+            if (nestedParent != null) {
+                // Nested keyword leaf. A single-valued keyword is declared SORTED (see FieldTypeMapping), so
+                // FieldExistsQuery for an `exists` predicate inside a nested query lands here — it must resolve
+                // the repeated Parquet column by its physical list.element path, exactly like the nested branch
+                // in getSortedSetDocValues; the flat dotted name has no leaf column in the file. The nested
+                // iterator is child-docId addressed and never upgrades to the uninverted tier, so pass IDENTITY
+                // and do not remap.
+                return withDictionaryOrdinals(
+                    field,
+                    producer().getNestedSorted(fi, parquetPhysicalPath(field), newNestedResolver(nestedParent)),
+                    RowIdResolver.IDENTITY
+                );
+            }
             RowIdResolver resolver = newRowIdResolver();
-            SortedDocValues sorted = withDictionaryOrdinals(field, producer().getSorted(fi));
-            return resolver == RowIdResolver.IDENTITY ? sorted : RowIdRemappingDocValues.sorted(sorted, resolver, maxDoc());
+            SortedDocValues sorted = withDictionaryOrdinals(field, producer().getSorted(fi), resolver);
+            return remapSorted(sorted, resolver);
         }
         return in.getSortedDocValues(field);
     }
@@ -615,8 +641,12 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      * the composite index's Lucene sidecar (O(distinct), cached per segment) — never from a row
      * scan. Above-budget fields keep the streaming iterator, whose global-ordinal operations
      * fail fast rather than materialize.
+     *
+     * <p>{@code resolver} is threaded through only for the docId-addressed uninverted tier, which
+     * uses it to translate docId→row for its own value-bytes lookup. The row-addressed dictionary
+     * and streaming tiers ignore it (they are remapped by the caller via {@link #remapSorted}).
      */
-    private SortedDocValues withDictionaryOrdinals(String field, SortedDocValues sorted) throws IOException {
+    private SortedDocValues withDictionaryOrdinals(String field, SortedDocValues sorted, RowIdResolver resolver) throws IOException {
         // Ordinal tiers rank Parquet VALUES against the Lucene sidecar's TERMS, which only
         // coincide for untokenized (keyword) fields. A text field's terms are analyzer tokens:
         // ranking values against tokens would produce silently wrong ordinals. Text fields stay
@@ -639,10 +669,31 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             long expectedNonNull = producer().nonNullRowCount(parquetFieldInfo(field));
             UninvertedOrdinals uninverted = UninvertedOrdinalsCache.get(in, segmentReadState.segmentInfo, field, expectedNonNull);
             if (uninverted != null) {
-                return new ParquetUninvertedSortedDocValues(uninverted, streaming, maxDoc());
+                // The uninverted iterator is docId-addressed; it takes the resolver so it can translate
+                // docId→row for its own value-bytes lookup (identity for flat segments). It must NOT be
+                // wrapped in RowIdRemappingDocValues afterward — see remapSorted.
+                return new ParquetUninvertedSortedDocValues(uninverted, streaming, maxDoc(), resolver);
             }
         }
         return sorted;
+    }
+
+    /**
+     * Applies the docId→row remap wrapper only when it is both necessary and correct. Skipped for
+     * IDENTITY segments (docId == row, nothing to translate) and for {@link ParquetUninvertedSortedDocValues},
+     * which is itself docId-addressed and translates docId→row internally for value bytes — wrapping it
+     * would feed a row into its docId-keyed ordinal array and undercount high-cardinality reads. The
+     * remaining row-addressed tiers (dictionary, streaming) still require the pre-translation.
+     *
+     * <p>TODO(dv-addressing): this IDENTITY-or-instanceof branch encodes each iterator's address space
+     * at the call site rather than on the iterator itself. Generalize once this fix is verified and
+     * perf-tested — see memory project_dv_addressing_generalization.
+     */
+    private SortedDocValues remapSorted(SortedDocValues sorted, RowIdResolver resolver) {
+        if (resolver == RowIdResolver.IDENTITY || sorted instanceof ParquetUninvertedSortedDocValues) {
+            return sorted;
+        }
+        return RowIdRemappingDocValues.sorted(sorted, resolver, maxDoc());
     }
 
     @Override
@@ -666,18 +717,18 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             if (nestedParent != null) {
                 // Nested keyword leaf: read the child element at (row, offset) from the repeated Parquet
                 // column, as streaming per-doc ordinals (upgraded to dictionary ordinals when in budget).
+                // NestedParquetSortedDocValues is not a ParquetSortedDocValues, so it never upgrades to
+                // the uninverted path — the resolver arg is unused here; pass IDENTITY.
                 SortedDocValues nested = withDictionaryOrdinals(
                     field,
-                    producer().getNestedSorted(asSorted, parquetPhysicalPath(field), newNestedResolver(nestedParent))
+                    producer().getNestedSorted(asSorted, parquetPhysicalPath(field), newNestedResolver(nestedParent)),
+                    RowIdResolver.IDENTITY
                 );
                 return DocValues.singleton(nested);
             }
-            SortedDocValues sorted = withDictionaryOrdinals(field, producer().getSorted(asSorted));
             RowIdResolver resolver = newRowIdResolver();
-            SortedDocValues remapped = resolver == RowIdResolver.IDENTITY
-                ? sorted
-                : RowIdRemappingDocValues.sorted(sorted, resolver, maxDoc());
-            return DocValues.singleton(remapped);
+            SortedDocValues sorted = withDictionaryOrdinals(field, producer().getSorted(asSorted), resolver);
+            return DocValues.singleton(remapSorted(sorted, resolver));
         }
         return in.getSortedSetDocValues(field);
     }
@@ -698,7 +749,7 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             // so the per-page stats are trustworthy; getNestedSkipper opens the repeated reader by the
             // physical list.element path and reports no per-page density (forcing an inner per-doc check).
             if (nested) {
-                DocValuesSkipper sk = producer().getNestedSkipper(fi, parquetPhysicalPath(field), nestedFirstDocIdOf(field));
+                DocValuesSkipper sk = producer().getNestedSkipper(fi, parquetPhysicalPath(field), () -> nestedFirstDocIdOf(field));
                 logger.info(
                     "[SKIPPER-VERIFY] getDocValuesSkipper field={} nested=true skipIndexType={} -> {}",
                     field,

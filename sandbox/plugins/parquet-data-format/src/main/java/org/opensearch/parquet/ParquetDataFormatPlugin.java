@@ -144,6 +144,7 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         ParquetDocValuesProducer.setDictionaryCacheBytes(ParquetSettings.DOCVALUES_DICTIONARY_CACHE_BYTES.get(this.settings));
         ParquetDocValuesProducer.setUninvertMaxDiskBytes(ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_BYTES.get(this.settings));
         org.opensearch.parquet.codec.UninvertedOrdinalsCache.setOrdsDir(environment.dataFiles()[0].resolve("parquet-ords"));
+
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_INITIAL_BATCH_SIZE, ParquetDocValuesProducer::setInitialBatchSize);
         clusterService.getClusterSettings()

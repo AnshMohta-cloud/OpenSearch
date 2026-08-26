@@ -11,6 +11,7 @@ package org.opensearch.parquet.codec.iter;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.parquet.codec.RowIdResolver;
 import org.opensearch.parquet.codec.UninvertedOrdinals;
 
 import java.io.IOException;
@@ -34,16 +35,23 @@ public final class ParquetUninvertedSortedDocValues extends SortedDocValues {
     private final UninvertedOrdinals ordinals;
     private final ParquetSortedDocValues streaming;
     private final int maxDoc;
+    private final RowIdResolver resolver;
 
     private UninvertedOrdinals.TermCursor termCursor;
     private int doc = -1;
     private int currentOrd = -1;
     private boolean streamingPositioned = false;
 
-    public ParquetUninvertedSortedDocValues(UninvertedOrdinals ordinals, ParquetSortedDocValues streaming, int maxDoc) {
+    public ParquetUninvertedSortedDocValues(
+        UninvertedOrdinals ordinals,
+        ParquetSortedDocValues streaming,
+        int maxDoc,
+        RowIdResolver resolver
+    ) {
         this.ordinals = ordinals;
         this.streaming = streaming;
         this.maxDoc = maxDoc;
+        this.resolver = resolver;
     }
 
     @Override
@@ -69,8 +77,13 @@ public final class ParquetUninvertedSortedDocValues extends SortedDocValues {
         if (ord == currentOrd && doc >= 0 && doc != NO_MORE_DOCS) {
             // Per-document value access: the streaming reader serves the CURRENT document's
             // bytes from its resident page — O(1), not a terms-index walk.
+            //
+            // The ordinal array above is docId-addressed (advanceExact keeps the raw docId), but the
+            // streaming VALUE reader is Parquet-row-addressed, so translate docId→row here (identity
+            // for flat/un-merged segments). doc arrives non-decreasing, so the forward-only resolver
+            // contract holds; this is the only resolver call on the value path.
             if (streamingPositioned == false) {
-                streaming.advanceExact(doc);
+                streaming.advanceExact((int) resolver.toRowId(doc));
                 streamingPositioned = true;
             }
             return streaming.lookupOrd(streaming.ordValue());

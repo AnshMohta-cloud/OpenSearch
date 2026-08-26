@@ -182,7 +182,8 @@ public class QueryPhase {
         // nested segments. Logging these makes the docId->row work concrete.
         {
             org.apache.lucene.search.TopDocs td = searchContext.queryResult().topDocs() == null
-                ? null : searchContext.queryResult().topDocs().topDocs;
+                ? null
+                : searchContext.queryResult().topDocs().topDocs;
             String matched;
             if (searchContext.size() == 0) {
                 // size:0 uses a count-only collector (TotalHitCountCollector) — no scoreDocs are kept,
@@ -193,17 +194,22 @@ public class QueryPhase {
                 if (td != null && td.scoreDocs != null) {
                     int shown = 0;
                     for (org.apache.lucene.search.ScoreDoc sd : td.scoreDocs) {
-                        if (shown++ >= 50) { sb.append("..."); break; }
+                        if (shown++ >= 50) {
+                            sb.append("...");
+                            break;
+                        }
                         if (shown > 1) sb.append(',');
                         sb.append(sd.doc);
                     }
                 }
                 matched = sb.append(']').toString();
             }
-            LOGGER.info("[DSL-TRACE] === QueryPhase DONE shard={} totalHits={} matchedTopDocIds={} (nested: these are PARENT/root docIds)",
+            LOGGER.info(
+                "[DSL-TRACE] === QueryPhase DONE shard={} totalHits={} matchedTopDocIds={} (nested: these are PARENT/root docIds)",
                 searchContext.shardTarget(),
                 td == null ? "?" : td.totalHits.value(),
-                matched);
+                matched
+            );
         }
 
         if (rescore) { // only if we do a regular search

@@ -14,6 +14,8 @@ import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.opensearch.parquet.codec.cache.ColumnPageIndex;
 
+import java.io.IOException;
+
 /**
  * {@link DocValuesSkipper} backed by the Parquet ColumnIndex (per-page min/max/null-count),
  * exposed through the already-loaded {@link ColumnPageIndex}.
@@ -25,14 +27,15 @@ import org.opensearch.parquet.codec.cache.ColumnPageIndex;
  *
  * <p>Single level: level 0 intervals are Parquet pages (~20k rows).
  *
- * <p><b>Flat mode</b> ({@code firstDocIdOf == null}): the Row ID = Doc ID invariant makes each
+ * <p><b>Flat mode</b> (no {@code firstDocIdOf} loader): the Row ID = Doc ID invariant makes each
  * page's row range directly usable as a Lucene doc-ID range ({@code firstRowOf(p) ..
  * firstRowOf(p)+numRowsOf(p)-1}), and per-page null counts give an exact per-page value density.
  *
- * <p><b>Nested mode</b> ({@code firstDocIdOf != null}): the column is a repeated (LIST) leaf, so a
- * page holds the ELEMENTS of a contiguous run of top-level rows, and one logical row is a block-join
- * block of {@code {children..., ROOT}} Lucene docs — docId != row. The caller therefore supplies
- * {@code firstDocIdOf}: the child-docId at which each page's first row's block begins. Consecutive
+ * <p><b>Nested mode</b> (a {@code firstDocIdOf} loader is supplied): the column is a repeated (LIST) leaf,
+ * so a page holds the ELEMENTS of a contiguous run of top-level rows, and one logical row is a block-join
+ * block of {@code {children..., ROOT}} Lucene docs — docId != row. The caller therefore supplies a loader
+ * that lazily builds {@code firstDocIdOf} on the first {@link #advance(int)}: the child-docId at which each
+ * page's first row's block begins. Consecutive
  * entries tile the doc space with no gaps, so page {@code p} owns doc range
  * {@code [firstDocIdOf[p], firstDocIdOf[p+1]-1]}. Per-page value min/max still read correctly (they
  * are element bounds, so the range test — the actual page-pruning win — still applies), but per-page
@@ -68,14 +71,27 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
     private final long globalMax;
     private final int globalDocCount;
 
+    /** True in nested mode: the docId axis is block-join child-docId space, not Parquet rows. */
+    private final boolean nested;
+
     /**
-     * Nested mode only ({@code null} for flat): the child-docId at which each page's first row's
+     * Nested mode only ({@code null} for flat): lazily supplies {@link #firstDocIdOf} on the first
+     * {@link #advance(int)}. Deferring the build keeps {@link #minValue()}/{@link #maxValue()} — which
+     * Lucene's {@code SortedNumericDocValuesRangeQuery.rewrite()} probes for a whole-range short-circuit —
+     * answerable from per-page stats alone, so a query that rewrites to MatchNoDocs never triggers the
+     * O(totalRows) parent-bitset walk that builds the tiling. See {@code ParquetDocValuesLeafReader#nestedFirstDocIdOf}.
+     */
+    private final IntArrayLoader firstDocIdOfLoader;
+
+    /**
+     * Nested mode only ({@code null} for flat, and {@code null} until the first {@link #advance(int)}
+     * materializes it via {@link #firstDocIdOfLoader}): the child-docId at which each page's first row's
      * block-join block begins, length {@code pageCount + 1}. {@code firstDocIdOf[0] == 0},
      * {@code firstDocIdOf[pageCount] == maxDoc}, strictly ascending; page {@code p} owns doc range
      * {@code [firstDocIdOf[p], firstDocIdOf[p+1]-1]}. Built by the leaf reader from the ROOT block-join
      * bitset (see {@code ParquetDocValuesLeafReader#nestedFirstDocIdOf}).
      */
-    private final int[] firstDocIdOf;
+    private int[] firstDocIdOf;
 
     /** Current page index, -1 before the first advance, pageCount when exhausted. */
     private int page = -1;
@@ -85,13 +101,17 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
     }
 
     /**
-     * @param firstDocIdOf nested-mode page→first-child-docId tiling (length {@code pageCount + 1}), or
-     *                     {@code null} for a flat column where docId == row.
+     * @param firstDocIdOfLoader nested-mode loader that lazily builds the page→first-child-docId tiling
+     *                           (length {@code pageCount + 1}) on the first {@link #advance(int)}, or
+     *                           {@code null} for a flat column where docId == row. Passing a loader rather
+     *                           than a built array is what defers the O(totalRows) parent-bitset walk past
+     *                           the rewrite phase — see {@link #firstDocIdOfLoader}.
      */
-    public ParquetDocValuesSkipper(ColumnPageIndex pageIndex, int maxDoc, int[] firstDocIdOf) {
+    public ParquetDocValuesSkipper(ColumnPageIndex pageIndex, int maxDoc, IntArrayLoader firstDocIdOfLoader) {
         this.pageIndex = pageIndex;
         this.maxDoc = maxDoc;
-        this.firstDocIdOf = firstDocIdOf;
+        this.firstDocIdOfLoader = firstDocIdOfLoader;
+        this.nested = firstDocIdOfLoader != null;
         long min = Long.MAX_VALUE;
         long max = Long.MIN_VALUE;
         long withValue = 0;
@@ -99,8 +119,9 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
         for (int p = 0; p < pageIndex.pageCount(); p++) {
             // Flat: skip provably all-null pages (exact per-page null counts). Nested: null counts are in
             // element units while numRowsOf is in row units, so isAllNulls is unreliable — include every
-            // page, yielding a safe-wide global that never wrongly excludes the field.
-            boolean include = firstDocIdOf != null || pageIndex.isAllNulls(p) == false;
+            // page, yielding a safe-wide global that never wrongly excludes the field. Note this reads only
+            // per-page stats (already loaded), never the firstDocIdOf tiling — so construction stays cheap.
+            boolean include = nested || pageIndex.isAllNulls(p) == false;
             if (include) {
                 min = Math.min(min, pageIndex.minOf(p));
                 max = Math.max(max, pageIndex.maxOf(p));
@@ -126,22 +147,32 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
                     .append("+")
                     .append(pageIndex.numRowsOf(p));
             }
+            // firstDocIdOf is built lazily on the first advance() in nested mode, so it is not yet available.
             logger.info(
-                "[SKIPPER-VERIFY] create #{} nested={} pageCount={} gmin={} gmax={} perPage=({}) firstDocIdOf={}",
+                "[SKIPPER-VERIFY] create #{} nested={} pageCount={} gmin={} gmax={} perPage=({}) firstDocIdOf=deferred",
                 instanceId,
                 nested(),
                 pageIndex.pageCount(),
                 globalMin,
                 globalMax,
-                perPage,
-                java.util.Arrays.toString(firstDocIdOf)
+                perPage
             );
         }
     }
 
+    /**
+     * Lazily supplies the nested {@code firstDocIdOf} tiling on the first {@link #advance(int)}. Kept as a
+     * loader (not a pre-built array) so constructing the skipper — and answering {@link #minValue()}/
+     * {@link #maxValue()} during Lucene's rewrite — never forces the O(totalRows) parent-bitset walk.
+     */
+    @FunctionalInterface
+    public interface IntArrayLoader {
+        int[] load() throws IOException;
+    }
+
     /** True in nested mode: the docId axis is block-join child-docId space, not Parquet rows. */
     private boolean nested() {
-        return firstDocIdOf != null;
+        return nested;
     }
 
     /**
@@ -156,10 +187,17 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
     }
 
     @Override
-    public void advance(int target) {
+    public void advance(int target) throws IOException {
+        // Nested: materialize the page→child-docId tiling on first use. Deferring to scan time (here) is
+        // Fix A — Lucene's rewrite phase only probes minValue()/maxValue() (answered from per-page stats),
+        // so a query that rewrites to MatchNoDocs never triggers the O(totalRows) parent-bitset walk. The
+        // loader itself is segment-cached, so this build runs at most once per segment. Flat: no-op.
+        if (nested && firstDocIdOf == null) {
+            firstDocIdOf = firstDocIdOfLoader.load();
+        }
         if (target >= maxDoc) {
             page = pageIndex.pageCount();
-        } else if (nested()) {
+        } else if (nested) {
             page = pageForDocId(target);
         } else {
             page = pageIndex.pageForRow(target);

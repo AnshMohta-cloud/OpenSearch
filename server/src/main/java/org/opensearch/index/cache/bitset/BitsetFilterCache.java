@@ -39,6 +39,7 @@ import org.apache.lucene.search.join.BitSetProducer;
 import org.apache.lucene.util.Accountable;
 import org.apache.lucene.util.BitDocIdSet;
 import org.apache.lucene.util.BitSet;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.RemovalListener;
@@ -53,6 +54,7 @@ import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.concurrent.ExecutionException;
 
 /**
  * Per-index view into the node-level {@link IndicesBitsetFilterCache}.
@@ -116,6 +118,24 @@ public final class BitsetFilterCache extends AbstractIndexComponent
     public BitSetProducer getBitSetProducer(Query query) {
         if (indicesCache != null) {
             return indicesCache.getBitSetProducer(query, listener);
+        }
+        throw new IllegalStateException("IndicesBitsetFilterCache is not available");
+    }
+
+    /**
+     * Composite/Parquet nested only: the memoized {@code row -> root-docId} map for {@code context}'s segment,
+     * co-loaded with (and sharing the cache lifetime of) the ROOT block-join bitset in the node-level cache.
+     * The nested numeric doc-values skipper reads this to translate a Parquet page's first row into a
+     * child-docId tiling boundary, so it never rebuilds the O(totalRows) map on the query path. Pre-warmed at
+     * refresh by the shard warmer (the composite branch of {@code IndicesBitsetFilterCache.BitSetProducerWarmer}).
+     */
+    public int[] getParentDocIdByRow(LeafReaderContext context) throws IOException {
+        if (indicesCache != null) {
+            try {
+                return indicesCache.getAndLoadParentDocIdByRow(context, listener);
+            } catch (ExecutionException e) {
+                throw ExceptionsHelper.convertToOpenSearchException(e);
+            }
         }
         throw new IllegalStateException("IndicesBitsetFilterCache is not available");
     }

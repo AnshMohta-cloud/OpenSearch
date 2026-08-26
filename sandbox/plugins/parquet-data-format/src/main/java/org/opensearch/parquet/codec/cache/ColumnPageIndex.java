@@ -130,4 +130,22 @@ public final class ColumnPageIndex {
         long nc = nullCountOf[p];
         return nc >= 0 && nc == numRowsOf(p);
     }
+
+    /**
+     * True when the column may contain nulls anywhere — any page reports a positive null count, OR any page's
+     * null count is unknown ({@code -1}). Returns false only when EVERY page is known to have zero nulls.
+     *
+     * <p>Nested numeric leaves use this to decide whether every path child is guaranteed to hold exactly one
+     * value (null-free). When so, the DV iterator can navigate by the path child bitset and skip per-doc
+     * presence resolution + value decode on the predicate/count path. Unknown counts are treated as "may have
+     * nulls" so the safe (decode-and-confirm) path is taken.
+     */
+    public boolean anyNulls() {
+        for (int p = 0; p < nullCountOf.length; p++) {
+            if (nullCountOf[p] != 0L) { // -1 (unknown) or >0 → conservatively "may have nulls"
+                return true;
+            }
+        }
+        return false;
+    }
 }

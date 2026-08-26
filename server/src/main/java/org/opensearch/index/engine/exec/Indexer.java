@@ -101,7 +101,10 @@ public interface Indexer
      * @param scope   the searcher scope
      * @return a searcher supplier whose {@code close()} releases the underlying reader resources
      */
-    default Engine.SearcherSupplier acquireSearcherSupplier(Function<Engine.Searcher, Engine.Searcher> wrapper, Engine.SearcherScope scope) {
+    default Engine.SearcherSupplier acquireSearcherSupplier(
+        Function<Engine.Searcher, Engine.Searcher> wrapper,
+        Engine.SearcherScope scope
+    ) {
         throw new UnsupportedOperationException("acquireSearcherSupplier not supported by " + getClass().getName());
     }
 

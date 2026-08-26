@@ -89,4 +89,23 @@ public final class NestedElementResolver {
         }
         return offset;
     }
+
+    /**
+     * The next child docId of THIS nested path at or after {@code fromDocId}, or
+     * {@link org.apache.lucene.search.DocIdSetIterator#NO_MORE_DOCS} if none. O(1) amortized for the ascending
+     * scans block-join produces. Lets a DV iterator jump child-to-child over the block-join docId space —
+     * skipping ROOT and sibling-path docs — instead of probing every docId. Membership in {@link #pathChildBits}
+     * is the sole test; the caller decides whether membership alone proves a value is present (null-free leaf)
+     * or whether the element must still be read to confirm presence.
+     */
+    public int nextChild(int fromDocId) {
+        if (fromDocId < 0) {
+            fromDocId = 0;
+        }
+        // FixedBitSet.nextSetBit requires the index to be < length(); past the last bit there are no children.
+        if (fromDocId >= pathChildBits.length()) {
+            return org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
+        }
+        return pathChildBits.nextSetBit(fromDocId);
+    }
 }

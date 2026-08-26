@@ -1126,6 +1126,12 @@ public class DataFormatAwareEngine implements Indexer {
             }
             throw new RefreshFailedEngineException(shardId, ex);
         }
+        if (refreshed) {
+            // Locks are released and the new catalog snapshot is committed, so acquireReader() now sees the
+            // just-published segments. Warm them before any query can reach them (part of "making documents
+            // searchable"), so the nested numeric skipper never pays the parent-bitset walk per query.
+            warmReader();
+        }
         final long totalRefreshElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - refreshStartNanos);
         logger.debug("refresh[{}]: total time to make documents searchable [{}ms] refreshed={}", source, totalRefreshElapsedMs, refreshed);
     }
@@ -2075,6 +2081,43 @@ public class DataFormatAwareEngine implements Indexer {
     }
 
     /**
+     * Eagerly warms per-segment structures for the currently-published reader, before any query can reach it.
+     * This is the composite engine's stand-in for the eager warm the shard normally drives through the core
+     * {@code IndexWarmer} on refresh. Rather than maintain a parallel warm channel, it drives the SAME shard
+     * warmer the standard engine drives — {@link EngineConfig#getWarmer()} — exactly as {@code InternalEngine}
+     * does on refresh. For a composite index that warmer pre-warms the ROOT block-join bitset AND co-loads the
+     * {@code row -> root-docId} map into the node bitset cache (see the composite branch of
+     * {@code IndicesBitsetFilterCache.BitSetProducerWarmer}), so the parquet nested numeric doc-values skipper
+     * reads that map as a cache hit instead of walking the O(totalRows) parent bitset on the query path.
+     *
+     * <p>The reader is acquired and wrapped exactly as {@link #acquireSearcherSupplier} does, so the leaves
+     * warmed here carry the SAME segment core-cache keys the query-time reader delegates to — a query resolves
+     * the entry warmed here rather than rebuilding it. Driving the full shard warmer also runs the standard
+     * eager-global-ordinals fielddata warm, identical to a vanilla refresh (a no-op unless a field opts in).
+     *
+     * <p>Best-effort: a warm failure is logged, not propagated — it must not fail a refresh or a merge. A missed
+     * warm merely costs the first nested query on the new segment a one-time (then cached) map rebuild.
+     */
+    private void warmReader() {
+        try (GatedCloseable<Reader> readerRef = acquireReader()) {
+            DataFormat luceneFormat = engineConfig.getDataFormatRegistry().format("lucene");
+            Object luceneReaderObj = readerRef.get().reader(luceneFormat);
+            if (luceneReaderObj == null) {
+                return;
+            }
+            // Acquire and wrap the reader exactly as acquireSearcherSupplier does, so the leaves warmed here share
+            // the query-time segment core-cache keys. Stamping binds each Lucene leaf to its backing Parquet file.
+            DirectoryReader rawDirectoryReader = extractDirectoryReader(luceneReaderObj);
+            stampParquetDocValuesFiles(rawDirectoryReader, readerRef.get().catalogSnapshot());
+            OpenSearchDirectoryReader osReader = OpenSearchDirectoryReader.wrap(rawDirectoryReader, shardId);
+            // Drive the standard shard warmer (InternalEngine does exactly this via getWarmer().warm(reader)).
+            engineConfig.getWarmer().warm(osReader);
+        } catch (Exception e) {
+            logger.warn("composite reader warm failed; nested numeric queries on new segments may pay a one-time rebuild", e);
+        }
+    }
+
+    /**
      * Acquires a point-in-time {@link Engine.SearcherSupplier} built from this engine's Lucene-format
      * {@link DirectoryReader}. This lets the standard {@code _search} → {@code QueryPhase} path reach
      * composite-engine shards without {@link org.opensearch.index.shard.IndexShard} ever depending on
@@ -2166,7 +2209,8 @@ public class DataFormatAwareEngine implements Indexer {
             return searchable.directoryReader();
         }
         throw new IllegalStateException(
-            "Lucene format reader " + luceneReaderObj.getClass().getName()
+            "Lucene format reader "
+                + luceneReaderObj.getClass().getName()
                 + " does not implement SearchableDirectoryReaderProvider; cannot build searcher"
         );
     }
@@ -2278,6 +2322,10 @@ public class DataFormatAwareEngine implements Indexer {
                     refreshListener.afterRefresh(true);
                 }
             }
+            // A merge publishes the merged segment via the swapped catalog without going through refresh(), so
+            // warm its nested row->root-docId map here too — otherwise a post-merge query would hit an unwarmed
+            // segment and throw (no lazy fallback by design). Idempotent for already-warmed segments.
+            warmReader();
         } catch (Exception ex) {
             try {
                 logger.error(() -> new ParameterizedMessage("Merge failed while registering merged files in Snapshot"), ex);
