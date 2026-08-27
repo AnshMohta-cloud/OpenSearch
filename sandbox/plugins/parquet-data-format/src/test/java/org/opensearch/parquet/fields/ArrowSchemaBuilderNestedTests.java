@@ -127,6 +127,68 @@ public class ArrowSchemaBuilderNestedTests extends MapperServiceTestCase {
         assertTrue(child(replyElement, "text").getType() instanceof ArrowType.Utf8);
     }
 
+    /**
+     * A {@code flat_object} inside a nested field (the OTel {@code events.attributes} shape) becomes a
+     * {@code MAP<Utf8,Utf8>} child of the element struct — the open key space — instead of exploded
+     * dotted leaf columns. Regression guard: before {@code buildMapField} was shared with
+     * {@code buildNestedListField}, a nested flat_object produced a MAP type with NO children.
+     */
+    public void testFlatObjectInNestedBecomesMap() throws Exception {
+        MapperService mapperService = createMapperService(mapping(b -> {
+            b.startObject("events");
+            {
+                b.field("type", "nested");
+                b.startObject("properties");
+                {
+                    b.startObject("name").field("type", "keyword").endObject();
+                    b.startObject("attributes").field("type", "flat_object").endObject();
+                    b.startObject("droppedAttributesCount").field("type", "integer").endObject();
+                }
+                b.endObject();
+            }
+            b.endObject();
+        }));
+
+        Schema schema = ArrowSchemaBuilder.getSchema(mapperService);
+        Field element = onlyChild(findTop(schema, "events"));
+        assertTrue(element.getType() instanceof ArrowType.Struct);
+        // Struct children are name-sorted: [attributes, droppedAttributesCount, name].
+        assertEquals(List.of("attributes", "droppedAttributesCount", "name"), childNames(element));
+
+        Field attributes = child(element, "attributes");
+        assertTrue("attributes is a MAP", attributes.getType() instanceof ArrowType.Map);
+        Field entries = onlyChild(attributes);
+        assertEquals("key_value", entries.getName());
+        assertTrue("map entries are a STRUCT", entries.getType() instanceof ArrowType.Struct);
+        assertEquals(List.of("key", "value"), childNames(entries));
+        assertTrue(child(entries, "key").getType() instanceof ArrowType.Utf8);
+        assertTrue(child(entries, "value").getType() instanceof ArrowType.Utf8);
+        assertFalse("map key must be non-null", child(entries, "key").isNullable());
+        assertFalse("map entries struct must be non-null", entries.isNullable());
+    }
+
+    /**
+     * A top-level {@code flat_object} becomes one {@code MAP<Utf8,Utf8>} column with the canonical
+     * {@code key_value} entries group — the same shape the nested case gets.
+     */
+    public void testTopLevelFlatObjectBecomesMap() throws Exception {
+        MapperService mapperService = createMapperService(mapping(b -> {
+            b.startObject("title").field("type", "keyword").endObject();
+            b.startObject("attributes").field("type", "flat_object").endObject();
+        }));
+
+        Schema schema = ArrowSchemaBuilder.getSchema(mapperService);
+        assertTrue(findTop(schema, "title").getType() instanceof ArrowType.Utf8);
+
+        Field attributes = findTop(schema, "attributes");
+        assertNotNull("flat_object must be emitted as a column", attributes);
+        assertTrue("flat_object column is a MAP", attributes.getType() instanceof ArrowType.Map);
+        Field entries = onlyChild(attributes);
+        assertEquals("key_value", entries.getName());
+        assertEquals(List.of("key", "value"), childNames(entries));
+        assertFalse("map key must be non-null", child(entries, "key").isNullable());
+    }
+
     /** A purely flat mapping produces no LIST columns; every declared leaf stays a flat top-level column. */
     public void testFlatMappingHasNoListColumns() throws Exception {
         MapperService mapperService = createMapperService(mapping(b -> {

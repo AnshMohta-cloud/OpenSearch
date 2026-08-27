@@ -208,9 +208,10 @@ public class CompositeFieldCapabilityIT extends AbstractCompositeEngineIT {
         assertTrue(ex.getMessage().contains("nested type is not supported with pluggable data format"));
     }
 
-    public void testFlatObjectFieldUnsupported() {
+    public void testFlatObjectFieldSupported() {
         startCluster();
-        assertIndexCreationFails("test-flat-object", "field", "type=flat_object");
+        // flat_object is now ingested as a Parquet MAP<utf8,utf8> column, so index creation succeeds.
+        assertIndexCreationSucceeds("test-flat-object", "field", "type=flat_object");
     }
 
     public void testWildcardFieldUnsupported() {

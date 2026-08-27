@@ -17,6 +17,7 @@ import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -312,6 +313,96 @@ public class VSRManagerNestedTests extends ParquetBaseTests {
         }
     }
 
+    /**
+     * MAP-in-STRUCT: three events whose {@code attributes} flat_object carries DIFFERENT dynamic keys —
+     * plus one event with NO attributes. Every key of every element must survive (the anti-regression for
+     * dropping keys under a frozen schema), and the empty-attributes element must write an empty,
+     * non-null map with contiguous offsets.
+     */
+    public void testWriteChildListMapPreservesAllDynamicKeys() throws Exception {
+        KeywordFieldMapper.KeywordFieldType name = new KeywordFieldMapper.KeywordFieldType("events.name");
+        // addMapEntry only reads mapField.name(), so any MappedFieldType so named stands in for the
+        // flat_object field type.
+        KeywordFieldMapper.KeywordFieldType attrs = new KeywordFieldMapper.KeywordFieldType("events.attributes");
+
+        ParquetDocumentInput doc = new ParquetDocumentInput();
+        // e0: two keys
+        doc.startNestedChild("events");
+        doc.addField(name, "e0");
+        doc.addMapEntry(attrs, "http.method", "GET");
+        doc.addMapEntry(attrs, "http.status", "200");
+        doc.endNestedChild();
+        // e1: a completely different key
+        doc.startNestedChild("events");
+        doc.addField(name, "e1");
+        doc.addMapEntry(attrs, "db.system", "postgres");
+        doc.endNestedChild();
+        // e2: no attributes at all
+        doc.startNestedChild("events");
+        doc.addField(name, "e2");
+        doc.endNestedChild();
+
+        try (ListVector events = newListOfStruct("events", List.of(utf8("name"), mapField("attributes")))) {
+            invokeWriteChildList(events, 0, "events", doc.getNestedChildren());
+            events.setValueCount(1);
+
+            assertEquals(0, events.getElementStartIndex(0));
+            assertEquals(3, events.getElementEndIndex(0));
+
+            StructVector struct = (StructVector) events.getDataVector();
+            VarCharVector nameVec = (VarCharVector) struct.getChild("name");
+            assertEquals("e0", nameVec.getObject(0).toString());
+            assertEquals("e1", nameVec.getObject(1).toString());
+            assertEquals("e2", nameVec.getObject(2).toString());
+
+            MapVector mapVec = (MapVector) struct.getChild("attributes");
+            // Offsets must be contiguous across all three elements: [0,2) [2,3) [3,3)
+            assertEquals(0, mapVec.getElementStartIndex(0));
+            assertEquals(2, mapVec.getElementEndIndex(0));
+            assertEquals(2, mapVec.getElementStartIndex(1));
+            assertEquals(3, mapVec.getElementEndIndex(1));
+            assertEquals(3, mapVec.getElementStartIndex(2));
+            assertEquals(3, mapVec.getElementEndIndex(2));
+            assertFalse("empty map is non-null, not null", mapVec.isNull(2));
+
+            StructVector entries = (StructVector) mapVec.getDataVector();
+            VarCharVector keys = (VarCharVector) entries.getChild(MapVector.KEY_NAME);
+            VarCharVector values = (VarCharVector) entries.getChild(MapVector.VALUE_NAME);
+            assertEquals("http.method", keys.getObject(0).toString());
+            assertEquals("GET", values.getObject(0).toString());
+            assertEquals("http.status", keys.getObject(1).toString());
+            assertEquals("200", values.getObject(1).toString());
+            // e1's distinct dynamic key survived rather than being dropped to match e0's key set.
+            assertEquals("db.system", keys.getObject(2).toString());
+            assertEquals("postgres", values.getObject(2).toString());
+        }
+    }
+
+    /** Duplicate keys are preserved: a parquet MAP is a repeated group, so {@code {"a":[1,2]}} keeps both. */
+    public void testWriteChildListMapPreservesDuplicateKeys() throws Exception {
+        KeywordFieldMapper.KeywordFieldType attrs = new KeywordFieldMapper.KeywordFieldType("events.attributes");
+        ParquetDocumentInput doc = new ParquetDocumentInput();
+        doc.startNestedChild("events");
+        doc.addMapEntry(attrs, "a", "1");
+        doc.addMapEntry(attrs, "a", "2");
+        doc.endNestedChild();
+
+        try (ListVector events = newListOfStruct("events", List.of(mapField("attributes")))) {
+            invokeWriteChildList(events, 0, "events", doc.getNestedChildren());
+            events.setValueCount(1);
+
+            MapVector mapVec = (MapVector) ((StructVector) events.getDataVector()).getChild("attributes");
+            assertEquals(2, mapVec.getElementEndIndex(0) - mapVec.getElementStartIndex(0));
+            StructVector entries = (StructVector) mapVec.getDataVector();
+            VarCharVector keys = (VarCharVector) entries.getChild(MapVector.KEY_NAME);
+            VarCharVector values = (VarCharVector) entries.getChild(MapVector.VALUE_NAME);
+            assertEquals("a", keys.getObject(0).toString());
+            assertEquals("a", keys.getObject(1).toString());
+            assertEquals("1", values.getObject(0).toString());
+            assertEquals("2", values.getObject(1).toString());
+        }
+    }
+
     // --- helpers ---
 
     private void invokeWriteChildList(ListVector list, int rowIndex, String path, List<ParquetDocumentInput.NestedChild> children)
@@ -321,6 +412,14 @@ public class VSRManagerNestedTests extends ParquetBaseTests {
 
     private static Field utf8(String name) {
         return new Field(name, FieldType.nullable(new ArrowType.Utf8()), null);
+    }
+
+    /** Mirrors {@code ArrowSchemaBuilder.buildMapField}: {@code MAP<Utf8,Utf8>} with a {@code key_value} struct. */
+    private static Field mapField(String name) {
+        Field key = new Field("key", new FieldType(false, ArrowType.Utf8.INSTANCE, null), null);
+        Field value = new Field("value", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field entries = new Field("key_value", new FieldType(false, ArrowType.Struct.INSTANCE, null), List.of(key, value));
+        return new Field(name, FieldType.nullable(new ArrowType.Map(false)), List.of(entries));
     }
 
     private static Field int32(String name) {
