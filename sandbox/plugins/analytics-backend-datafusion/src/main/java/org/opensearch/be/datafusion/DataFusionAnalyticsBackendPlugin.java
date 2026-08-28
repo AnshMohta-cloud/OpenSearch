@@ -99,6 +99,11 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         // advertise a scan capability for NESTED — otherwise OpenSearchTableScanRule finds
         // no viable backend for a `comments` projection and rejects the plan.
         SUPPORTED_FIELD_TYPES.add(FieldType.NESTED);
+        // flat_object: DataFusion scans the Parquet MAP<utf8,utf8> column, so — exactly as for
+        // NESTED above — it must advertise a scan capability for MAP. Otherwise a mapping
+        // containing a flat_object leaves the scan with no value-producing backend and the plan
+        // collapses to Lucene ("No backend supports SORT capability among [lucene]").
+        SUPPORTED_FIELD_TYPES.add(FieldType.MAP);
     }
 
     // Filter-side scalar functions DataFusion can evaluate natively. Comparisons, arithmetic

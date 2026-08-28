@@ -73,8 +73,10 @@ public enum FieldType {
      * mode ({@code JSON_EXTRACT_ALL} returns {@code MAP<VARCHAR, VARCHAR>}) and PPL
      * {@code parse} (named regex groups returned as {@code MAP<VARCHAR, VARCHAR>}). Mapping
      * string is {@code "map"} as a placeholder — no OpenSearch storage format declares this
-     * mapping today, so {@link #fromMappingType} never resolves to it through the mapping
-     * path; columns reach MAP only through {@link #fromSqlTypeName}. Capability registrations
+     * mapping today. {@code flat_object} is resolved to MAP explicitly by
+     * {@link #fromMappingType} because a columnar primary stores it as one
+     * {@code MAP<utf8,utf8>} column; other columns reach MAP through
+     * {@link #fromSqlTypeName}. Capability registrations
      * for filter / project operators on MAP columns are intentionally minimal: callers (e.g.
      * PPL {@code where doc.user.name}) always wrap the MAP column in an ITEM lookup whose
      * result type is the map's value type, so the EQUALS / sort / aggregate operators see
@@ -116,6 +118,14 @@ public enum FieldType {
     public static FieldType fromMappingType(String type) {
         if (type == null) {
             return null;
+        }
+        // flat_object has an open key space that a columnar primary stores as a single
+        // MAP<utf8,utf8> column (see ArrowSchemaBuilder.buildMapField), so it resolves to MAP
+        // rather than to a dedicated FieldType. Without this the field's FieldType is null and
+        // scan/filter capability lookups match nothing, so DataFusion is dropped as a viable
+        // backend for the whole scan ("No backend supports SORT capability among [lucene]").
+        if ("flat_object".equals(type)) {
+            return MAP;
         }
         for (FieldType fieldType : values()) {
             if (fieldType.mappingType.equals(type)) {

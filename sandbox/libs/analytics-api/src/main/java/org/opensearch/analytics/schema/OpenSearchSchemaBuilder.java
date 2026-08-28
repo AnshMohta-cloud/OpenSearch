@@ -174,7 +174,8 @@ public class OpenSearchSchemaBuilder {
      *   <li>boolean -> BOOLEAN</li>
      *   <li>date/date_nanos -> TIMESTAMP</li>
      *   <li>ip/binary -> VARBINARY</li>
-     *   <li>everything else (geo_point, geo_shape, nested, object, flat_object, completion,
+     *   <li>flat_object -> MAP(VARCHAR, VARCHAR) (handled in {@link #buildLeafType}, not here)</li>
+     *   <li>everything else (geo_point, geo_shape, nested, object, completion,
      *       constant_keyword, wildcard, alias, dense_vector, sparse_vector, percolator,
      *       *_range, token_count, version, plus genuinely unknown plugin types) -> {@code null}</li>
      * </ul>
@@ -254,6 +255,17 @@ public class OpenSearchSchemaBuilder {
         }
         if (BinaryType.NAME.equals(opensearchType)) {
             return BinaryType.nullable();
+        }
+        // flat_object is stored by the columnar primary as one MAP<utf8,utf8> column (see
+        // ArrowSchemaBuilder.buildMapField), so the logical schema must declare a MAP of the same
+        // shape. Dropping it instead is NOT harmless inside a nested field: the read-side struct
+        // would then have fewer children than the parquet element struct, and DataFusion rejects the
+        // whole scan with "Field 'events' in Substrait schema has a different type ...", making even
+        // scalar-only queries on that index fail. Keys and values are both VARCHAR because
+        // flat_object stringifies every leaf value.
+        if ("flat_object".equals(opensearchType)) {
+            RelDataType varchar = typeFactory.createTypeWithNullability(typeFactory.createSqlType(SqlTypeName.VARCHAR), true);
+            return typeFactory.createTypeWithNullability(typeFactory.createMapType(varchar, varchar), true);
         }
         if ("date".equals(opensearchType) || "date_nanos".equals(opensearchType)) {
             int precision = "date_nanos".equals(opensearchType) ? 9 : 3;
