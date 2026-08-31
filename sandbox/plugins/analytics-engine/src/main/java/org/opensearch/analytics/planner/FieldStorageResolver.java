@@ -91,10 +91,40 @@ public class FieldStorageResolver {
                 }
                 throw new IllegalStateException("Field [" + fieldName + "] has no type in mapping");
             }
-            // POC nested (N1): skip "nested" type fields — they're stored as LIST<STRUCT> in Parquet
-            // and have no traditional field storage entry. The Calcite schema registers them as
-            // ARRAY(ROW(...)) which the planner handles separately via the UNNEST rewrite.
+            // A "nested" mapping DOES have field storage, in both formats: the columnar primary
+            // stores it as one LIST<STRUCT> column, and the Lucene secondary indexes every leaf
+            // beneath it as a multi-valued field on the same document (one Lucene doc per row —
+            // see LuceneDocumentInput). Registering it matters because FieldStorageInfo is what the
+            // planner's viability check keys off: with no entry, OpenSearchTableScanRule substitutes
+            // a derived placeholder whose empty format lists and isDerived=true make Lucene
+            // non-viable, and OpenSearchFilterRule then drops Lucene from the viable set before
+            // NestedAnyMatchExprSerializer#canServe is ever consulted — so no nested predicate could
+            // be delegated at all, regardless of its shape.
+            //
+            // FieldType.NESTED, not ARRAY: NESTED is the type the codebase uses for a *mapped*
+            // nested column (DataFusion advertises a scan capability for it precisely so the scan
+            // rule finds a value-producing backend), whereas ARRAY is reserved for array-*returning
+            // expressions* and is intentionally excluded from DataFusion's scan types. Recurse
+            // afterwards so the leaves ("events.name", ...) are registered too, since a per-leaf
+            // lookup is what any leaf-grained viability check needs.
             if ("nested".equals(fieldType)) {
+                boolean leavesIndexed = !Boolean.FALSE.equals(fieldProps.get("index"));
+                this.fieldStorage.put(
+                    fieldName,
+                    new FieldStorageInfo(
+                        fieldName,
+                        fieldType,
+                        FieldType.NESTED,
+                        List.of(primaryFormat),
+                        (leavesIndexed && luceneAvailable) ? List.of(LUCENE_FORMAT) : List.of(),
+                        List.of(),
+                        false
+                    )
+                );
+                Map<String, Object> nestedLeaves = (Map<String, Object>) fieldProps.get("properties");
+                if (nestedLeaves != null) {
+                    populateFromProperties(nestedLeaves, fieldName, primaryFormat, luceneAvailable);
+                }
                 continue;
             }
             this.fieldStorage.put(fieldName, resolveField(fieldName, fieldType, fieldProps, primaryFormat, luceneAvailable));

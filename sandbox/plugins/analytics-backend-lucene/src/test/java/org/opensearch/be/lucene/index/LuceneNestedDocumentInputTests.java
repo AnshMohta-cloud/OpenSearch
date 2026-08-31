@@ -9,130 +9,97 @@
 package org.opensearch.be.lucene.index;
 
 import org.apache.lucene.document.Document;
-import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.IndexableField;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Tests the nested-block behavior of {@link LuceneDocumentInput}: the {@code startNestedChild} /
- * {@code endNestedChild} signals must reproduce vanilla OpenSearch's nested Lucene block, i.e. every
- * nested object materializes as its OWN child {@link Document} (carrying a {@code _nested_path} term
- * and its own leaf fields), laid out children-first / root-last in post-order for
- * {@code IndexWriter.addDocuments}.
+ * Tests that {@link LuceneDocumentInput} writes exactly ONE Lucene document per logical document.
+ *
+ * <p>Unlike vanilla OpenSearch, nested array elements do NOT become child documents. Every nested leaf
+ * collapses into a MULTI-VALUED field on the single row document (one value per element, in parse order),
+ * and no {@code _nested_path} term is ever written. This keeps the Lucene docId equal to the Parquet
+ * rowId, which is what lets Lucene hand DataFusion a row-skipping bitset directly.
+ *
+ * <p>Dropping the element boundary is sound on this path because DataFusion re-evaluates the full query
+ * over the Parquet {@code LIST<STRUCT>}: losing "which element matched" can only ever produce false
+ * positives, never false negatives.
  */
 public class LuceneNestedDocumentInputTests extends LucenePluginBaseTests {
 
-    /** (a) A flat doc emits no nested children: block == [root] and hasNestedChildren == false. */
-    public void testFlatDocumentProducesSingleRootBlock() {
+    /** A flat doc produces one document holding its own leaf and no nested marker. */
+    public void testFlatDocumentProducesSingleDocument() {
         LuceneDocumentInput input = new LuceneDocumentInput();
         input.addField(mockKeywordField("status"), "active");
 
-        assertFalse("a flat doc must not report nested children", input.hasNestedChildren());
-
-        List<Document> block = input.getDocumentBlock();
-        assertEquals("flat block is just the root", 1, block.size());
-        assertSame("the single block entry is the root document", input.getFinalInput(), block.get(0));
-        assertNotNull("root keeps its own leaf field", block.get(0).getField("status"));
-        assertNull("root never carries a _nested_path", block.get(0).getField(DocumentInput.NESTED_PATH_FIELD));
+        Document doc = input.getFinalInput();
+        assertEquals(List.of("active"), valuesOf(doc, "status"));
+        assertNoNestedPath(doc);
+        assertEquals("balanced signals leave depth at zero", 0, input.nestedDepth());
     }
 
     /**
-     * (b) Single-level nested with two children: block == [child0, child1, root]. Each child carries a
-     * {@code _nested_path} term equal to the path and its own leaf on the correct child; the root carries
-     * neither the nested leaf nor a {@code _nested_path}.
+     * Two nested elements collapse into one multi-valued field on the row doc, in parse order. The root's
+     * own leaf is unaffected and there is no {@code _nested_path}.
      */
-    public void testSingleLevelNestedTwoChildren() {
+    public void testNestedElementsCollapseIntoMultiValuedField() {
         MappedFieldType rootField = mockKeywordField("title");
         MappedFieldType commentAuthor = mockKeywordField("comments.author");
 
         LuceneDocumentInput input = new LuceneDocumentInput();
-        input.addField(rootField, "post-title"); // lands on root (no child open)
+        input.addField(rootField, "post-title");
 
         input.startNestedChild("comments");
-        input.addField(commentAuthor, "alice"); // lands on child0
+        input.addField(commentAuthor, "alice");
         input.endNestedChild();
 
         input.startNestedChild("comments");
-        input.addField(commentAuthor, "bob"); // lands on child1
+        input.addField(commentAuthor, "bob");
         input.endNestedChild();
 
-        assertTrue(input.hasNestedChildren());
-        List<Document> block = input.getDocumentBlock();
-        assertEquals("two children + root", 3, block.size());
-
-        Document child0 = block.get(0);
-        Document child1 = block.get(1);
-        Document root = block.get(2);
-        assertSame("root is last in the block", input.getFinalInput(), root);
-
-        assertNestedPath(child0, "comments");
-        assertNestedPath(child1, "comments");
-        assertEquals("alice", child0.getField("comments.author").stringValue());
-        assertEquals("bob", child1.getField("comments.author").stringValue());
-
-        // Root carries only its own leaf, never the nested leaf nor a _nested_path.
-        assertEquals("post-title", root.getField("title").stringValue());
-        assertNull(root.getField("comments.author"));
-        assertNull(root.getField(DocumentInput.NESTED_PATH_FIELD));
+        Document doc = input.getFinalInput();
+        assertEquals("one value per element, in parse order", List.of("alice", "bob"), valuesOf(doc, "comments.author"));
+        assertEquals(2, input.getFieldCount("comments.author"));
+        assertEquals(List.of("post-title"), valuesOf(doc, "title"));
+        assertNoNestedPath(doc);
+        assertEquals(0, input.nestedDepth());
     }
 
     /**
-     * (c) Multi-level nested (comments -> replies, depth 2/3) plus a sibling comment. Children must land
-     * in POST-ORDER: a deeper child closes before its enclosing element, so the block is
-     * [reply(depth-2), comment0(depth-1), comment1(depth-1), root]. Each child's {@code _nested_path} is
-     * its full dotted path.
+     * Multi-level nesting: leaves from every level land on the same row doc, each multi-valued according
+     * to how many elements contributed a value. Element identity is deliberately not preserved.
      */
-    public void testMultiLevelNestedPostOrder() {
+    public void testMultiLevelNestedAllLeavesLandOnRowDoc() {
         MappedFieldType commentAuthor = mockKeywordField("comments.author");
         MappedFieldType replyText = mockKeywordField("comments.replies.text");
 
         LuceneDocumentInput input = new LuceneDocumentInput();
 
-        // comment0 with one reply (depth 2)
+        // comment0 with one reply
         input.startNestedChild("comments");
         input.addField(commentAuthor, "alice");
         input.startNestedChild("comments.replies");
         input.addField(replyText, "nice");
-        input.endNestedChild(); // reply closes first
-        input.endNestedChild(); // then comment0
+        input.endNestedChild();
+        input.endNestedChild();
 
-        // comment1, a flat sibling (depth 1)
+        // comment1, no replies
         input.startNestedChild("comments");
         input.addField(commentAuthor, "bob");
         input.endNestedChild();
 
-        List<Document> block = input.getDocumentBlock();
-        assertEquals("reply + comment0 + comment1 + root", 4, block.size());
-
-        // Post-order: deepest (reply) first, then its enclosing comment, then the sibling, root last.
-        Document reply = block.get(0);
-        Document comment0 = block.get(1);
-        Document comment1 = block.get(2);
-        Document root = block.get(3);
-
-        assertNestedPath(reply, "comments.replies");
-        assertEquals("nice", reply.getField("comments.replies.text").stringValue());
-        assertNull("reply holds only its own leaf", reply.getField("comments.author"));
-
-        assertNestedPath(comment0, "comments");
-        assertEquals("alice", comment0.getField("comments.author").stringValue());
-        assertNull("the reply leaf belongs to the reply child, not the comment", comment0.getField("comments.replies.text"));
-
-        assertNestedPath(comment1, "comments");
-        assertEquals("bob", comment1.getField("comments.author").stringValue());
-
-        assertSame(input.getFinalInput(), root);
-        assertNull(root.getField(DocumentInput.NESTED_PATH_FIELD));
+        Document doc = input.getFinalInput();
+        assertEquals(List.of("alice", "bob"), valuesOf(doc, "comments.author"));
+        assertEquals(List.of("nice"), valuesOf(doc, "comments.replies.text"));
+        assertNoNestedPath(doc);
+        assertEquals(0, input.nestedDepth());
     }
 
-    /**
-     * (c') Depth-3 chain (comments -> replies -> reactions): the block must be strictly deepest-first
-     * [reaction, reply, comment, root].
-     */
-    public void testThreeLevelNestedPostOrder() {
+    /** A depth-3 chain still yields a single document carrying every level's leaf. */
+    public void testThreeLevelNestedProducesSingleDocument() {
         LuceneDocumentInput input = new LuceneDocumentInput();
         input.startNestedChild("comments");
         input.addField(mockKeywordField("comments.author"), "alice");
@@ -140,35 +107,31 @@ public class LuceneNestedDocumentInputTests extends LucenePluginBaseTests {
         input.addField(mockKeywordField("comments.replies.text"), "r1");
         input.startNestedChild("comments.replies.reactions");
         input.addField(mockKeywordField("comments.replies.reactions.emoji"), "smile");
+        assertEquals("three levels open", 3, input.nestedDepth());
         input.endNestedChild(); // reactions
         input.endNestedChild(); // replies
         input.endNestedChild(); // comments
 
-        List<Document> block = input.getDocumentBlock();
-        assertEquals(4, block.size());
-        assertNestedPath(block.get(0), "comments.replies.reactions");
-        assertNestedPath(block.get(1), "comments.replies");
-        assertNestedPath(block.get(2), "comments");
-        assertSame("root last", input.getFinalInput(), block.get(3));
-        assertEquals("smile", block.get(0).getField("comments.replies.reactions.emoji").stringValue());
+        Document doc = input.getFinalInput();
+        assertEquals(List.of("alice"), valuesOf(doc, "comments.author"));
+        assertEquals(List.of("r1"), valuesOf(doc, "comments.replies.text"));
+        assertEquals(List.of("smile"), valuesOf(doc, "comments.replies.reactions.emoji"));
+        assertNoNestedPath(doc);
+        assertEquals(0, input.nestedDepth());
     }
 
-    /**
-     * (d) An empty nested array yields no child docs. The parser emits no start/end signals for zero
-     * elements, so the document stays flat — block == [root], hasNestedChildren == false.
-     */
-    public void testEmptyNestedArrayProducesNoChildDocs() {
+    /** An empty nested array emits no start/end signals, so the doc is simply flat. */
+    public void testEmptyNestedArrayStillOneDocument() {
         LuceneDocumentInput input = new LuceneDocumentInput();
         input.addField(mockKeywordField("title"), "only-root");
-        // (no startNestedChild calls — an empty array contributes no elements)
 
-        assertFalse(input.hasNestedChildren());
-        List<Document> block = input.getDocumentBlock();
-        assertEquals(1, block.size());
-        assertSame(input.getFinalInput(), block.get(0));
+        Document doc = input.getFinalInput();
+        assertEquals(List.of("only-root"), valuesOf(doc, "title"));
+        assertNoNestedPath(doc);
+        assertEquals(0, input.nestedDepth());
     }
 
-    /** (e) Closing a nested child when none is open is a programming error and must fail fast. */
+    /** Closing a nested child when none is open is a programming error and must fail fast. */
     public void testEndNestedChildWithoutOpenChildThrows() {
         LuceneDocumentInput input = new LuceneDocumentInput();
         IllegalStateException e = expectThrows(IllegalStateException.class, input::endNestedChild);
@@ -176,10 +139,10 @@ public class LuceneNestedDocumentInputTests extends LucenePluginBaseTests {
     }
 
     /**
-     * The row ID is a root-only marker: {@code setRowId} writes {@code __row_id__} onto the root document
-     * only, never onto any nested child (children are correlated to their root via the block layout).
+     * {@code __row_id__} lands on the one and only document, so the Lucene docId ↔ Parquet rowId identity
+     * holds without any per-child bookkeeping.
      */
-    public void testSetRowIdWritesOnRootOnly() {
+    public void testSetRowIdWritesOnTheRowDocument() {
         LuceneDocumentInput input = new LuceneDocumentInput();
         input.startNestedChild("comments");
         input.addField(mockKeywordField("comments.author"), "alice");
@@ -187,19 +150,22 @@ public class LuceneNestedDocumentInputTests extends LucenePluginBaseTests {
         input.setRowId(DocumentInput.ROW_ID_FIELD, 7L);
 
         assertEquals(7L, input.getRowId());
-        List<Document> block = input.getDocumentBlock();
-        Document child = block.get(0);
-        Document root = block.get(1);
-        assertNull("child must not carry __row_id__", child.getField(DocumentInput.ROW_ID_FIELD));
-        assertNotNull("root carries __row_id__", root.getField(DocumentInput.ROW_ID_FIELD));
+        Document doc = input.getFinalInput();
+        assertNotNull("the row doc carries __row_id__", doc.getField(DocumentInput.ROW_ID_FIELD));
+        assertEquals(1, doc.getFields(DocumentInput.ROW_ID_FIELD).length);
     }
 
-    /** Asserts the doc carries a postings-only, not-stored {@code _nested_path} term equal to {@code expected}. */
-    private static void assertNestedPath(Document doc, String expected) {
-        IndexableField path = doc.getField(DocumentInput.NESTED_PATH_FIELD);
-        assertNotNull("child must carry a _nested_path", path);
-        assertEquals(expected, path.stringValue());
-        assertFalse("_nested_path is not stored", path.fieldType().stored());
-        assertNotEquals("_nested_path is indexed as a term", IndexOptions.NONE, path.fieldType().indexOptions());
+    /** Values of {@code field} on {@code doc}, in the order they were added. */
+    private static List<String> valuesOf(Document doc, String field) {
+        List<String> values = new ArrayList<>();
+        for (IndexableField f : doc.getFields(field)) {
+            values.add(f.stringValue());
+        }
+        return values;
+    }
+
+    /** No nested marker is ever written now that nested elements are not separate documents. */
+    private static void assertNoNestedPath(Document doc) {
+        assertNull("_nested_path must never be written", doc.getField(DocumentInput.NESTED_PATH_FIELD));
     }
 }

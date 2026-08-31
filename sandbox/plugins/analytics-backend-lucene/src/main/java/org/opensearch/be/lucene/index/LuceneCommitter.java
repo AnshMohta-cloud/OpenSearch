@@ -382,15 +382,14 @@ public class LuceneCommitter extends SafeBootstrapCommitter {
         List<String> secondaryFormats = engineConfig.getIndexSettings().getSettings().getAsList("index.composite.secondary_data_formats");
         boolean isSecondary = secondaryFormats.contains("lucene");
 
+        // No setParentField on either branch: LuceneWriter writes exactly one Lucene doc per logical
+        // document (nested leaves are multi-valued fields), so there are no document blocks to keep
+        // contiguous. Both writers must agree — declaring a parent field here while the ingest writer
+        // does not (or vice versa) makes the index unopenable.
         if (isSecondary) {
             iwc.setIndexSort(new Sort(new SortedNumericSortField(DocumentInput.ROW_ID_FIELD, SortField.Type.LONG)));
-            // Must match the parent field the per-generation ingest writer (LuceneWriter) set, so segments
-            // carrying nested __nested_parent blocks can be committed/merged (addIndexes) by this writer too
-            // while keeping parent+children blocks contiguous through the sorted merge.
-            iwc.setParentField(LuceneWriter.NESTED_PARENT_FIELD);
         } else if (userProvidedSort != null) {
             iwc.setIndexSort(userProvidedSort);
-            iwc.setParentField(LuceneWriter.NESTED_PARENT_FIELD);
         }
         iwc.setCommitOnClose(false);
         iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);

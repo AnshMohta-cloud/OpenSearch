@@ -76,6 +76,8 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
     private final Map<Long, String> generationToSegmentName;
 
     private final ConcurrentHashMap<Integer, Weight> weightsByProviderKey = new ConcurrentHashMap<>();
+    /** providerKey -> annotationId, so every emitted bitset can be attributed to the predicate that asked for it. */
+    private final ConcurrentHashMap<Integer, Integer> annotationIdByProviderKey = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, ScorerHandle> scorersByCollectorKey = new ConcurrentHashMap<>();
     private final AtomicInteger nextProviderKey = new AtomicInteger(1);
     private final AtomicInteger nextCollectorKey = new AtomicInteger(1);
@@ -113,12 +115,7 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                 // has no doc_values/norms (they live in the parquet primary), so a FieldExistsQuery
                 // built from an _exists_ clause (PPL `search field!=value`) would throw at rewrite().
                 Query query = LuceneQueryConversionUtils.rewriteFieldExistsForSecondary(queryBuilder.toQuery(context));
-                LOGGER.info(
-                    "[NAM-QDBG] annotationId={} queryBuilder=[{}] compiledQuery=[{}]",
-                    expr.getAnnotationId(),
-                    queryBuilder,
-                    query
-                );
+                LOGGER.info("[NAM-QDBG] annotationId={} queryBuilder=[{}] compiledQuery=[{}]", expr.getAnnotationId(), queryBuilder, query);
                 queries.put(expr.getAnnotationId(), query);
             } catch (IOException exception) {
                 throw new IllegalStateException(
@@ -141,6 +138,7 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             Weight weight = searcher.createWeight(rewritten, ScoreMode.COMPLETE_NO_SCORES, 1.0f);
             int providerKey = nextProviderKey.getAndIncrement();
             weightsByProviderKey.put(providerKey, weight);
+            annotationIdByProviderKey.put(providerKey, annotationId);
             LOGGER.info("[scf] createProvider annotationId={} → providerKey={} rewrittenQuery=[{}]", annotationId, providerKey, rewritten);
             // ONE-SHOT DIAGNOSTIC: scan every leaf with a fresh scorer, doc 0..end, logging where the
             // block-join's matches land in docId space and their translated rows — independent of any window.
@@ -148,7 +146,13 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                 try {
                     Scorer probe = weight.scorer(lrc);
                     if (probe == null) {
-                        LOGGER.info("[NAM-PROBE] annotationId={} leaf(ord={},docBase={},maxDoc={}) scorer=NULL", annotationId, lrc.ord, lrc.docBase, lrc.reader().maxDoc());
+                        LOGGER.info(
+                            "[NAM-PROBE] annotationId={} leaf(ord={},docBase={},maxDoc={}) scorer=NULL",
+                            annotationId,
+                            lrc.ord,
+                            lrc.docBase,
+                            lrc.reader().maxDoc()
+                        );
                         continue;
                     }
                     SortedNumericDocValues rid = lrc.reader().getSortedNumericDocValues(ROW_ID_FIELD);
@@ -167,7 +171,15 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                         d = it.nextDoc();
                         c++;
                     }
-                    LOGGER.info("[NAM-PROBE] annotationId={} leaf(ord={},docBase={},maxDoc={}) blockJoinMatches(first{})=[{}]", annotationId, lrc.ord, lrc.docBase, lrc.reader().maxDoc(), c, sb);
+                    LOGGER.info(
+                        "[NAM-PROBE] annotationId={} leaf(ord={},docBase={},maxDoc={}) blockJoinMatches(first{})=[{}]",
+                        annotationId,
+                        lrc.ord,
+                        lrc.docBase,
+                        lrc.reader().maxDoc(),
+                        c,
+                        sb
+                    );
                 } catch (Exception pe) {
                     LOGGER.warn("[NAM-PROBE] leaf probe failed", pe);
                 }
@@ -223,7 +235,11 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             translator = RowIdTranslator.forLeaf(leaf);
         } catch (IOException exception) {
             LOGGER.error(
-                "createCollector: failed building row-id translator for segment=" + segName + " (writerGeneration=" + writerGeneration + ")",
+                "createCollector: failed building row-id translator for segment="
+                    + segName
+                    + " (writerGeneration="
+                    + writerGeneration
+                    + ")",
                 exception
             );
             return -1;
@@ -249,7 +265,18 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             // this is the live doc-values the translator reads with advanceExact; null on a flat leaf (unused).
             SortedNumericDocValues rowIdDV = translator.isNested() ? leaf.reader().getSortedNumericDocValues(ROW_ID_FIELD) : null;
             int collectorKey = nextCollectorKey.getAndIncrement();
-            scorersByCollectorKey.put(collectorKey, new ScorerHandle(scorer, minDoc, maxDoc, translator, rowIdDV));
+            scorersByCollectorKey.put(
+                collectorKey,
+                new ScorerHandle(
+                    scorer,
+                    annotationIdByProviderKey.getOrDefault(providerKey, -1),
+                    String.valueOf(weight.getQuery()),
+                    minDoc,
+                    maxDoc,
+                    translator,
+                    rowIdDV
+                )
+            );
             LOGGER.debug(
                 "[scf] createCollector providerKey={} writerGeneration={} rowWindow=[{},{}) nested={} → collectorKey={}",
                 providerKey,
@@ -351,15 +378,28 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                         }
                         handle.currentDoc = docId;
                     }
+                    // [NAM-BITSET] the exact row bitset handed to DataFusion for ONE delegated predicate.
+                    // `selectedRows` are ABSOLUTE logical row ids (bit i of the returned bitset means row
+                    // minDoc+i), which is the coordinate space DataFusion turns into a Parquet RowSelection —
+                    // so this line is literally "these rows survive Lucene; DF may skip the rest". Pair it with
+                    // the Rust-side [SCF-DF] summary (rows_matched / rows_pruned / output_rows) to see DF act on
+                    // it. Logged per (predicate x row-group window), so a query with N delegated predicates
+                    // emits N of these per window.
                     LOGGER.info(
-                        "[NAM-COLL] collectorKey={} matchedDocs={} skippedNoRow={} skippedOutOfWindow={} cardinality={} collect_ms={} matches=[{}]",
+                        "[NAM-BITSET] annotationId={} collectorKey={} rowWindow=[{},{}) cardinality={}/{} selectedRows={} "
+                            + "matchedDocs={} skippedNoRow={} skippedOutOfWindow={} collect_ms={} query=[{}]",
+                        handle.annotationId,
                         collectorKey,
+                        minDoc,
+                        maxDoc,
+                        bits.cardinality(),
+                        span,
+                        selectedRows(bits, minDoc),
                         matched,
                         skippedNoRow,
                         skippedOutOfWindow,
-                        bits.cardinality(),
                         (System.nanoTime() - collStartNanos) / 1_000_000L,
-                        matchTrace
+                        handle.queryDesc
                     );
                 } catch (IOException exception) {
                     LOGGER.warn("IOException during collectDocs, returning partial bitset", exception);
@@ -421,8 +461,37 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         return (SegmentReader) current;
     }
 
+    /**
+     * Renders the set bits of {@code bits} as ABSOLUTE logical row ids ({@code minDoc + bitIndex}) — the row
+     * ids DataFusion will scan. Capped at {@value #ROW_TRACE_CAP} ids so a wide row-group window cannot flood
+     * the log; the full count is always available from {@code cardinality} on the same line.
+     */
+    private static String selectedRows(FixedBitSet bits, int minDoc) {
+        StringBuilder sb = new StringBuilder("[");
+        int shown = 0;
+        for (int i = bits.nextSetBit(0); i != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;) {
+            if (shown == ROW_TRACE_CAP) {
+                sb.append(", ...");
+                break;
+            }
+            if (shown++ > 0) {
+                sb.append(", ");
+            }
+            sb.append(minDoc + i);
+            i = i + 1 >= bits.length() ? org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS : bits.nextSetBit(i + 1);
+        }
+        return sb.append(']').toString();
+    }
+
+    /** Max row ids printed by {@link #selectedRows}. */
+    private static final int ROW_TRACE_CAP = 64;
+
     private static final class ScorerHandle {
         final Scorer scorer;
+        /** The delegated predicate this collector serves — lets each emitted bitset be attributed in the log. */
+        final int annotationId;
+        /** The compiled Lucene query, logged alongside the bitset so the two can be read together. */
+        final String queryDesc;
         /** Partition bounds in LOGICAL-ROW space (Parquet row-group slice), inclusive-exclusive. */
         final int partitionRowMin;
         final int partitionRowMax;
@@ -436,8 +505,18 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         /** Forward cursor in Lucene docId space, monotonic across successive collectDocs calls. */
         int currentDoc = -1;
 
-        ScorerHandle(Scorer scorer, int partitionRowMin, int partitionRowMax, RowIdTranslator translator, SortedNumericDocValues rowIdDV) {
+        ScorerHandle(
+            Scorer scorer,
+            int annotationId,
+            String queryDesc,
+            int partitionRowMin,
+            int partitionRowMax,
+            RowIdTranslator translator,
+            SortedNumericDocValues rowIdDV
+        ) {
             this.scorer = scorer;
+            this.annotationId = annotationId;
+            this.queryDesc = queryDesc;
             this.partitionRowMin = partitionRowMin;
             this.partitionRowMax = partitionRowMax;
             this.translator = translator;

@@ -128,17 +128,6 @@ public class LuceneReaderManager implements EngineReaderManager<LuceneReader> {
 
         Map<Long, String> generationToSegmentName = buildGenerationToSegmentName(catalogSnapshot, currentReader.leaves());
         readers.put(catalogSnapshot.getId(), new LuceneReader(readerForSnapshot, generationToSegmentName));
-
-        // Vanilla-parity warmer: eagerly build the per-segment parentDocIds cache for nested leaves now,
-        // on the refresh thread (off the query path), so the FIRST delegated nested query doesn't pay the
-        // O(maxDoc) __row_id__ doc-values scan. Mirrors IndicesBitsetFilterCache.BitSetProducerWarmer, which
-        // eagerly loads the root/parent bitset on every new segment (why vanilla nested cold latency ≈ warm).
-        // Best-effort and idempotent — the cache is segment-keyed, so already-warmed segments are cheap
-        // no-ops on subsequent refreshes and the query path still builds lazily if this is skipped.
-        // Warm BOTH nested caches: (1) parentDocIds (row->docId map, used by the count fast-path), and
-        // (2) the parent BitSet for every nested level (used by the block-join filter/RowSelection path).
-        RowIdTranslator.warmNestedCaches(currentReader);
-        CachingParentBitSetProducer.warmAll(currentReader);
     }
 
     private static Map<Long, String> buildGenerationToSegmentName(CatalogSnapshot catalogSnapshot, List<LeafReaderContext> leaves) {

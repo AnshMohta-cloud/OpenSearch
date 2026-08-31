@@ -21,17 +21,10 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.search.BooleanClause;
-import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.search.FieldExistsQuery;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.opensearch.analytics.backend.EngineResultStream;
 import org.opensearch.analytics.backend.SearchExecEngine;
 import org.opensearch.analytics.backend.ShardScanExecutionContext;
-import org.opensearch.index.engine.dataformat.DocumentInput;
-import org.opensearch.index.search.OpenSearchToParentBlockJoinQuery;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -76,18 +69,10 @@ final class LuceneSearchExecEngine implements SearchExecEngine<ShardScanExecutio
 
     @Override
     public EngineResultStream execute(ShardScanExecutionContext context) throws IOException {
-        // [NESTED] count(*) must return LOGICAL-document count (== Parquet rows), not raw Lucene doc
-        // count. On a nested index a logical doc is a block of N+1 Lucene docs, so a plain
-        // count(MatchAll) over-counts by the children. Restrict the count to PARENT docs by AND-ing the
-        // filter with a parents filter (FieldExistsQuery on the block-join parent field). On a non-nested
-        // index there is no parent field, so the query is used unchanged and behaviour is identical.
-        // Grep: NESTED count-fastpath.
-        // Count via IndexSearcher.count(), identical to how vanilla OpenSearch counts a nested query
-        // (size:0 search / _count over the block-join): TotalHitCount over the block-join scorer, which
-        // honors liveDocs and needs no bespoke rollup. parentScopedCountQuery scopes the count to logical
-        // parent docs — and for a pure ToParentBlockJoinQuery it returns the bare block-join unwrapped
-        // (fix #2), so the count runs on the single-clause block-join path exactly like vanilla's.
-        Query countQuery = parentScopedCountQuery(state.searcher(), state.filterQuery());
+        // count(*) must return the LOGICAL-document count (== Parquet rows). There is exactly one Lucene doc
+        // per Parquet row — nested leaves are multi-valued fields, not child docs — so a plain count over the
+        // filter already counts logical documents: no parent scoping, no block-join unwrapping.
+        Query countQuery = state.filterQuery();
         long countStartNanos = System.nanoTime();
         long count = state.searcher().count(countQuery);
         long countMs = (System.nanoTime() - countStartNanos) / 1_000_000L;
@@ -119,55 +104,6 @@ final class LuceneSearchExecEngine implements SearchExecEngine<ShardScanExecutio
                 }
             }
         }
-    }
-
-    /**
-     * Returns a count query scoped to PARENT (logical) documents when the index uses nested block-join
-     * storage, else the original query unchanged.
-     *
-     * <p>A nested index stores each logical document as a block of N+1 Lucene docs (N children + parent),
-     * so raw {@code count(query)} over-counts by the children. Only parents carry the {@code __row_id__}
-     * doc-value, so {@code query AND FieldExists(__row_id__)} counts exactly the logical documents — which
-     * equals the Parquet primary's row count. We detect "nested index" via the Lucene parent field
-     * ({@code FieldInfos.getParentField()}, set to {@code __nested_parent} by the writer); when absent the
-     * index is flat and the original query is returned untouched (zero behaviour change for non-nested).
-     *
-     * <p><b>Pure block-join fast path.</b> When the whole filter is a single {@link
-     * OpenSearchToParentBlockJoinQuery} (the shape a lone nested-equality predicate serializes to, e.g.
-     * {@code where comments.replies.author = "alice" | stats count()}), the extra {@code #FieldExists(__row_id__)}
-     * conjunct is <em>redundant</em>: a {@code ToParentBlockJoinQuery} already resolves each matching child
-     * block up to its single parent doc, so it emits <em>only</em> parent docs. AND-ing it with the parent
-     * marker changes nothing about the result, but it turns a 1-clause count into a 2-required-clause
-     * {@code BooleanQuery}. That forces {@code IndexSearcher.count()} down the {@code ConjunctionScorer}
-     * path — full candidate-by-candidate iteration with a redundant {@code __row_id__} doc-values advance
-     * per parent — because {@code ToParentBlockJoinQuery} has no fast {@code Weight.count()} and the
-     * conjunction disables the single-clause bulk path. Returning the bare block-join lets {@code count()}
-     * use the block-join's own scorer directly (the same path vanilla's nested count takes), which is the
-     * dominant cost of nested-eq {@code count()} at scale (see project_mustang_latency). The count is
-     * identical — logical parents with >=1 matching child. We keep the wrapper for every other filter
-     * shape (MatchAll, flat/keyword terms, or any query that can match child docs), where the
-     * {@code __row_id__} conjunct is what prevents over-counting.
-     */
-    private static Query parentScopedCountQuery(IndexSearcher searcher, Query filterQuery) {
-        boolean nested = searcher.getIndexReader()
-            .leaves()
-            .stream()
-            .anyMatch(leaf -> leaf.reader().getFieldInfos().getParentField() != null);
-        if (nested == false) {
-            return filterQuery;
-        }
-        // Pure block-join: already parent-scoped, so the __row_id__ conjunct is redundant — return it
-        // unwrapped to keep count() on the fast single-clause block-join path.
-        if (filterQuery instanceof OpenSearchToParentBlockJoinQuery) {
-            return filterQuery;
-        }
-        Query parents = new FieldExistsQuery(DocumentInput.ROW_ID_FIELD);
-        if (filterQuery instanceof MatchAllDocsQuery) {
-            return parents;
-        }
-        return new BooleanQuery.Builder().add(filterQuery, BooleanClause.Occur.MUST)
-            .add(parents, BooleanClause.Occur.FILTER)
-            .build();
     }
 
     private static Schema buildSchema(List<String> columnNames) {

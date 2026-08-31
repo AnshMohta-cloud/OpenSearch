@@ -24,6 +24,7 @@ import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexShuttle;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlFunctionCategory;
 import org.apache.calcite.sql.SqlKind;
@@ -437,8 +438,18 @@ public final class OpenSearchNestedFieldRewriter {
         RelOptCluster cluster = filter.getCluster();
         RexBuilder rexBuilder = cluster.getRexBuilder();
 
+        // Expand any SEARCH/Sarg back into explicit comparisons BEFORE the lambda rewrite. Calcite
+        // collapses same-field disjunctions and IN-lists into a single SEARCH(expr, Sarg[...]) node
+        // (e.g. `depts.name='Sales' OR depts.name='Ops'` and `depts.name IN ('Sales','Ops')` both
+        // become SEARCH(ITEM($0,'name'), Sarg['Ops','Sales'])). ExprTreeBuilder has no mapping for
+        // SqlKind.SEARCH, so without this the rewrite reports "not applicable" and the filter falls
+        // through to the unnest path — which cannot resolve the unnested column against the base scan
+        // schema and fails the query outright. expandSearch is Calcite's own inverse transform, so
+        // this is semantics-preserving; a condition with no Sarg is returned unchanged.
+        RexNode condition = RexUtil.expandSearch(rexBuilder, null, filter.getCondition());
+
         // Try the lambda (nested_any_match) rewrite first — it preserves parent grain.
-        RexNode lambdaCondition = tryLambdaRewrite(filter.getCondition(), arrayCol, input.getRowType(), rexBuilder);
+        RexNode lambdaCondition = tryLambdaRewrite(condition, arrayCol, input.getRowType(), rexBuilder);
         if (lambdaCondition != null) {
             LOGGER.info("[NESTED-LAMBDA] filter rewritten to nested_any_match (no unnest, row count preserved)");
             return LogicalFilter.create(input, lambdaCondition);
@@ -452,7 +463,7 @@ public final class OpenSearchNestedFieldRewriter {
             return filter;
         }
         ItemRewriteShuttle shuttle = new ItemRewriteShuttle(arrayCol, u.unnestedFieldIndex, rexBuilder, u.nestedScope.getRowType());
-        RexNode newCondition = filter.getCondition().accept(shuttle);
+        RexNode newCondition = condition.accept(shuttle);
         RelNode newFilter = LogicalFilter.create(u.nestedScope, newCondition);
 
         List<RexNode> passthrough = new ArrayList<>(originalColCount);
@@ -503,6 +514,18 @@ public final class OpenSearchNestedFieldRewriter {
         // carries a raw multi-level Struct that DataFusion's array_element/sum can't handle). Try
         // the OR-split first; only a pure-array OR (no parent operand at all, e.g. `comments.a=X or
         // comments.b=Y`) falls through unchanged to the existing single-joint-tree treatment below.
+        // NOTE on negation (investigated, NOT fixable here). SQL/PPL `where NOT (depts.name='Sales')`
+        // should mean "no dept is named Sales" (¬∃e p), but a comparison on a nested field is implicitly
+        // EXISTENTIALLY quantified, so folding the negation into the comparison yields ∃e ¬p — a different
+        // and wrong predicate. (A doc with depts [Sales, Eng] satisfies ∃e ¬p but must not satisfy ¬∃e p.)
+        //
+        // We cannot correct that here: the negation is already pushed down before this rule runs. The very
+        // first RelNode handed to PlannerImpl for that query is `<>(ITEM($0,'name'),'Sales')` — no NOT node
+        // survives to the rewriter, and De Morgan has likewise already turned NOT(A AND B) into
+        // OR(<>,<=). That lowering happens in the external PPL→Calcite frontend
+        // (unified-query-ppl jar), which is not part of this repository. Fixing it requires suppressing
+        // negation-pushing when the negated operand references an array/nested field, at the point where
+        // the RelNode is built. A `SqlKind.NOT` branch here would be dead code.
         if (condition.getKind() == SqlKind.OR) {
             RexNode orSplit = tryOrSplitRewrite(condition, arrayCol, inputRowType, rexBuilder);
             if (orSplit != null) {

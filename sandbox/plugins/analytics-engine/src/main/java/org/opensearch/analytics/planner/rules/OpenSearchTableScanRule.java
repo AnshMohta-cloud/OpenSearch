@@ -73,19 +73,37 @@ public class OpenSearchTableScanRule extends RelOptRule {
 
         // TODO : This expects the FrontEnds to attach the row type with all fields.
         // TODO : How will they attach if we perform the index resolution
-        // POC nested (N1): ARRAY-typed columns (nested fields) don't have traditional field storage
-        // entries in the resolver. Resolve only scalar fields, then insert synthetic placeholder
-        // entries for ARRAY fields at their correct positions so indices stay aligned with the row type.
+        // An ARRAY-typed column is a `nested` mapping exposed to Calcite as ARRAY<ROW<leaves...>>
+        // (see OpenSearchSchemaBuilder#addLeafFields). It DOES have real field storage: the columnar
+        // primary stores the LIST<STRUCT> column and the Lucene secondary indexes each leaf as a
+        // multi-valued field, so FieldStorageResolver resolves it like any other mapped field.
+        //
+        // Resolving it for real (rather than substituting a derived placeholder) matters because
+        // FieldStorageInfo#isDerived drives filter viability: OpenSearchFilterRule treats a derived
+        // column as having "no physical storage to delegate a scan against" and caps its viable set
+        // at the child's, which silently made every nested predicate DataFusion-only — Lucene was
+        // dropped before NestedAnyMatchExprSerializer#canServe was ever consulted, so no nested
+        // predicate could be delegated at all.
+        //
+        // The fallback keeps the previous behaviour for any ARRAY column the resolver genuinely has
+        // no entry for (e.g. an array produced by a frontend-attached row type rather than a mapping),
+        // so this can only widen viability, never break a plan that used to resolve.
         List<RelDataTypeField> allFields = scan.getRowType().getFieldList();
         List<FieldStorageInfo> fieldStorage = new java.util.ArrayList<>(allFields.size());
         for (RelDataTypeField field : allFields) {
-            if (field.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.ARRAY) {
-                // Synthetic entry for nested ARRAY column — treated as DataFusion-readable
-                fieldStorage.add(FieldStorageInfo.derivedColumn(field.getName(), field.getType().getSqlTypeName()));
-            } else {
-                List<FieldStorageInfo> resolved = fieldStorageResolver.resolve(List.of(field.getName()));
-                fieldStorage.add(resolved.get(0));
+            boolean isArrayColumn = field.getType().getSqlTypeName() == org.apache.calcite.sql.type.SqlTypeName.ARRAY;
+            FieldStorageInfo resolved = null;
+            try {
+                resolved = fieldStorageResolver.resolve(List.of(field.getName())).get(0);
+            } catch (RuntimeException noEntry) {
+                if (!isArrayColumn) {
+                    throw noEntry;
+                }
+                LOGGER.debug("No field storage entry for ARRAY column [{}]; falling back to a derived placeholder", field.getName());
             }
+            fieldStorage.add(
+                resolved != null ? resolved : FieldStorageInfo.derivedColumn(field.getName(), field.getType().getSqlTypeName())
+            );
         }
 
         // Viable backends: must be able to read ALL requested fields

@@ -23,6 +23,7 @@ import org.opensearch.analytics.planner.PlannerContext;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.planner.rel.AnnotatedPredicate;
 import org.opensearch.analytics.planner.rel.OpenSearchFilter;
+import org.opensearch.analytics.planner.rel.OpenSearchNestedScope;
 import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 import org.opensearch.analytics.settings.DelegationBlockList;
 import org.opensearch.analytics.spi.DelegatedPredicateSerializer;
@@ -83,7 +84,7 @@ public class OpenSearchFilterRule extends RelOptRule {
         List<FieldStorageInfo> childFieldStorage = openSearchInput.getOutputFieldStorage();
 
         // Annotate every leaf predicate with viable backends.
-        RexNode annotatedCondition = annotateCondition(filter.getCondition(), childFieldStorage, childViableBackends);
+        RexNode annotatedCondition = annotateCondition(filter.getCondition(), childFieldStorage, childViableBackends, child);
 
         // Compute operator-level viable backends: must be viable for child AND handle predicates
         List<String> viableBackends = computeFilterViableBackends(annotatedCondition, childViableBackends);
@@ -122,18 +123,71 @@ public class OpenSearchFilterRule extends RelOptRule {
      * preserved — we recurse into their children. Leaf predicates are wrapped in
      * {@link AnnotatedPredicate} with viable backends resolved from child's field storage.
      */
-    private RexNode annotateCondition(RexNode condition, List<FieldStorageInfo> fieldStorageInfos, List<String> childViableBackends) {
+    private RexNode annotateCondition(
+        RexNode condition,
+        List<FieldStorageInfo> fieldStorageInfos,
+        List<String> childViableBackends,
+        RelNode child
+    ) {
+        // Whether this is a NESTED query decides delegation policy for the whole condition, not just
+        // for its nested leaves — see the exclusion in resolveViableBackends. Computed once here,
+        // before annotation.
+        //
+        // Detected from the PLAN, not from the predicate, because the nested rewriter has two output
+        // shapes and only one of them leaves a marker in the predicate:
+        // * lambda shape — the leaf becomes NESTED_ANY_MATCH_EXPR(arrayCol, jsonTree);
+        // * unnest shape — the leaf becomes an ordinary comparison on a post-unnest column, e.g.
+        // `=($16,'retry')` / `=(ITEM($15,'retry_count'),'3')`, with no marker at all, and those
+        // columns are derivedColumn placeholders so FieldType.NESTED is gone too.
+        // An OpenSearchNestedScope is introduced under the filter in BOTH shapes, so the plan is the
+        // only representation-independent signal. The predicate check is kept OR'd in as cheap
+        // insurance for a nested leaf arriving without a scope operator above the scan.
+        boolean filterHasNested = subtreeHasNestedScope(child) || containsNestedPredicate(condition);
+        return annotateCondition(condition, fieldStorageInfos, childViableBackends, false, filterHasNested);
+    }
+
+    /** Whether {@code n}'s subtree contains an {@link OpenSearchNestedScope} — i.e. this plan reads a nested path. */
+    private static boolean subtreeHasNestedScope(RelNode n) {
+        RelNode u = RelNodeUtils.unwrapHep(n);
+        if (u instanceof OpenSearchNestedScope) {
+            return true;
+        }
+        for (RelNode input : u.getInputs()) {
+            if (subtreeHasNestedScope(input)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @param underOrNot      true when any ancestor of this node is an OR/NOT.
+     * @param filterHasNested true when this is a nested query — an {@link OpenSearchNestedScope} under
+     *                        the filter, or a {@code NESTED_ANY_MATCH_EXPR} in the condition. Both are
+     *                        threaded so a leaf's viability can depend on its boolean position and on
+     *                        whether the query is nested — see the exclusion in
+     *                        {@link #resolveViableBackends}.
+     */
+    private RexNode annotateCondition(
+        RexNode condition,
+        List<FieldStorageInfo> fieldStorageInfos,
+        List<String> childViableBackends,
+        boolean underOrNot,
+        boolean filterHasNested
+    ) {
         if (!(condition instanceof RexCall rexCall)) {
             return condition;
         }
         if (rexCall.getKind() == SqlKind.AND || rexCall.getKind() == SqlKind.OR || rexCall.getKind() == SqlKind.NOT) {
+            // Monotonic: once under an OR/NOT every descendant is too, at any depth of nested AND.
+            boolean childUnderOrNot = underOrNot || rexCall.getKind() == SqlKind.OR || rexCall.getKind() == SqlKind.NOT;
             List<RexNode> annotatedOperands = new ArrayList<>();
             for (RexNode operand : rexCall.getOperands()) {
-                annotatedOperands.add(annotateCondition(operand, fieldStorageInfos, childViableBackends));
+                annotatedOperands.add(annotateCondition(operand, fieldStorageInfos, childViableBackends, childUnderOrNot, filterHasNested));
             }
             return rexCall.clone(rexCall.getType(), annotatedOperands);
         }
-        List<String> viableBackends = resolveViableBackends(rexCall, fieldStorageInfos, childViableBackends);
+        List<String> viableBackends = resolveViableBackends(rexCall, fieldStorageInfos, childViableBackends, underOrNot, filterHasNested);
         // TODO: viableBackends here is computed from each backend's declared FilterCapability
         // (see resolveViableBackends below). Today a backend can advertise a function as
         // filter-capable without actually shipping a DelegatedPredicateSerializer for it; the
@@ -162,6 +216,38 @@ public class OpenSearchFilterRule extends RelOptRule {
         RexCall predicate,
         List<FieldStorageInfo> fieldStorageInfos,
         List<String> childViableBackends
+    ) {
+        return resolveViableBackends(predicate, fieldStorageInfos, childViableBackends, false, false);
+    }
+
+    /**
+     * Whether {@code node}'s subtree mentions a {@code NESTED_ANY_MATCH_EXPR} call — i.e. whether this
+     * is a "nested query". Descends through {@link AnnotatedPredicate} wrappers, which extend
+     * {@link RexCall}, so the annotation must be unwrapped before its operator is inspected.
+     */
+    private static boolean containsNestedPredicate(RexNode node) {
+        if (node instanceof AnnotatedPredicate ap) {
+            return containsNestedPredicate(ap.unwrap());
+        }
+        if (node instanceof RexCall call) {
+            if (ScalarFunction.fromSqlOperatorWithFallback(call.getOperator()) == ScalarFunction.NESTED_ANY_MATCH_EXPR) {
+                return true;
+            }
+            for (RexNode operand : call.getOperands()) {
+                if (containsNestedPredicate(operand)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private List<String> resolveViableBackends(
+        RexCall predicate,
+        List<FieldStorageInfo> fieldStorageInfos,
+        List<String> childViableBackends,
+        boolean underOrNot,
+        boolean filterHasNested
     ) {
         PredicateContents contents = new PredicateContents(new HashSet<>(), new ArrayList<>());
         for (RexNode operand : predicate.getOperands()) {
@@ -282,6 +368,26 @@ public class OpenSearchFilterRule extends RelOptRule {
                 fieldViable = new HashSet<>(registry.filterBackendsForField(function, storageInfo));
             }
 
+            if (function == ScalarFunction.NESTED_ANY_MATCH_EXPR && LOGGER.isDebugEnabled()) {
+                // Nested-predicate viability is easy to get wrong and hard to see: a missing/derived
+                // FieldStorageInfo silently drops Lucene before canServe is consulted. Log the inputs
+                // to that decision so a non-delegating nested query can be diagnosed from one line.
+                LOGGER.debug(
+                    "[NAM-VIAB] field=[{}] mappingType={} fieldType={} derived={} docValueFormats={} "
+                        + "indexFormats={} childViable={} filterCapable={} fieldViable={} viableSoFar={}",
+                    storageInfo.getFieldName(),
+                    storageInfo.getMappingType(),
+                    storageInfo.getFieldType(),
+                    storageInfo.isDerived(),
+                    storageInfo.getDocValueFormats(),
+                    storageInfo.getIndexFormats(),
+                    childViableBackends,
+                    registry.filterCapableBackends(),
+                    fieldViable,
+                    viableSet
+                );
+            }
+
             viableSet.retainAll(fieldViable);
         }
 
@@ -293,7 +399,36 @@ public class OpenSearchFilterRule extends RelOptRule {
         // viability the static check didn't already establish.
         viableSet.removeIf(candidateName -> {
             DelegatedPredicateSerializer serializer = registry.getBackend(candidateName).delegatedPredicateSerializers().get(function);
-            return serializer != null && !serializer.canServe(predicate, fieldStorageInfos);
+            if (serializer == null) {
+                // No serializer for this function on this backend means the backend evaluates it
+                // NATIVELY rather than by receiving a delegated predicate — nothing to narrow.
+                return false;
+            }
+            if (!serializer.canServe(predicate, fieldStorageInfos)) {
+                return true;
+            }
+            // In a NESTED query — one whose filter mentions NESTED_ANY_MATCH_EXPR anywhere — no leaf
+            // under an OR/NOT may be delegated. combine() would demote such a leaf from performance to
+            // CORRECTNESS delegation, which REPLACES the original and makes the peer's bitset the
+            // answer for it. For a nested predicate that is unsound: the peer evaluates
+            // NESTED_ANY_MATCH_EXPR at ROW grain, so a conjunction of nested leaves becomes a row-level
+            // must-clause set answering (∃e A) ∧ (∃e B) — a strict SUPERSET of ∃e(A ∧ B), matching rows
+            // whose elements satisfy the clauses separately. Fine as a pruning bound, wrong as an
+            // answer. The rule is applied to the whole condition rather than only to nested leaves so
+            // that the driving backend owns the ENTIRE result of a nested query: the combiner fuses
+            // same-backend siblings without regard to scalar-vs-nested, so a scalar leaf sharing a
+            // boolean group with a nested one would otherwise still answer from the peer.
+            //
+            // A PURE SCALAR filter is untouched (filterHasNested == false): a flat term query is exact,
+            // so demotion stays sound there and the scalar path keeps its existing pruning.
+            //
+            // Excluding HERE rather than at classify/strip time is deliberate: viability is the single
+            // source of truth that operator-level viability, delegation classification and strip all
+            // read. Dropping the leaf later leaves the annotation still advertising the peer, and those
+            // two disagreeing produced wrong results. With the peer removed here, narrowTo() derives no
+            // performance peers either, so no marker is emitted and the driving backend evaluates the
+            // predicate natively.
+            return underOrNot && filterHasNested;
         });
 
         // Every nested scalar function in the predicate must also be evaluable by a candidate backend
