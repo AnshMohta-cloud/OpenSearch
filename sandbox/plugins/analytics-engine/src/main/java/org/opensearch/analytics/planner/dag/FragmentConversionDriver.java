@@ -14,6 +14,7 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -33,6 +34,7 @@ import org.opensearch.analytics.planner.rel.OperatorAnnotation;
 import org.opensearch.analytics.spi.AnalyticsSearchBackendPlugin;
 import org.opensearch.analytics.spi.DelegatedExpression;
 import org.opensearch.analytics.spi.DelegatedPredicateSerializer;
+import org.opensearch.analytics.spi.DelegatedSubtreeConvertor;
 import org.opensearch.analytics.spi.DelegationPossibleFunction;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 import org.opensearch.analytics.spi.FilterTreeShape;
@@ -81,7 +83,16 @@ public class FragmentConversionDriver {
      * {@link StagePlan#convertedBytes()} on each plan.
      */
     public static void convertAll(QueryDAG dag, CapabilityRegistry registry) {
-        convertStage(dag.rootStage(), registry);
+        convertAll(dag, registry, false);
+    }
+
+    /**
+     * @param pruneOnly when true, {@link PruneOnlyRelaxer} replaces {@link DelegatedPredicateCombiner}:
+     *                  the peer backend is consulted only to skip rows and never owns any part of the
+     *                  answer. See {@code AnalyticsPlugin.LUCENE_PRUNE_ONLY}.
+     */
+    public static void convertAll(QueryDAG dag, CapabilityRegistry registry, boolean pruneOnly) {
+        convertStage(dag.rootStage(), registry, pruneOnly);
         // Root stage executes locally at coordinator — store factory for instruction dispatch.
         Stage root = dag.rootStage();
         if (root.getExchangeSinkProvider() != null && !root.getPlanAlternatives().isEmpty()) {
@@ -90,9 +101,9 @@ public class FragmentConversionDriver {
         }
     }
 
-    private static void convertStage(Stage stage, CapabilityRegistry registry) {
+    private static void convertStage(Stage stage, CapabilityRegistry registry, boolean pruneOnly) {
         for (Stage child : stage.getChildStages()) {
-            convertStage(child, registry);
+            convertStage(child, registry, pruneOnly);
         }
         // After children are converted, surface any decorator-induced schema delta as
         // postDecorationSchemaBytes on the child plans. The reduce sink consults this when
@@ -118,12 +129,23 @@ public class FragmentConversionDriver {
             // not findNode's topmost (HAVING → NO_DELEGATION → collector skipped → over-count).
             List<OpenSearchFilter> filters = RelNodeUtils.findAllNodes(plan.resolvedFragment(), OpenSearchFilter.class);
             OpenSearchFilter filter = filters.isEmpty() ? null : filters.getLast();
-            FilterTreeShape treeShape = filter != null
+            // Derived pre-strip only on the combiner path, where the deriver mirrors what the
+            // combiner will emit. Prune-only mode bypasses the combiner, so that prediction does not
+            // describe the tree; its shape is read off what conversion actually shipped, below.
+            FilterTreeShape derivedShape = (pruneOnly == false && filter != null)
                 ? FilterTreeShapeDeriver.derive(filter, plan.backendId())
                 : FilterTreeShape.NO_DELEGATION;
 
-            IntraOperatorDelegationBytes delegationBytes = new IntraOperatorDelegationBytes(registry);
+            IntraOperatorDelegationBytes delegationBytes = new IntraOperatorDelegationBytes(registry, pruneOnly);
             byte[] bytes = convert(plan.resolvedFragment(), convertor, delegationBytes);
+
+            // Prune-only ships at most one performance marker, as a conjunct at the root of the
+            // filter — so no OR/NOT ever sits above a peer leaf and the data node's single-collector
+            // path applies. The shape the data node receives must match the tree, not a prediction:
+            // it is this ordinal (not the Rust-side classifier) that selects the evaluator.
+            FilterTreeShape treeShape = pruneOnly
+                ? (delegationBytes.getResult().isEmpty() ? FilterTreeShape.NO_DELEGATION : FilterTreeShape.CONJUNCTIVE)
+                : derivedShape;
 
             // Assemble instruction list
             List<DelegatedExpression> delegated = delegationBytes.getResult();
@@ -282,10 +304,16 @@ public class FragmentConversionDriver {
      */
     static final class IntraOperatorDelegationBytes {
         private final CapabilityRegistry registry;
+        private final boolean pruneOnly;
         private List<DelegatedExpression> delegatedExpressions;
 
         IntraOperatorDelegationBytes(CapabilityRegistry registry) {
+            this(registry, false);
+        }
+
+        IntraOperatorDelegationBytes(CapabilityRegistry registry, boolean pruneOnly) {
             this.registry = registry;
+            this.pruneOnly = pruneOnly;
         }
 
         /**
@@ -308,6 +336,9 @@ public class FragmentConversionDriver {
 
                 @Override
                 public RexNode resolveTree(RexNode condition) {
+                    if (pruneOnly) {
+                        return resolvePruneOnly(condition, operatorBackend, fieldStorage, rexBuilder);
+                    }
                     DelegatedPredicateCombiner.Classified result = classifier.classify(condition, this::apply);
                     if (result instanceof DelegatedPredicateCombiner.Delegated d) {
                         return classifier.finalizeDelegated(d);
@@ -396,6 +427,74 @@ public class FragmentConversionDriver {
                     return annotation.makePlaceholder(rexBuilder);
                 }
             };
+        }
+
+        /**
+         * Strict prune-only resolution. Relaxes the condition to the strongest peer-servable
+         * predicate it implies, ships that as a single performance-delegation marker, and hands the
+         * driving backend the original condition untouched.
+         *
+         * <p>Two consequences are structural rather than enforced by a check: no
+         * {@code delegated_predicate} is emitted, so the peer never owns any part of the answer; and
+         * all peer involvement sits in one leaf at the root under an AND, so no OR/NOT is ever above
+         * a peer leaf and the data node's single-collector path applies.
+         *
+         * <p>When the relaxation is {@code TRUE} nothing is prunable: no query is built, nothing is
+         * shipped, and the peer is not consulted at all.
+         */
+        private RexNode resolvePruneOnly(
+            RexNode condition,
+            String operatorBackend,
+            List<FieldStorageInfo> fieldStorage,
+            RexBuilder rexBuilder
+        ) {
+            RexNode original = unwrapAllAnnotations(condition);
+            PruneOnlyRelaxer.Result relaxation = new PruneOnlyRelaxer(operatorBackend, registry, rexBuilder).relax(condition);
+            if (relaxation.prunable() == false) {
+                LOGGER.debug("[prune-only] relaxation is TRUE - nothing prunable, peer not consulted");
+                return original;
+            }
+            DelegatedSubtreeConvertor convertor = registry.getBackend(relaxation.backend()).getDelegatedSubtreeConvertor();
+            if (convertor == null) {
+                LOGGER.debug("[prune-only] backend [{}] has no subtree convertor - staying native", relaxation.backend());
+                return original;
+            }
+            byte[] bytes = convertor.convertSubtree(relaxation.relaxed(), fieldStorage);
+            if (delegatedExpressions == null) {
+                delegatedExpressions = new ArrayList<>();
+            }
+            delegatedExpressions.add(new DelegatedExpression(relaxation.annotationId(), relaxation.backend(), bytes));
+            LOGGER.debug(
+                "[prune-only] one prune query to [{}] id={} ({} bytes): {}",
+                relaxation.backend(),
+                relaxation.annotationId(),
+                bytes.length,
+                relaxation.relaxed()
+            );
+            // composeConjunction, not makeCall(AND, ..): the original condition is frequently itself
+            // an AND, and Calcite asserts RexUtil.isFlat on filter conditions.
+            return RexUtil.composeConjunction(
+                rexBuilder,
+                List.of(DelegationPossibleFunction.makeCall(rexBuilder, relaxation.relaxed(), relaxation.annotationId()), original)
+            );
+        }
+
+        /** Replaces every {@link AnnotatedPredicate} with its underlying predicate, delegating nothing. */
+        private static RexNode unwrapAllAnnotations(RexNode node) {
+            if (node instanceof AnnotatedPredicate ap) {
+                return ap.unwrap();
+            }
+            if (node instanceof RexCall call) {
+                List<RexNode> operands = new ArrayList<>(call.getOperands().size());
+                boolean changed = false;
+                for (RexNode operand : call.getOperands()) {
+                    RexNode stripped = unwrapAllAnnotations(operand);
+                    changed |= stripped != operand;
+                    operands.add(stripped);
+                }
+                return changed ? call.clone(call.getType(), operands) : call;
+            }
+            return node;
         }
 
         List<DelegatedExpression> getResult() {
