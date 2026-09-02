@@ -131,6 +131,33 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
     );
 
     /**
+     * Strict prune-only delegation. When enabled, the peer backend (Lucene) is never given
+     * responsibility for any part of the answer — the driving backend evaluates the whole filter and
+     * the peer is consulted purely to skip rows.
+     *
+     * <ul>
+     *   <li>{@code false} (default) — today's behaviour: {@link
+     *       org.opensearch.analytics.planner.dag.DelegatedPredicateCombiner} decides per leaf whether
+     *       the peer is a pruning hint (under AND) or authoritative (under OR/NOT).</li>
+     *   <li>{@code true} — the filter is relaxed by {@code PruneOnlyRelaxer} into a single
+     *       peer-servable predicate shipped as one performance-delegation marker. No
+     *       {@code delegated_predicate} is ever emitted, so the driving backend always retains the
+     *       complete predicate. When the relaxation is {@code TRUE} nothing is prunable and the peer
+     *       is not consulted at all.</li>
+     * </ul>
+     *
+     * <p>Dynamic so the two modes can be A/B compared on one index without reindexing. The eventual
+     * trigger is per-query (a nested filter) rather than an operator toggle; swapping the source is a
+     * one-line change at the single call site in {@code DefaultPlanExecutor}.
+     */
+    public static final Setting<Boolean> LUCENE_PRUNE_ONLY = Setting.boolSetting(
+        "analytics.delegation.lucene.prune_only",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Creates a new analytics engine hub plugin.
      */
     public AnalyticsPlugin() {}
@@ -239,6 +266,7 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
         List<Setting<?>> settings = new java.util.ArrayList<>();
         settings.add(COORDINATOR_BUFFER_LIMIT);
         settings.add(PREFER_METADATA_DRIVER);
+        settings.add(LUCENE_PRUNE_ONLY);
         settings.add(ReaderContextStore.READER_CONTEXT_KEEP_ALIVE);
         settings.addAll(org.opensearch.analytics.settings.AnalyticsApproximationSettings.all());
         settings.addAll(org.opensearch.analytics.settings.AnalyticsQuerySettings.all());
