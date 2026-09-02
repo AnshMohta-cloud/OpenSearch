@@ -256,12 +256,18 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         // TODO: remove the null fallback once every front-end (test-ppl-frontend,
         // dsl-query-executor) threads an EngineContextProvider.getContext() snapshot through.
         ClusterState planningState = queryCtx != null ? queryCtx.clusterState() : clusterService.state();
+        // Strict prune-only also has to switch off the metadata-only driver. That is a separate
+        // mechanism from filter delegation: PlanAlternativeSelector can hand Lucene the WHOLE stage
+        // (the count fast path), in which case Lucene produces the result and no amount of
+        // predicate-level care matters. Dropping metadata-driver alternatives is exactly what
+        // prefer_metadata_driver=false already does, so reuse it rather than adding a second knob.
+        boolean metadataDriver = preferMetadataDriver && lucenePruneOnly == false;
         PlannerContext plannerContext = new PlannerContext(
             capabilityRegistry,
             planningState,
             indexNameExpressionResolver,
             false,
-            preferMetadataDriver
+            metadataDriver
         );
         plannerContext.setPlannerSettings(plannerSettings);
         RelNode plan = PlannerImpl.createPlan(logicalFragment, plannerContext);
@@ -271,7 +277,7 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         BackendPlanAdapter.adaptAll(dag, capabilityRegistry);
         // Collapse multi-backend stages to a single chosen alternative before conversion
         // so the convertor runs once per stage and the wire request carries one PlanAlternative.
-        PlanAlternativeSelector.selectAll(dag, capabilityRegistry, preferMetadataDriver);
+        PlanAlternativeSelector.selectAll(dag, capabilityRegistry, metadataDriver);
         FragmentConversionDriver.convertAll(dag, capabilityRegistry, lucenePruneOnly);
         final long planningTimeNanos = System.nanoTime() - planStartNanos;
         final long planningTimeMs = TimeUnit.NANOSECONDS.toMillis(planningTimeNanos);
