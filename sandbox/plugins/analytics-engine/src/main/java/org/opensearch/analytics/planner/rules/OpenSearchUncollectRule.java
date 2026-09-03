@@ -16,7 +16,6 @@ import org.apache.calcite.rel.core.Uncollect;
 import org.opensearch.analytics.planner.PlannerContext;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.planner.rel.OpenSearchConvention;
-import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 import org.opensearch.analytics.planner.rel.OpenSearchUncollect;
 
 import java.util.List;
@@ -51,13 +50,15 @@ public class OpenSearchUncollectRule extends RelOptRule {
 
         RelTraitSet traitSet = uncollect.getTraitSet().replace(OpenSearchConvention.INSTANCE);
 
-        call.transformTo(new OpenSearchUncollect(
-            uncollect.getCluster(),
-            traitSet,
-            input,
-            uncollect.withOrdinality,
-            uncollect.getItemAliases(),
-            viableBackends
-        ));
+        call.transformTo(
+            new OpenSearchUncollect(
+                uncollect.getCluster(),
+                traitSet,
+                input,
+                uncollect.withOrdinality,
+                uncollect.getItemAliases(),
+                viableBackends
+            )
+        );
     }
 }

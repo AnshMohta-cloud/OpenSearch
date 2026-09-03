@@ -18,7 +18,6 @@ import org.apache.calcite.rel.core.CorrelationId;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.logical.LogicalCorrelate;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
-import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.spi.FieldStorageInfo;
@@ -75,8 +74,14 @@ public class OpenSearchCorrelate extends Correlate implements OpenSearchRelNode 
     }
 
     @Override
-    public Correlate copy(RelTraitSet traitSet, RelNode left, RelNode right,
-                          CorrelationId correlationId, ImmutableBitSet requiredColumns, JoinRelType joinType) {
+    public Correlate copy(
+        RelTraitSet traitSet,
+        RelNode left,
+        RelNode right,
+        CorrelationId correlationId,
+        ImmutableBitSet requiredColumns,
+        JoinRelType joinType
+    ) {
         return new OpenSearchCorrelate(getCluster(), traitSet, left, right, correlationId, requiredColumns, joinType, viableBackends);
     }
 
@@ -93,8 +98,14 @@ public class OpenSearchCorrelate extends Correlate implements OpenSearchRelNode 
     @Override
     public RelNode copyResolved(String backend, List<RelNode> children, List<OperatorAnnotation> resolvedAnnotations) {
         return new OpenSearchCorrelate(
-            getCluster(), getTraitSet(), children.get(0), children.get(1),
-            getCorrelationId(), getRequiredColumns(), getJoinType(), List.of(backend)
+            getCluster(),
+            getTraitSet(),
+            children.get(0),
+            children.get(1),
+            getCorrelationId(),
+            getRequiredColumns(),
+            getJoinType(),
+            List.of(backend)
         );
     }
 

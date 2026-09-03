@@ -44,7 +44,13 @@ public class OpenSearchNestedScope extends SingleRel implements OpenSearchRelNod
     private final int arrayColumnIndex;
     private final List<String> viableBackends;
 
-    public OpenSearchNestedScope(RelOptCluster cluster, RelTraitSet traitSet, RelNode input, int arrayColumnIndex, List<String> viableBackends) {
+    public OpenSearchNestedScope(
+        RelOptCluster cluster,
+        RelTraitSet traitSet,
+        RelNode input,
+        int arrayColumnIndex,
+        List<String> viableBackends
+    ) {
         super(cluster, traitSet, input);
         this.arrayColumnIndex = arrayColumnIndex;
         this.viableBackends = viableBackends;

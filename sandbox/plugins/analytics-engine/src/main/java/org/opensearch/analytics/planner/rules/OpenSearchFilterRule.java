@@ -428,6 +428,17 @@ public class OpenSearchFilterRule extends RelOptRule {
             // two disagreeing produced wrong results. With the peer removed here, narrowTo() derives no
             // performance peers either, so no marker is emitted and the driving backend evaluates the
             // predicate natively.
+            // Strict prune-only makes this exclusion both unnecessary and harmful. Unnecessary
+            // because the peer can no longer own any part of the answer — no delegated_predicate is
+            // emitted and the driving backend always retains the full predicate — so the wrong-result
+            // shapes this guards against are structurally impossible. Harmful because removing the
+            // peer here makes the leaf look unservable to PruneOnlyRelaxer, which then drops it from
+            // the relaxation and loses pruning that is exactly sound: every Lucene-servable nested
+            // predicate is a row-grain superset (NestedAnyMatchExprSerializer refuses AND-bearing
+            // trees outright, and existential quantification distributes over OR exactly).
+            if (context.lucenePruneOnly()) {
+                return false;
+            }
             return underOrNot && filterHasNested;
         });
 

@@ -31,6 +31,8 @@ public class PlannerContext {
     private final OpenSearchDistributionTraitDef distributionTraitDef;
     private final boolean profilingEnabled;
     private final boolean preferMetadataDriver;
+    // Set by DefaultPlanExecutor before planning; see AnalyticsPlugin.LUCENE_PRUNE_ONLY.
+    private boolean lucenePruneOnly;
     private int annotationIdCounter;
     private RuleProfilingListener.PlannerProfile lastProfile;
     // Cluster settings the planner consults at planning time (oversampling factor + delegation
@@ -134,6 +136,20 @@ public class PlannerContext {
      * scan alternative — value-producing peers handle every shape, no late-stage alternative
      * pruning needed.
      */
+    /**
+     * Strict prune-only delegation. When true, the peer backend is consulted only to skip rows and
+     * never owns any part of the answer, so viability rules that exist purely to stop the peer from
+     * answering (see {@code OpenSearchFilterRule.resolveViableBackends}) are unnecessary and would
+     * only cost pruning.
+     */
+    public boolean lucenePruneOnly() {
+        return lucenePruneOnly;
+    }
+
+    public void setLucenePruneOnly(boolean lucenePruneOnly) {
+        this.lucenePruneOnly = lucenePruneOnly;
+    }
+
     public boolean preferMetadataDriver() {
         return preferMetadataDriver;
     }

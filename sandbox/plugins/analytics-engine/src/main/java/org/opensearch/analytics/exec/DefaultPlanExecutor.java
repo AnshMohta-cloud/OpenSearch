@@ -270,6 +270,7 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
             metadataDriver
         );
         plannerContext.setPlannerSettings(plannerSettings);
+        plannerContext.setLucenePruneOnly(lucenePruneOnly);
         RelNode plan = PlannerImpl.createPlan(logicalFragment, plannerContext);
         final String fullPlan = profile ? RelOptUtil.toString(plan) : null;
         QueryDAG dag = DAGBuilder.build(plan, capabilityRegistry, clusterService, indexNameExpressionResolver);

@@ -123,7 +123,10 @@ public class FragmentConversionDriver {
         // stub Read carrying the wrapper's output schema so Stage 3's parent reduce sink
         // can derive the partition schema via the standard producerPlanBytes path.
         if (stage.getExecutionType() == StageExecutionType.LATE_MATERIALIZATION) {
-            LOGGER.info("[TRACE-STEP] convertStage(stageId={}): executionType=LATE_MATERIALIZATION -> convertLateMaterializationStage (no Substrait compute, Java-only scatter/gather stub)", stage.getStageId());
+            LOGGER.info(
+                "[TRACE-STEP] convertStage(stageId={}): executionType=LATE_MATERIALIZATION -> convertLateMaterializationStage (no Substrait compute, Java-only scatter/gather stub)",
+                stage.getStageId()
+            );
             convertLateMaterializationStage(stage, registry);
             return;
         }
