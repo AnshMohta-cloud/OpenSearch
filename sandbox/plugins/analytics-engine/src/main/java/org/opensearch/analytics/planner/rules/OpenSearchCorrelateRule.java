@@ -55,11 +55,7 @@ public class OpenSearchCorrelateRule extends RelOptRule {
                 List<String> expanded = new java.util.ArrayList<>(scan.getViableBackends());
                 expanded.add("datafusion");
                 left = new org.opensearch.analytics.planner.rel.OpenSearchTableScan(
-                    scan.getCluster(),
-                    scan.getTraitSet(),
-                    scan.getTable(),
-                    expanded,
-                    scan.getOutputFieldStorage()
+                    scan.getCluster(), scan.getTraitSet(), scan.getTable(), expanded, scan.getOutputFieldStorage()
                 );
             }
         }
@@ -68,18 +64,16 @@ public class OpenSearchCorrelateRule extends RelOptRule {
 
         RelTraitSet traitSet = correlate.getTraitSet().replace(OpenSearchConvention.INSTANCE);
 
-        call.transformTo(
-            new OpenSearchCorrelate(
-                correlate.getCluster(),
-                traitSet,
-                left,
-                right,
-                correlate.getCorrelationId(),
-                correlate.getRequiredColumns(),
-                correlate.getJoinType(),
-                viableBackends
-            )
-        );
+        call.transformTo(new OpenSearchCorrelate(
+            correlate.getCluster(),
+            traitSet,
+            left,
+            right,
+            correlate.getCorrelationId(),
+            correlate.getRequiredColumns(),
+            correlate.getJoinType(),
+            viableBackends
+        ));
     }
 
     private static List<String> viableBackendsOf(RelNode rel) {

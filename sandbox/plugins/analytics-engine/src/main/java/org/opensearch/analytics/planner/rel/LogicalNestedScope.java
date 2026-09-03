@@ -108,7 +108,9 @@ public class LogicalNestedScope extends SingleRel {
         RelDataTypeField arrayField = inputRowType.getFieldList().get(arrayColumnIndex);
         RelDataType elementType = arrayField.getType().getComponentType();
         if (elementType == null || !elementType.isStruct()) {
-            throw new IllegalArgumentException("LogicalNestedScope: array column '" + arrayField.getName() + "' is not ARRAY(ROW)");
+            throw new IllegalArgumentException(
+                "LogicalNestedScope: array column '" + arrayField.getName() + "' is not ARRAY(ROW)"
+            );
         }
 
         CorrelationId correlId = cluster.createCorrel();

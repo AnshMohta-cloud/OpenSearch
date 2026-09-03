@@ -110,7 +110,7 @@ public class PlannerImpl {
         ).toRule();
 
     public static RelNode createPlan(RelNode rawRelNode, PlannerContext context) {
-        // step 3
+        //step 3
         return runAllOptimizations(rawRelNode, context);
     }
 
@@ -182,10 +182,7 @@ public class PlannerImpl {
         logStage("After CBO", modifiedRelNode);
         LOGGER.info("[NESTED-POC] After CBO row type: {}", modifiedRelNode.getRowType());
         LOGGER.info("[TRACE-STEP] AFTER cbo() — output:\n{}", RelOptUtil.toString(modifiedRelNode));
-        LOGGER.info(
-            "[TRACE-STEP] BEFORE OpenSearchLateMaterializationRewriter.rewrite() — input:\n{}",
-            RelOptUtil.toString(modifiedRelNode)
-        );
+        LOGGER.info("[TRACE-STEP] BEFORE OpenSearchLateMaterializationRewriter.rewrite() — input:\n{}", RelOptUtil.toString(modifiedRelNode));
         Optional<RelNode> lateMat = OpenSearchLateMaterializationRewriter.rewrite(modifiedRelNode);
         if (lateMat.isPresent()) {
             modifiedRelNode = lateMat.get();

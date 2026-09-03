@@ -61,8 +61,6 @@ public class OpenSearchNestedScopeRule extends RelOptRule {
 
         RelTraitSet traitSet = nestedScope.getTraitSet().replace(OpenSearchConvention.INSTANCE);
 
-        call.transformTo(
-            new OpenSearchNestedScope(nestedScope.getCluster(), traitSet, child, nestedScope.getArrayColumnIndex(), viableBackends)
-        );
+        call.transformTo(new OpenSearchNestedScope(nestedScope.getCluster(), traitSet, child, nestedScope.getArrayColumnIndex(), viableBackends));
     }
 }

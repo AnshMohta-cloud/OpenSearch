@@ -304,8 +304,7 @@ public final class OpenSearchNestedFieldRewriter {
     }
 
     /** Result of a stacked unnest: the final NestedScope input, the rewritten project exprs + extra exprs, and level count. */
-    private record StackedUnnestResult(RelNode input, List<RexNode> projectExprs, List<RexNode> extraExprs, int levels) {
-    }
+    private record StackedUnnestResult(RelNode input, List<RexNode> projectExprs, List<RexNode> extraExprs, int levels) {}
 
     /**
      * STACKED (iterative) UNNEST for ARBITRARY nesting depth. A deep path
@@ -692,11 +691,7 @@ public final class OpenSearchNestedFieldRewriter {
         List<RexNode> allOperands = new ArrayList<>(parentOperands.size() + 1);
         allOperands.add(anyMatchCall);
         allOperands.addAll(parentOperands);
-        return rexBuilder.makeCall(
-            rexBuilder.getTypeFactory().createSqlType(SqlTypeName.BOOLEAN),
-            org.apache.calcite.sql.fun.SqlStdOperatorTable.OR,
-            allOperands
-        );
+        return rexBuilder.makeCall(rexBuilder.getTypeFactory().createSqlType(SqlTypeName.BOOLEAN), org.apache.calcite.sql.fun.SqlStdOperatorTable.OR, allOperands);
     }
 
     /** Builds a single {@code NESTED_ANY_MATCH_EXPR(arrayCol, jsonTree)} call, or {@code null} if
@@ -771,7 +766,12 @@ public final class OpenSearchNestedFieldRewriter {
         String fieldName = fieldLit.getValueAs(String.class);
         String value = valueLit.getValueAs(String.class);
 
-        Map<String, Object> equalityLeafTree = Map.of("op", "=", "args", List.of(Map.of("field", fieldName), Map.of("lit", value)));
+        Map<String, Object> equalityLeafTree = Map.of(
+            "op",
+            "=",
+            "args",
+            List.of(Map.of("field", fieldName), Map.of("lit", value))
+        );
         return buildAnyMatchExprCall(equalityLeafTree, arrayCol, inputRowType, rexBuilder);
     }
 
@@ -835,11 +835,7 @@ public final class OpenSearchNestedFieldRewriter {
         List<RexNode> allOperands = new ArrayList<>(parentConjuncts.size() + 1);
         allOperands.add(arrayCall);
         allOperands.addAll(parentConjuncts);
-        return rexBuilder.makeCall(
-            rexBuilder.getTypeFactory().createSqlType(SqlTypeName.BOOLEAN),
-            org.apache.calcite.sql.fun.SqlStdOperatorTable.AND,
-            allOperands
-        );
+        return rexBuilder.makeCall(rexBuilder.getTypeFactory().createSqlType(SqlTypeName.BOOLEAN), org.apache.calcite.sql.fun.SqlStdOperatorTable.AND, allOperands);
     }
 
     /**
@@ -933,9 +929,7 @@ public final class OpenSearchNestedFieldRewriter {
             if (node instanceof RexCall itemCall && "ITEM".equals(itemCall.getOperator().getName()) && itemCall.getOperands().size() == 2) {
                 RexNode arrayOperand = itemCall.getOperands().get(0);
                 RexNode fieldNode = itemCall.getOperands().get(1);
-                if (arrayOperand instanceof RexInputRef ref
-                    && fieldNode instanceof RexLiteral lit
-                    && lit.getTypeName() == SqlTypeName.CHAR) {
+                if (arrayOperand instanceof RexInputRef ref && fieldNode instanceof RexLiteral lit && lit.getTypeName() == SqlTypeName.CHAR) {
                     if (ref.getIndex() != arrayCol) {
                         return null; // ITEM on a DIFFERENT array — unsupported, fall back
                     }
@@ -1172,8 +1166,7 @@ public final class OpenSearchNestedFieldRewriter {
     // ---- Shared: build LogicalNestedScope(input, arrayCol) appending the struct fields ----------
 
     /** Result of injecting an unnest: the new NestedScope rel + the index where unnested fields begin. */
-    private record UnnestResult(LogicalNestedScope nestedScope, int unnestedFieldIndex, Map<String, Integer> fieldToIndex) {
-    }
+    private record UnnestResult(LogicalNestedScope nestedScope, int unnestedFieldIndex, Map<String, Integer> fieldToIndex) {}
 
     /**
      * Injects {@code LogicalNestedScope(input, arrayCol)} — the backend-neutral "expand this array,

@@ -15,6 +15,7 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.core.Uncollect;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 
 import java.util.ArrayList;
@@ -72,7 +73,9 @@ public class OpenSearchUncollect extends Uncollect implements OpenSearchRelNode 
 
     @Override
     public RelNode copyResolved(String backend, List<RelNode> children, List<OperatorAnnotation> resolvedAnnotations) {
-        return new OpenSearchUncollect(getCluster(), getTraitSet(), children.get(0), withOrdinality, getItemAliases(), List.of(backend));
+        return new OpenSearchUncollect(
+            getCluster(), getTraitSet(), children.get(0), withOrdinality, getItemAliases(), List.of(backend)
+        );
     }
 
     @Override
