@@ -173,19 +173,19 @@ public class NestedAnyMatchExprSerializer extends AbstractQuerySerializer {
             // while the predicate stays PERFORMANCE-delegated, where strip() keeps the original for
             // DataFusion to re-check. Three things make that impossible to guarantee from here, all
             // verified empirically on a live node:
-            // 1. Under a plan-level OR/NOT, DelegatedPredicateCombiner reclassifies performance ->
-            // correctness, and the correctness branch of FragmentConversionDriver.strip calls
-            // makePlaceholder, which DROPS the original — the superset is then trusted.
-            // `where (events.name='cache_miss' and events.status='error') or trace='R2'` returned an
-            // extra row whose two values lived in different elements.
-            // 2. Suppressing that reclassification does not help: a PERFORMANCE-delegated leaf under an
-            // OR degenerates to all-true at runtime (the same query then returned every row, with
-            // collectDocs never called), which is exactly why the combiner reclassifies in the first
-            // place. demote_delegation_possible() does not rescue this shape.
-            // 3. Declining to delegate in the combiner does not help either, because merely reporting
-            // canServe=true here makes the leaf dual-viable, and the operator-level viability
-            // decided upstream in OpenSearchFilterRule is itself enough to change fragment
-            // classification and break the OR shapes.
+            //   1. Under a plan-level OR/NOT, DelegatedPredicateCombiner reclassifies performance ->
+            //      correctness, and the correctness branch of FragmentConversionDriver.strip calls
+            //      makePlaceholder, which DROPS the original — the superset is then trusted.
+            //      `where (events.name='cache_miss' and events.status='error') or trace='R2'` returned an
+            //      extra row whose two values lived in different elements.
+            //   2. Suppressing that reclassification does not help: a PERFORMANCE-delegated leaf under an
+            //      OR degenerates to all-true at runtime (the same query then returned every row, with
+            //      collectDocs never called), which is exactly why the combiner reclassifies in the first
+            //      place. demote_delegation_possible() does not rescue this shape.
+            //   3. Declining to delegate in the combiner does not help either, because merely reporting
+            //      canServe=true here makes the leaf dual-viable, and the operator-level viability
+            //      decided upstream in OpenSearchFilterRule is itself enough to change fragment
+            //      classification and break the OR shapes.
             // So an AND-bearing tree must not be Lucene-viable AT ALL until the DataFusion/Rust evaluator
             // supports a delegated leaf under OR/NOT (see the unimplemented! arms in
             // indexed_table/eval/{mod,bitmap_tree}.rs). Acceleration for the AND case still comes from
