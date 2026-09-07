@@ -121,6 +121,35 @@ fn evaluate_nested_any_match(
     let values = list_array.values();
     let struct_array = values.as_struct();
 
+    // Compile the JSON tree ONCE for the whole batch: resolve every field name to a column index,
+    // every operator string to an enum, and every literal to a `Val`. The per-element loop below then
+    // touches no JSON and does no string work. Previously the tree was re-walked per element, paying a
+    // `serde_json` map lookup per node plus a linear name-vs-`Fields` string comparison per field read —
+    // constant work repeated 20M times on a 10M-row x 2-element scan.
+    //
+    // A consequence worth noting: malformed predicates (unknown field, nested field that is not
+    // List<Struct>) now surface once, before the loop, instead of on first evaluation. That makes them
+    // detectable even when every array is empty or null, where the old code would silently never look.
+    let compiled = compile_node(tree, &struct_fields)?;
+
+    // Fast path: evaluate the element condition ONCE over the whole flattened child array with Arrow
+    // kernels, then roll the per-element mask up to parents. Falls back to the per-element walk below
+    // for any node whose exact semantics the vectorised path declines to reproduce (see try_vectorize).
+    if let Some(mask) = try_vectorize(&compiled, struct_array, lucene, struct_array.len()) {
+        for row_idx in 0..num_rows {
+            if list_array.is_null(row_idx) {
+                result.append_null();
+                continue;
+            }
+            let start = list_array.value_offsets()[row_idx] as usize;
+            let end = list_array.value_offsets()[row_idx + 1] as usize;
+            // A null element mask entry is "unknown", which the existential treats as not-matching —
+            // the same as the scalar loop, where only `Some(true)` sets `any_match`.
+            result.append_value((start..end).any(|i| mask.is_valid(i) && mask.value(i)));
+        }
+        return Ok(result.finish());
+    }
+
     for row_idx in 0..num_rows {
         if list_array.is_null(row_idx) {
             result.append_null();
@@ -134,7 +163,7 @@ fn evaluate_nested_any_match(
         }
         let mut any_match = false;
         for elem_idx in start..end {
-            if let Some(true) = eval_bool(tree, struct_array, &struct_fields, elem_idx, lucene)? {
+            if let Some(true) = eval_compiled(&compiled, struct_array, elem_idx, lucene)? {
                 any_match = true;
                 break;
             }
@@ -188,99 +217,189 @@ impl<'a> LuceneClauseBits<'a> {
     }
 }
 
-/// Evaluate a boolean-typed node of the tree for one struct element. Returns `Ok(None)` for a
-/// NULL result (SQL three-valued logic — e.g. comparing against a NULL field value).
+/// A value produced while evaluating one element, **borrowed** from the Arrow array (for a field
+/// read) or from the parsed JSON tree (for a literal).
 ///
-/// `lucene` carries per-element results for any Lucene-delegated leaves (child-grain split); `None` on the
-/// plain (non-split) path. A `{"lucene": <idx>}` node consults it instead of comparing a field.
-fn eval_bool(
-    node: &Json,
-    struct_array: &datafusion::arrow::array::StructArray,
-    struct_fields: &datafusion::arrow::datatypes::Fields,
-    elem_idx: usize,
-    lucene: Option<&LuceneClauseBits>,
-) -> Result<Option<bool>> {
-    // Child-grain split leaf: a keyword clause the rewriter chose to route to Lucene.
-    // `{"lucene": <clauseIdx>, "fallback": <originalPredicateSubtree>}`.
-    //
-    // Lucene is a pure OPTIMIZATION here, never a correctness dependency: when the child-grain split
-    // executor supplies this clause's per-element verdicts (`lucene` present AND has clause `idx`), use
-    // them (two-valued: matched / not — Lucene has no NULL notion). Otherwise — the plain UDF path
-    // (`lucene == None`), the Tree/OR-NOT path where the peer was demoted to native, or any path where
-    // this clause wasn't delegated — evaluate the `fallback` subtree natively so the result is identical.
-    // This keeps `nested_any_match_expr` self-sufficient on EVERY execution path; the split only makes it
-    // faster, never changes its answer.
+/// This exists purely to keep the inner loop allocation-free. The obvious implementation reads a
+/// field with `ScalarValue::try_from_array`, which for a keyword column heap-allocates a `String`
+/// per element; the literal side then allocated another via `json_to_scalar`, and the old
+/// `scalar_to_string` cloned *both* again to compare them — four allocations per element per
+/// comparison, 80M of them on a 20M-element scan. Numeric predicates never paid this (they coerce
+/// through `f64`), which is exactly why they already ran at native-DataFusion speed while keyword
+/// predicates ran ~2x slower. Borrowing removes all four.
+///
+/// `Other` stands for a non-null value of a type this evaluator does not compare (dates,
+/// timestamps, structs). It deliberately reproduces the previous behaviour: such a value is
+/// *present* for `EXISTS`, but any comparison against it yields `None` (unknown).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Val<'a> {
+    Null,
+    Num(f64),
+    Str(&'a str),
+    Bool(bool),
+    Other,
+}
+
+/// Read element `idx` out of a struct field column without allocating.
+fn read_field(arr: &dyn Array, idx: usize) -> Val<'_> {
+    use datafusion::arrow::datatypes::{
+        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    };
+    if arr.is_null(idx) {
+        return Val::Null;
+    }
+    match arr.data_type() {
+        DataType::Utf8 => Val::Str(arr.as_string::<i32>().value(idx)),
+        DataType::LargeUtf8 => Val::Str(arr.as_string::<i64>().value(idx)),
+        DataType::Utf8View => Val::Str(arr.as_string_view().value(idx)),
+        DataType::Int8 => Val::Num(arr.as_primitive::<Int8Type>().value(idx) as f64),
+        DataType::Int16 => Val::Num(arr.as_primitive::<Int16Type>().value(idx) as f64),
+        DataType::Int32 => Val::Num(arr.as_primitive::<Int32Type>().value(idx) as f64),
+        DataType::Int64 => Val::Num(arr.as_primitive::<Int64Type>().value(idx) as f64),
+        DataType::UInt8 => Val::Num(arr.as_primitive::<UInt8Type>().value(idx) as f64),
+        DataType::UInt16 => Val::Num(arr.as_primitive::<UInt16Type>().value(idx) as f64),
+        DataType::UInt32 => Val::Num(arr.as_primitive::<UInt32Type>().value(idx) as f64),
+        DataType::UInt64 => Val::Num(arr.as_primitive::<UInt64Type>().value(idx) as f64),
+        DataType::Float32 => Val::Num(arr.as_primitive::<Float32Type>().value(idx) as f64),
+        DataType::Float64 => Val::Num(arr.as_primitive::<Float64Type>().value(idx)),
+        DataType::Boolean => Val::Bool(arr.as_boolean().value(idx)),
+        _ => Val::Other,
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Compiled predicate tree
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The wire format is JSON, which is convenient to emit from Java but expensive to interpret: every
+// node access is a `serde_json` map lookup and every `{"field":...}` resolves its column by scanning
+// `Fields` and comparing strings. Doing that per array element meant repeating fixed work 20,000,000
+// times on a 10M-row x 2-element scan.
+//
+// `compile_node` walks the JSON exactly once per batch and lowers it to the enums below: field names
+// become column indices, operator strings become discriminants, literals become `Val`s. `eval_compiled`
+// then evaluates per element with no JSON, no string comparison and no allocation.
+//
+// Semantics are unchanged from the interpreted version — same three-valued logic, same two-valued
+// existential/`EXISTS` conventions, same error messages.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CmpOp {
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    Eq,
+    Ne,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+/// A value-producing node: a field read (by resolved column index), a literal, or arithmetic.
+#[derive(Debug)]
+enum CVal<'a> {
+    Field(usize),
+    Lit(Val<'a>),
+    Arith(ArithOp, Box<CVal<'a>>, Box<CVal<'a>>),
+}
+
+/// A boolean-producing node.
+#[derive(Debug)]
+enum CNode<'a> {
+    And(Vec<CNode<'a>>),
+    Or(Vec<CNode<'a>>),
+    Not(Box<CNode<'a>>),
+    Cmp(CmpOp, CVal<'a>, CVal<'a>),
+    /// `EXISTS` / `NOT_EXISTS`; the flag is set for the negated form.
+    Exists(CVal<'a>, bool),
+    /// Child-grain split leaf: use clause `idx`'s per-element verdict when supplied, else `fallback`.
+    Lucene { idx: usize, fallback: Box<CNode<'a>> },
+    /// Descent into an inner `LIST<STRUCT>` column, opening a fresh existential over its elements.
+    /// `inner` is compiled against the *inner* struct's fields.
+    Nested { col: usize, inner: Box<CNode<'a>> },
+}
+
+/// Resolve a field name to its column index, with the same diagnostic the interpreter produced.
+fn resolve_field(fields: &datafusion::arrow::datatypes::Fields, name: &str, what: &str) -> Result<usize> {
+    fields.iter().position(|f| f.name() == name).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "nested_any_match_expr: {what}'{name}' not found. Available: {:?}",
+            fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+        ))
+    })
+}
+
+fn compile_val<'a>(node: &'a Json, fields: &datafusion::arrow::datatypes::Fields) -> Result<CVal<'a>> {
+    if let Some(field_name) = node.get("field").and_then(|v| v.as_str()) {
+        return Ok(CVal::Field(resolve_field(fields, field_name, "field ")?));
+    }
+    if let Some(lit) = node.get("lit") {
+        return Ok(CVal::Lit(json_to_val(lit)));
+    }
+    if let Some(op) = node.get("op").and_then(|v| v.as_str()) {
+        let args = node
+            .get("args")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| DataFusionError::Execution(format!("nested_any_match_expr: missing 'args' in node {node}")))?;
+        if args.len() != 2 {
+            return plan_err!("nested_any_match_expr: arithmetic op '{op}' expects 2 args");
+        }
+        let aop = match op {
+            "+" => ArithOp::Add,
+            "-" => ArithOp::Sub,
+            "*" => ArithOp::Mul,
+            "/" => ArithOp::Div,
+            "%" => ArithOp::Rem,
+            other => return plan_err!("nested_any_match_expr: unsupported arithmetic operator '{other}'"),
+        };
+        return Ok(CVal::Arith(
+            aop,
+            Box::new(compile_val(&args[0], fields)?),
+            Box::new(compile_val(&args[1], fields)?),
+        ));
+    }
+    plan_err!("nested_any_match_expr: unrecognized value node {node}")
+}
+
+fn compile_node<'a>(node: &'a Json, fields: &datafusion::arrow::datatypes::Fields) -> Result<CNode<'a>> {
+    // Child-grain split leaf: `{"lucene": <clauseIdx>, "fallback": <originalPredicateSubtree>}`.
+    // Lucene is a pure OPTIMIZATION, never a correctness dependency: the executor may or may not supply
+    // this clause's per-element verdicts, so the `fallback` subtree is always compiled and stands ready.
     if let Some(idx) = node.get("lucene").and_then(|v| v.as_u64()) {
         let idx = idx as usize;
-        if let Some(l) = lucene {
-            if l.has_clause(idx) {
-                return Ok(Some(l.value(idx, elem_idx)));
-            }
-        }
-        match node.get("fallback") {
-            Some(fallback) => return eval_bool(fallback, struct_array, struct_fields, elem_idx, lucene),
-            None => {
-                return plan_err!(
-                    "nested_any_match_expr: {{\"lucene\":{idx}}} node has neither delegated bits nor a \
-                     \"fallback\" subtree — the rewriter must always emit a fallback so the predicate is \
-                     correct when Lucene verdicts are absent"
-                )
-            }
-        }
+        let fallback = node.get("fallback").ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "nested_any_match_expr: {{\"lucene\":{idx}}} node has neither delegated bits nor a \
+                 \"fallback\" subtree — the rewriter must always emit a fallback so the predicate is \
+                 correct when Lucene verdicts are absent"
+            ))
+        })?;
+        return Ok(CNode::Lucene {
+            idx,
+            fallback: Box::new(compile_node(fallback, fields)?),
+        });
     }
 
-    // Nested descent: an inner LIST<STRUCT> array level. `{"nested":"<field>","inner":<subtree>}`.
-    //
-    // This is what makes the evaluator arbitrary-depth. `field` names a field on the CURRENT struct
-    // element that is ITSELF a nested array (Arrow List<Struct>) — e.g. `comments.replies` where both
-    // `comments` and `replies` are OpenSearch `nested`. We open a fresh existential (∃) loop over the
-    // inner list's elements for THIS outer element (`elem_idx`), short-circuiting on the first inner
-    // element that satisfies `inner`, and return whether any did. `inner` may itself be another
-    // `{"nested":...}` node, so this composes to any depth (∃-over-∃-over-∃…), one loop per array level.
-    //
-    // The coordinate composition is the standard Arrow nested-list descent: the inner list column's
-    // `value_offsets[elem_idx]..[elem_idx+1]` delimits this outer element's inner elements in the
-    // flattened inner values array — the same value_offsets indexing the outer loop used one level up.
-    //
-    // Semantics are TWO-VALUED (boolean), NOT 3VL — matching vanilla OpenSearch nested-query existential
-    // semantics: an empty inner list, a null inner-list slot, and "inner elements present but none match"
-    // ALL collapse to Some(false) (the parent has no matching nested child), never None. A null leaf on an
-    // inner element is handled inside the recursion (its comparison yields None → that element doesn't
-    // match → the ∃ loop continues), never poisoning the whole result. `lucene` is threaded through
-    // UNCHANGED: a `{"lucene": i}` node found at this depth (multi-level child-grain split) consults
-    // clause i's own bit array with the INNER elem_idx computed just below — each clause's bit array is
-    // built by the executor in that clause's own coordinate space (see single_collector.rs's per-clause
-    // chained-offset base computation), so indexing with whatever elem_idx is current at this recursion
-    // depth is always correct, regardless of how many `{"nested"}` levels were crossed to get here.
+    // Nested descent: `{"nested":"<field>","inner":<subtree>}`. `field` names a column on the CURRENT
+    // struct that is itself List<Struct>, so `inner` compiles against the INNER struct's fields — which
+    // is what makes the evaluator arbitrary-depth (one existential loop per array level).
     if let Some(field_name) = node.get("nested").and_then(|v| v.as_str()) {
         let inner_subtree = node.get("inner").ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "nested_any_match_expr: {{\"nested\":\"{field_name}\"}} node missing \"inner\" subtree"
             ))
         })?;
-        let field_idx = struct_fields
-            .iter()
-            .position(|f| f.name() == field_name)
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "nested_any_match_expr: nested field '{field_name}' not found. Available: {:?}",
-                    struct_fields.iter().map(|f| f.name()).collect::<Vec<_>>()
-                ))
-            })?;
-        let inner_col = struct_array.column(field_idx);
-        // A null inner-list slot for this element ⇒ no inner elements ⇒ ∃ = false.
-        if inner_col.is_null(elem_idx) {
-            return Ok(Some(false));
-        }
-        let inner_list = inner_col.as_list_opt::<i32>().ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "nested_any_match_expr: nested field '{field_name}' must be List<Struct>, got {:?}",
-                inner_col.data_type()
-            ))
-        })?;
-        let inner_fields = match inner_list.data_type() {
+        let col = resolve_field(fields, field_name, "nested field ")?;
+        let inner_fields = match fields[col].data_type() {
             DataType::List(f) => match f.data_type() {
-                DataType::Struct(fields) => fields.clone(),
+                DataType::Struct(inner) => inner.clone(),
                 other => {
                     return plan_err!(
                         "nested_any_match_expr: nested field '{field_name}' must be List<Struct>, got List<{other:?}>"
@@ -289,16 +408,10 @@ fn eval_bool(
             },
             other => return plan_err!("nested_any_match_expr: nested field '{field_name}' must be a List, got {other:?}"),
         };
-        let inner_values = inner_list.values();
-        let inner_struct = inner_values.as_struct();
-        let inner_start = inner_list.value_offsets()[elem_idx] as usize;
-        let inner_end = inner_list.value_offsets()[elem_idx + 1] as usize;
-        for inner_idx in inner_start..inner_end {
-            if let Some(true) = eval_bool(inner_subtree, inner_struct, &inner_fields, inner_idx, lucene)? {
-                return Ok(Some(true));
-            }
-        }
-        return Ok(Some(false));
+        return Ok(CNode::Nested {
+            col,
+            inner: Box::new(compile_node(inner_subtree, &inner_fields)?),
+        });
     }
 
     let op = node
@@ -311,9 +424,115 @@ fn eval_bool(
         .ok_or_else(|| DataFusionError::Execution(format!("nested_any_match_expr: missing 'args' in node {node}")))?;
 
     match op {
-        "AND" => {
+        "AND" | "OR" => {
+            let mut kids = Vec::with_capacity(args.len());
             for a in args {
-                match eval_bool(a, struct_array, struct_fields, elem_idx, lucene)? {
+                kids.push(compile_node(a, fields)?);
+            }
+            Ok(if op == "AND" { CNode::And(kids) } else { CNode::Or(kids) })
+        }
+        "NOT" => {
+            if args.len() != 1 {
+                return plan_err!("nested_any_match_expr: NOT expects 1 arg");
+            }
+            Ok(CNode::Not(Box::new(compile_node(&args[0], fields)?)))
+        }
+        ">" | ">=" | "<" | "<=" | "=" | "!=" => {
+            if args.len() != 2 {
+                return plan_err!("nested_any_match_expr: comparison expects 2 args");
+            }
+            let cop = match op {
+                ">" => CmpOp::Gt,
+                ">=" => CmpOp::Ge,
+                "<" => CmpOp::Lt,
+                "<=" => CmpOp::Le,
+                "=" => CmpOp::Eq,
+                _ => CmpOp::Ne,
+            };
+            Ok(CNode::Cmp(
+                cop,
+                compile_val(&args[0], fields)?,
+                compile_val(&args[1], fields)?,
+            ))
+        }
+        "EXISTS" | "NOT_EXISTS" => {
+            if args.len() != 1 {
+                return plan_err!("nested_any_match_expr: {op} expects 1 arg");
+            }
+            Ok(CNode::Exists(compile_val(&args[0], fields)?, op == "NOT_EXISTS"))
+        }
+        other => plan_err!("nested_any_match_expr: '{other}' is not a boolean operator"),
+    }
+}
+
+/// Evaluate a compiled value node for one struct element. The returned [`Val`] borrows from the array
+/// or from the compiled literal — nothing is copied.
+fn eval_cval<'a>(v: &'a CVal<'a>, struct_array: &'a datafusion::arrow::array::StructArray, elem_idx: usize) -> Result<Val<'a>> {
+    match v {
+        CVal::Field(col) => Ok(read_field(struct_array.column(*col).as_ref(), elem_idx)),
+        CVal::Lit(lit) => Ok(*lit),
+        CVal::Arith(op, l, r) => {
+            let left = eval_cval(l, struct_array, elem_idx)?;
+            let right = eval_cval(r, struct_array, elem_idx)?;
+            arithmetic(&left, *op, &right)
+        }
+    }
+}
+
+/// Evaluate a compiled boolean node for one struct element. `Ok(None)` is a NULL result (SQL
+/// three-valued logic — e.g. comparing against a NULL field value).
+///
+/// `lucene` carries per-element results for Lucene-delegated leaves (child-grain split); `None` on the
+/// plain path. It is threaded through `Nested` descents UNCHANGED: each clause's bit array is built by
+/// the executor in that clause's own coordinate space, so indexing with whatever `elem_idx` is current
+/// at this recursion depth is always correct, however many levels were crossed to get here.
+fn eval_compiled(
+    node: &CNode<'_>,
+    struct_array: &datafusion::arrow::array::StructArray,
+    elem_idx: usize,
+    lucene: Option<&LuceneClauseBits>,
+) -> Result<Option<bool>> {
+    match node {
+        CNode::Lucene { idx, fallback } => {
+            // Two-valued when Lucene supplied verdicts (it has no NULL notion); otherwise evaluate the
+            // fallback natively so the answer is identical on every execution path.
+            if let Some(l) = lucene {
+                if l.has_clause(*idx) {
+                    return Ok(Some(l.value(*idx, elem_idx)));
+                }
+            }
+            eval_compiled(fallback, struct_array, elem_idx, lucene)
+        }
+
+        // Semantics here are TWO-VALUED, not 3VL — matching vanilla OpenSearch nested-query existential
+        // semantics: an empty inner list, a null inner-list slot, and "inner elements present but none
+        // match" ALL collapse to Some(false), never None. A null leaf on an inner element is handled
+        // inside the recursion (its comparison yields None, so that element simply doesn't match).
+        CNode::Nested { col, inner } => {
+            let inner_col = struct_array.column(*col);
+            if inner_col.is_null(elem_idx) {
+                return Ok(Some(false));
+            }
+            let inner_list = inner_col.as_list_opt::<i32>().ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "nested_any_match_expr: nested column {col} must be List<Struct>, got {:?}",
+                    inner_col.data_type()
+                ))
+            })?;
+            let inner_struct = inner_list.values().as_struct();
+            let start = inner_list.value_offsets()[elem_idx] as usize;
+            let end = inner_list.value_offsets()[elem_idx + 1] as usize;
+            for inner_idx in start..end {
+                if let Some(true) = eval_compiled(inner, inner_struct, inner_idx, lucene)? {
+                    return Ok(Some(true));
+                }
+            }
+            Ok(Some(false))
+        }
+
+        CNode::And(kids) => {
+            for k in kids {
+                match eval_compiled(k, struct_array, elem_idx, lucene)? {
                     Some(false) => return Ok(Some(false)),
                     None => return Ok(None), // NULL propagates: NULL AND anything-not-false = NULL
                     Some(true) => continue,
@@ -321,10 +540,11 @@ fn eval_bool(
             }
             Ok(Some(true))
         }
-        "OR" => {
+
+        CNode::Or(kids) => {
             let mut saw_null = false;
-            for a in args {
-                match eval_bool(a, struct_array, struct_fields, elem_idx, lucene)? {
+            for k in kids {
+                match eval_compiled(k, struct_array, elem_idx, lucene)? {
                     Some(true) => return Ok(Some(true)),
                     None => saw_null = true,
                     Some(false) => continue,
@@ -332,181 +552,96 @@ fn eval_bool(
             }
             Ok(if saw_null { None } else { Some(false) })
         }
-        "NOT" => {
-            if args.len() != 1 {
-                return plan_err!("nested_any_match_expr: NOT expects 1 arg");
-            }
-            Ok(eval_bool(&args[0], struct_array, struct_fields, elem_idx, lucene)?.map(|b| !b))
+
+        CNode::Not(inner) => Ok(eval_compiled(inner, struct_array, elem_idx, lucene)?.map(|b| !b)),
+
+        CNode::Cmp(op, l, r) => {
+            let left = eval_cval(l, struct_array, elem_idx)?;
+            let right = eval_cval(r, struct_array, elem_idx)?;
+            Ok(compare(&left, *op, &right))
         }
-        ">" | ">=" | "<" | "<=" | "=" | "!=" => {
-            if args.len() != 2 {
-                return plan_err!("nested_any_match_expr: comparison expects 2 args");
-            }
-            let left = eval_value(&args[0], struct_array, struct_fields, elem_idx)?;
-            let right = eval_value(&args[1], struct_array, struct_fields, elem_idx)?;
-            Ok(compare(&left, op, &right))
+
+        // Deliberately TWO-VALUED, never None: whether a value is present is never itself "unknown" —
+        // matching vanilla OpenSearch's `is not null`/`exists` semantics and this evaluator's two-valued
+        // existence convention.
+        CNode::Exists(arg, negated) => {
+            let present = !is_null(&eval_cval(arg, struct_array, elem_idx)?);
+            Ok(Some(if *negated { !present } else { present }))
         }
-        // IS NOT NULL / IS NULL ("exists" / a leaf field-reference's own presence check).
-        // Deliberately TWO-VALUED, never None: whether a value is present is never itself
-        // "unknown" — matching vanilla OpenSearch's `is not null`/`exists` semantics, and this
-        // evaluator's existing two-valued convention for nested existence/absence (see the
-        // "nested" descent above).
-        "EXISTS" | "NOT_EXISTS" => {
-            if args.len() != 1 {
-                return plan_err!("nested_any_match_expr: {op} expects 1 arg");
-            }
-            let value = eval_value(&args[0], struct_array, struct_fields, elem_idx)?;
-            let present = !is_null(&value);
-            Ok(Some(if op == "EXISTS" { present } else { !present }))
-        }
-        other => plan_err!("nested_any_match_expr: '{other}' is not a boolean operator"),
     }
 }
 
-/// Evaluate a value-typed node (field access, literal, or arithmetic) for one struct element.
-fn eval_value(
-    node: &Json,
-    struct_array: &datafusion::arrow::array::StructArray,
-    struct_fields: &datafusion::arrow::datatypes::Fields,
-    elem_idx: usize,
-) -> Result<ScalarValue> {
-    if let Some(field_name) = node.get("field").and_then(|v| v.as_str()) {
-        let field_idx = struct_fields
-            .iter()
-            .position(|f| f.name() == field_name)
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "nested_any_match_expr: field '{field_name}' not found. Available: {:?}",
-                    struct_fields.iter().map(|f| f.name()).collect::<Vec<_>>()
-                ))
-            })?;
-        let field_array = struct_array.column(field_idx);
-        if field_array.is_null(elem_idx) {
-            return Ok(ScalarValue::Null);
-        }
-        return ScalarValue::try_from_array(field_array, elem_idx);
-    }
-
-    if let Some(lit) = node.get("lit") {
-        return Ok(json_to_scalar(lit));
-    }
-
-    if let Some(op) = node.get("op").and_then(|v| v.as_str()) {
-        let args = node
-            .get("args")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| DataFusionError::Execution(format!("nested_any_match_expr: missing 'args' in node {node}")))?;
-        if args.len() != 2 {
-            return plan_err!("nested_any_match_expr: arithmetic op '{op}' expects 2 args");
-        }
-        let left = eval_value(&args[0], struct_array, struct_fields, elem_idx)?;
-        let right = eval_value(&args[1], struct_array, struct_fields, elem_idx)?;
-        return arithmetic(&left, op, &right);
-    }
-
-    plan_err!("nested_any_match_expr: unrecognized value node {node}")
-}
-
-fn json_to_scalar(v: &Json) -> ScalarValue {
+/// A literal from the wire format. The `&str` borrows straight out of the parsed tree, which is
+/// parsed once per batch, so a string literal costs nothing per element.
+fn json_to_val(v: &Json) -> Val<'_> {
     if let Some(n) = v.as_f64() {
-        return ScalarValue::Float64(Some(n));
+        return Val::Num(n);
     }
     if let Some(s) = v.as_str() {
         if s == "null" {
-            return ScalarValue::Null;
+            return Val::Null;
         }
-        return ScalarValue::Utf8(Some(s.to_string()));
+        return Val::Str(s);
     }
     if let Some(b) = v.as_bool() {
-        return ScalarValue::Boolean(Some(b));
+        return Val::Bool(b);
     }
-    ScalarValue::Null
+    Val::Null
 }
 
-fn scalar_to_f64(s: &ScalarValue) -> Option<f64> {
-    match s {
-        ScalarValue::Int8(Some(v)) => Some(*v as f64),
-        ScalarValue::Int16(Some(v)) => Some(*v as f64),
-        ScalarValue::Int32(Some(v)) => Some(*v as f64),
-        ScalarValue::Int64(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt8(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt16(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt32(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt64(Some(v)) => Some(*v as f64),
-        ScalarValue::Float32(Some(v)) => Some(*v as f64),
-        ScalarValue::Float64(Some(v)) => Some(*v as f64),
-        _ => None,
-    }
-}
-
-fn scalar_to_string(s: &ScalarValue) -> Option<String> {
-    match s {
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) | ScalarValue::Utf8View(Some(v)) => Some(v.clone()),
-        _ => None,
-    }
-}
-
-fn is_null(s: &ScalarValue) -> bool {
-    matches!(s, ScalarValue::Null) || s.is_null()
+fn is_null(v: &Val<'_>) -> bool {
+    matches!(v, Val::Null)
 }
 
 /// SQL three-valued comparison: NULL compared to anything is NULL (unknown), never true/false.
-fn compare(left: &ScalarValue, op: &str, right: &ScalarValue) -> Option<bool> {
-    if is_null(left) || is_null(right) {
-        return None;
+///
+/// Type pairings mirror the previous `ScalarValue` implementation exactly: numbers compare as
+/// `f64`, strings compare lexicographically, and every other combination — including
+/// boolean-vs-boolean and any mixed pairing — is `None`. (Boolean yielding `None` is pre-existing
+/// behaviour, not something introduced here.)
+fn compare(left: &Val<'_>, op: CmpOp, right: &Val<'_>) -> Option<bool> {
+    match (left, right) {
+        (Val::Null, _) | (_, Val::Null) => None,
+        (Val::Num(l), Val::Num(r)) => Some(match op {
+            CmpOp::Gt => l > r,
+            CmpOp::Ge => l >= r,
+            CmpOp::Lt => l < r,
+            CmpOp::Le => l <= r,
+            CmpOp::Eq => (l - r).abs() < f64::EPSILON,
+            CmpOp::Ne => (l - r).abs() >= f64::EPSILON,
+        }),
+        (Val::Str(l), Val::Str(r)) => Some(match op {
+            CmpOp::Gt => l > r,
+            CmpOp::Ge => l >= r,
+            CmpOp::Lt => l < r,
+            CmpOp::Le => l <= r,
+            CmpOp::Eq => l == r,
+            CmpOp::Ne => l != r,
+        }),
+        _ => None,
     }
-    if let (Some(l), Some(r)) = (scalar_to_f64(left), scalar_to_f64(right)) {
-        return Some(match op {
-            ">" => l > r,
-            ">=" => l >= r,
-            "<" => l < r,
-            "<=" => l <= r,
-            "=" => (l - r).abs() < f64::EPSILON,
-            "!=" => (l - r).abs() >= f64::EPSILON,
-            _ => return None,
-        });
-    }
-    if let (Some(l), Some(r)) = (scalar_to_string(left), scalar_to_string(right)) {
-        return Some(match op {
-            ">" => l > r,
-            ">=" => l >= r,
-            "<" => l < r,
-            "<=" => l <= r,
-            "=" => l == r,
-            "!=" => l != r,
-            _ => return None,
-        });
-    }
-    None
 }
 
-fn arithmetic(left: &ScalarValue, op: &str, right: &ScalarValue) -> Result<ScalarValue> {
+fn arithmetic<'a>(left: &Val<'a>, op: ArithOp, right: &Val<'a>) -> Result<Val<'a>> {
     if is_null(left) || is_null(right) {
-        return Ok(ScalarValue::Null);
+        return Ok(Val::Null);
     }
-    let (l, r) = match (scalar_to_f64(left), scalar_to_f64(right)) {
-        (Some(l), Some(r)) => (l, r),
-        _ => return plan_err!("nested_any_match_expr: arithmetic op '{op}' requires numeric operands"),
+    let (l, r) = match (left, right) {
+        (Val::Num(l), Val::Num(r)) => (*l, *r),
+        _ => return plan_err!("nested_any_match_expr: arithmetic op '{op:?}' requires numeric operands"),
     };
     let result = match op {
-        "+" => l + r,
-        "-" => l - r,
-        "*" => l * r,
-        "/" => {
+        ArithOp::Add => l + r,
+        ArithOp::Sub => l - r,
+        ArithOp::Mul => l * r,
+        ArithOp::Div | ArithOp::Rem => {
             if r == 0.0 {
-                return Ok(ScalarValue::Null);
+                return Ok(Val::Null);
             }
-            l / r
+            if op == ArithOp::Div { l / r } else { l % r }
         }
-        "%" => {
-            if r == 0.0 {
-                return Ok(ScalarValue::Null);
-            }
-            l % r
-        }
-        other => return plan_err!("nested_any_match_expr: unsupported arithmetic operator '{other}'"),
     };
-    Ok(ScalarValue::Float64(Some(result)))
+    Ok(Val::Num(result))
 }
 
 fn extract_string_scalar(arg: &ColumnarValue, name: &str) -> Result<String> {
@@ -524,6 +659,217 @@ fn extract_string_scalar(arg: &ColumnarValue, name: &str) -> Result<String> {
         }
         other => plan_err!("nested_any_match_expr: '{}' must be a string literal, got {:?}", name, other),
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Vectorised evaluation
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `eval_compiled` walks the compiled tree once per ELEMENT. With ~2 elements per row over 10M rows
+// that is 20,000,000 tree walks, each a chain of virtual dispatches that re-derives the same shape.
+// Measured with the Rust-side timer, `on_batch_mask` was 107 ms against 10 ms for an equivalent flat
+// (non-nested) predicate on the same index — 10x, and the single largest phase of a nested query.
+//
+// The element-level condition is independent per element, so it can instead be evaluated ONCE over
+// the whole flattened child array with Arrow kernels, yielding a per-element boolean mask, which is
+// then rolled up to parents through the list offsets. Same answer, one vectorised pass.
+//
+// This path is deliberately PARTIAL. `try_vectorize` returns `None` for any node whose exact
+// semantics it cannot reproduce, and the caller then runs the original per-element loop for the whole
+// batch. That keeps the fast path honest: it never approximates, it declines. Two places where the
+// scalar evaluator is subtly non-standard and declining matters:
+//
+//   * `AND` is NOT Kleene. It yields NULL on the first null operand without looking for a later
+//     FALSE, whereas `and_kleene(NULL, FALSE)` is FALSE. The `EXISTS` roll-up hides the difference
+//     (both are "not true"), but a `NOT` above it does not — `NOT (a AND b)` is a real shape (F2).
+//     So AND is built from raw bitwise buffer ops that reproduce the short-circuit exactly, not from
+//     `and_kleene`.
+//   * numeric `=` / `!=` compare through `f64` with an `EPSILON` tolerance. That is identical to
+//     Arrow's exact `eq` for integers (every i64 up to 2^53 is exactly representable) but not for
+//     genuine floats, so float `=`/`!=` declines to the scalar path.
+
+use datafusion::arrow::array::{BooleanArray, Scalar};
+use datafusion::arrow::buffer::{BooleanBuffer, NullBuffer};
+use datafusion::arrow::compute::kernels::{boolean, cmp};
+
+/// Is this a type whose values are exactly representable in `f64`, so Arrow's exact `eq` agrees with
+/// the scalar path's `EPSILON` comparison?
+fn is_exact_in_f64(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+    )
+}
+
+fn is_numeric_col(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
+fn is_string_col(t: &DataType) -> bool {
+    matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+}
+
+/// `a AND b` with the scalar evaluator's short-circuit: NULL wins over a later FALSE.
+///
+/// Pure bitwise algebra on the value/validity buffers, so it stays vectorised:
+///   values(r)   = (valid(a) & value(a)) & value(b)
+///   validity(r) = valid(a) & (!value(a) | valid(b))
+/// i.e. when `a` is null the result is null; when `a` is false the result is a valid false; and only
+/// when `a` is true does `b` decide.
+fn and_shortcircuit(a: &BooleanArray, b: &BooleanArray) -> BooleanArray {
+    let av = a.values();
+    let bv = b.values();
+    let a_valid = a.nulls().map(|n| n.inner().clone()).unwrap_or_else(|| BooleanBuffer::new_set(a.len()));
+    let b_valid = b.nulls().map(|n| n.inner().clone()).unwrap_or_else(|| BooleanBuffer::new_set(b.len()));
+
+    let a_true = &a_valid & av;
+    let values = &a_true & bv;
+    let validity = &a_valid & &(&!av | &b_valid);
+    BooleanArray::new(values, Some(NullBuffer::new(validity)))
+}
+
+/// Per-element mask for one compiled node over the whole child array, or `None` when this path
+/// cannot reproduce the scalar semantics exactly.
+fn try_vectorize(
+    node: &CNode<'_>,
+    struct_array: &datafusion::arrow::array::StructArray,
+    lucene: Option<&LuceneClauseBits>,
+    len: usize,
+) -> Option<BooleanArray> {
+    match node {
+        CNode::And(kids) => {
+            let mut acc = try_vectorize(kids.first()?, struct_array, lucene, len)?;
+            for k in &kids[1..] {
+                acc = and_shortcircuit(&acc, &try_vectorize(k, struct_array, lucene, len)?);
+            }
+            Some(acc)
+        }
+        // OR *is* Kleene here (TRUE wins, else NULL if any operand was null, else FALSE).
+        CNode::Or(kids) => {
+            let mut acc = try_vectorize(kids.first()?, struct_array, lucene, len)?;
+            for k in &kids[1..] {
+                acc = boolean::or_kleene(&acc, &try_vectorize(k, struct_array, lucene, len)?).ok()?;
+            }
+            Some(acc)
+        }
+        // `not` preserves nulls, matching `Option::map(|b| !b)`.
+        CNode::Not(inner) => boolean::not(&try_vectorize(inner, struct_array, lucene, len)?).ok(),
+
+        // Two-valued by design: presence is never itself unknown. `read_field` returns Val::Null
+        // exactly when the slot is null, so this is precisely `is_not_null` on the column.
+        CNode::Exists(CVal::Field(col), negated) => {
+            let c = struct_array.column(*col);
+            let m = if *negated { boolean::is_null(c).ok()? } else { boolean::is_not_null(c).ok()? };
+            Some(m)
+        }
+
+        CNode::Cmp(op, CVal::Field(col), CVal::Lit(lit)) => cmp_field_lit(struct_array.column(*col), *op, lit),
+        // Literal on the left: flip the operator rather than the operands.
+        CNode::Cmp(op, CVal::Lit(lit), CVal::Field(col)) => {
+            let flipped = match op {
+                CmpOp::Gt => CmpOp::Lt,
+                CmpOp::Ge => CmpOp::Le,
+                CmpOp::Lt => CmpOp::Gt,
+                CmpOp::Le => CmpOp::Ge,
+                CmpOp::Eq => CmpOp::Eq,
+                CmpOp::Ne => CmpOp::Ne,
+            };
+            cmp_field_lit(struct_array.column(*col), flipped, lit)
+        }
+
+        // A Lucene-delegated leaf is a straight bit lookup per element — cheap, and no tree walk.
+        CNode::Lucene { idx, fallback } => match lucene {
+            Some(l) if l.has_clause(*idx) => Some(BooleanArray::from_iter((0..len).map(|i| Some(l.value(*idx, i))))),
+            _ => try_vectorize(fallback, struct_array, lucene, len),
+        },
+
+        // Inner LIST<STRUCT> level: vectorise the inner condition over the inner values array, then
+        // roll it up to THIS level's elements. Two-valued (empty or null inner list => false),
+        // matching the scalar path.
+        CNode::Nested { col, inner } => {
+            let inner_col = struct_array.column(*col);
+            let list = inner_col.as_list_opt::<i32>()?;
+            let inner_struct = list.values().as_struct();
+            let inner_mask = try_vectorize(inner, inner_struct, lucene, list.values().len())?;
+            let offsets = list.value_offsets();
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                if inner_col.is_null(i) {
+                    out.push(Some(false));
+                    continue;
+                }
+                let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+                out.push(Some((s..e).any(|j| inner_mask.is_valid(j) && inner_mask.value(j))));
+            }
+            Some(BooleanArray::from(out))
+        }
+
+        // Arithmetic operands, field-vs-field, and EXISTS over a computed value all decline.
+        _ => None,
+    }
+}
+
+/// `column <op> literal` as a vectorised comparison, or `None` when the pair is not one this path
+/// can reproduce exactly (mismatched families, float equality, bool/other literals).
+fn cmp_field_lit(col: &ArrayRef, op: CmpOp, lit: &Val<'_>) -> Option<BooleanArray> {
+    let dt = col.data_type();
+    let rhs: ArrayRef = match lit {
+        // Comparing against NULL is unknown for every element.
+        Val::Null => {
+            return Some(BooleanArray::new(
+                BooleanBuffer::new_unset(col.len()),
+                Some(NullBuffer::new(BooleanBuffer::new_unset(col.len()))),
+            ))
+        }
+        Val::Num(n) if is_numeric_col(dt) => {
+            if matches!(op, CmpOp::Eq | CmpOp::Ne) && !is_exact_in_f64(dt) {
+                return None; // EPSILON tolerance is not Arrow's exact eq for wide ints / floats
+            }
+            // Compare in f64, exactly as the scalar path does.
+            let casted = datafusion::arrow::compute::kernels::cast::cast(col, &DataType::Float64).ok()?;
+            return apply_cmp(&casted, op, &(Arc::new(datafusion::arrow::array::Float64Array::from(vec![*n])) as ArrayRef));
+        }
+        Val::Str(s) if is_string_col(dt) => Arc::new(datafusion::arrow::array::StringArray::from(vec![*s])) as ArrayRef,
+        // Str-vs-numeric and friends yield None per element in the scalar path; decline rather than
+        // hand Arrow a type error.
+        _ => return None,
+    };
+    let lhs: ArrayRef = if matches!(dt, DataType::Utf8) {
+        Arc::clone(col)
+    } else {
+        datafusion::arrow::compute::kernels::cast::cast(col, &DataType::Utf8).ok()?
+    };
+    apply_cmp(&lhs, op, &rhs)
+}
+
+fn apply_cmp(lhs: &ArrayRef, op: CmpOp, rhs: &ArrayRef) -> Option<BooleanArray> {
+    let r = Scalar::new(rhs);
+    match op {
+        CmpOp::Gt => cmp::gt(lhs, &r),
+        CmpOp::Ge => cmp::gt_eq(lhs, &r),
+        CmpOp::Lt => cmp::lt(lhs, &r),
+        CmpOp::Le => cmp::lt_eq(lhs, &r),
+        CmpOp::Eq => cmp::eq(lhs, &r),
+        CmpOp::Ne => cmp::neq(lhs, &r),
+    }
+    .ok()
 }
 
 #[cfg(test)]
@@ -989,5 +1335,88 @@ mod tests {
         let bad = json!({"nested": "nope", "inner": eq_v(2)});
         let err = evaluate_nested_any_match(&arr, &bad, None).unwrap_err();
         assert!(err.to_string().contains("not found"), "unexpected error: {err}");
+    }
+    /// Differential test: the vectorised path must agree with the per-element scalar path EXACTLY,
+    /// element for element, including three-valued results. This is the guard that lets
+    /// `try_vectorize` be trusted — if it ever diverges rather than declining, this fails.
+    ///
+    /// Exact comparison (not just "both not-true") is deliberate: it is what catches the non-Kleene
+    /// AND short-circuit, where `NULL AND FALSE` must be NULL and not FALSE, because a `NOT` above it
+    /// turns that distinction into a different answer.
+    #[test]
+    fn vectorized_agrees_with_scalar_element_for_element() {
+        let arrays: Vec<ArrayRef> = vec![
+            corpus(),
+            comments_array(&[vec![], vec![("alice", 70)]]),
+            comments_array_nullable_score(&[vec![("alice", None), ("bob", Some(90))], vec![("alice", None)]]),
+            comments_array_nullable_score(&[vec![("alice", Some(5)), ("bob", None)], vec![("alice", Some(70))]]),
+        ];
+        let trees = vec![
+            json!({"op": "=", "args": [{"field": "author"}, {"lit": "alice"}]}),
+            json!({"op": "!=", "args": [{"field": "author"}, {"lit": "alice"}]}),
+            json!({"op": ">", "args": [{"field": "score"}, {"lit": 50}]}),
+            json!({"op": "<=", "args": [{"field": "score"}, {"lit": 50}]}),
+            json!({"op": "AND", "args": [
+                {"op": "=", "args": [{"field": "author"}, {"lit": "alice"}]},
+                {"op": ">", "args": [{"field": "score"}, {"lit": 50}]}]}),
+            json!({"op": "OR", "args": [
+                {"op": "=", "args": [{"field": "author"}, {"lit": "zzz"}]},
+                {"op": ">", "args": [{"field": "score"}, {"lit": 50}]}]}),
+            // NOT over AND — the shape where the non-Kleene short-circuit becomes observable.
+            json!({"op": "NOT", "args": [{"op": "AND", "args": [
+                {"op": "=", "args": [{"field": "author"}, {"lit": "alice"}]},
+                {"op": ">", "args": [{"field": "score"}, {"lit": 50}]}]}]}),
+            json!({"op": "NOT", "args": [{"op": "OR", "args": [
+                {"op": "=", "args": [{"field": "author"}, {"lit": "alice"}]},
+                {"op": ">", "args": [{"field": "score"}, {"lit": 50}]}]}]}),
+            json!({"op": "EXISTS", "args": [{"field": "score"}]}),
+            json!({"op": "NOT_EXISTS", "args": [{"field": "score"}]}),
+            // Arithmetic must DECLINE (return None), not silently differ.
+            json!({"op": "=", "args": [{"op": "%", "args": [{"field": "score"}, {"lit": 2}]}, {"lit": 0}]}),
+        ];
+        let mut vectorized_count = 0;
+        for (ai, array) in arrays.iter().enumerate() {
+            let list = array.as_list_opt::<i32>().unwrap();
+            let fields = match list.data_type() {
+                DataType::List(f) => match f.data_type() {
+                    DataType::Struct(fs) => fs.clone(),
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+            let struct_array = list.values().as_struct();
+            for (ti, tree) in trees.iter().enumerate() {
+                let compiled = compile_node(tree, &fields).unwrap();
+                let Some(mask) = try_vectorize(&compiled, struct_array, None, struct_array.len()) else {
+                    continue; // declined — the scalar path handles it, nothing to compare
+                };
+                vectorized_count += 1;
+                for i in 0..struct_array.len() {
+                    let scalar = eval_compiled(&compiled, struct_array, i, None).unwrap();
+                    let vect = if mask.is_valid(i) { Some(mask.value(i)) } else { None };
+                    assert_eq!(scalar, vect, "array {ai} tree {ti} element {i}: scalar {scalar:?} != vectorized {vect:?}");
+                }
+                // and the roll-up must match too
+                let a = evaluate_nested_any_match(array, tree, None).unwrap();
+                let mut b = BooleanBuilder::with_capacity(list.len());
+                for r in 0..list.len() {
+                    if list.is_null(r) {
+                        b.append_null();
+                        continue;
+                    }
+                    let (s, e) = (list.value_offsets()[r] as usize, list.value_offsets()[r + 1] as usize);
+                    let mut any = false;
+                    for i in s..e {
+                        if let Some(true) = eval_compiled(&compiled, struct_array, i, None).unwrap() {
+                            any = true;
+                            break;
+                        }
+                    }
+                    b.append_value(any);
+                }
+                assert_eq!(a, b.finish(), "array {ai} tree {ti}: roll-up differs");
+            }
+        }
+        assert!(vectorized_count >= 20, "expected the fast path to cover most trees, covered {vectorized_count}");
     }
 }
