@@ -14,7 +14,6 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
-import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -525,18 +524,31 @@ public class FragmentConversionDriver {
             }
             delegatedExpressions.add(new DelegatedExpression(relaxation.annotationId(), relaxation.backend(), bytes));
             LOGGER.debug(
-                "[prune-only] one prune query to [{}] id={} ({} bytes): {}",
+                "[prune-only] one prune query to [{}] id={} ({} bytes, lossless={}): {}",
                 relaxation.backend(),
                 relaxation.annotationId(),
                 bytes.length,
+                relaxation.lossless(),
                 relaxation.relaxed()
             );
-            // composeConjunction, not makeCall(AND, ..): the original condition is frequently itself
-            // an AND, and Calcite asserts RexUtil.isFlat on filter conditions.
-            return RexUtil.composeConjunction(
-                rexBuilder,
-                List.of(DelegationPossibleFunction.makeCall(rexBuilder, relaxation.relaxed(), relaxation.annotationId()), original)
-            );
+            // The peer keeps only a PRUNING role — the query shipped to it above (`bytes`) is built from
+            // the RELAXATION, and that is the peer's whole contribution. The driving backend must still
+            // decide every row itself, and it must decide it on the ORIGINAL condition: exactly phi,
+            // nothing weaker and nothing extra.
+            //
+            // So the hint carries `original`, not `relaxation.relaxed()`. A DelegationPossible node's
+            // argument is what the driving backend uses for all three of its native jobs — the row-level
+            // residual (residual_bool_to_physical_expr), the page-stat PruningPredicate cache
+            // (collect_predicate_exprs), and the fallback predicate if the peer is demoted
+            // (demote_delegation_possible) — see bool_tree.rs. Feeding it `original` makes all three
+            // exactly right, and needs no second conjunct.
+            //
+            // Passing the relaxation instead was the old shape, and it cost double work: the residual
+            // became `R(phi) AND phi`. Since phi implies R(phi) that is merely phi, but every conjunct
+            // R(phi) retained was then evaluated twice per batch — the whole predicate when the
+            // relaxation was lossless, and its servable part otherwise. It also handed page pruning the
+            // WEAKER expression, losing prune power for free.
+            return DelegationPossibleFunction.makeCall(rexBuilder, original, relaxation.annotationId());
         }
 
         /** Replaces every {@link AnnotatedPredicate} with its underlying predicate, delegating nothing. */

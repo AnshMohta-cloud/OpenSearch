@@ -60,8 +60,11 @@ final class PruneOnlyRelaxer {
      * @param backend      peer backend the relaxation targets; {@code null} when {@code relaxed} is null
      * @param annotationId annotation id to key the shipped query on — the id of the first leaf that
      *                     survived into the relaxation, so no new id space is needed
+     * @param lossless     {@code true} when nothing was substituted away, i.e. {@code R(phi) == phi}
+     *                     rather than a strict superset. The caller uses this to avoid re-appending
+     *                     the original condition to a relaxation that already <em>is</em> it.
      */
-    record Result(RexNode relaxed, String backend, int annotationId) {
+    record Result(RexNode relaxed, String backend, int annotationId, boolean lossless) {
         boolean prunable() {
             return relaxed != null;
         }
@@ -74,6 +77,12 @@ final class PruneOnlyRelaxer {
     /** First peer-servable leaf encountered, used to key the shipped query. */
     private Integer firstAnnotationId;
     private String peerBackend;
+    /**
+     * Set whenever any node is substituted by {@code TRUE}. Conservative: it flips on every
+     * relaxed-away node, so {@code lossless} is only reported when the relaxation is the whole
+     * original condition. A false negative here merely keeps a redundant conjunct.
+     */
+    private boolean substituted;
 
     PruneOnlyRelaxer(String operatorBackend, CapabilityRegistry registry, RexBuilder rexBuilder) {
         this.operatorBackend = operatorBackend;
@@ -84,9 +93,9 @@ final class PruneOnlyRelaxer {
     Result relax(RexNode condition) {
         RexNode relaxed = relaxNode(condition);
         if (relaxed == null) {
-            return new Result(null, null, -1);
+            return new Result(null, null, -1, false);
         }
-        return new Result(relaxed, peerBackend, firstAnnotationId);
+        return new Result(relaxed, peerBackend, firstAnnotationId, substituted == false);
     }
 
     /** Returns the relaxation of {@code node}, or {@code null} meaning {@code TRUE}. */
@@ -94,6 +103,7 @@ final class PruneOnlyRelaxer {
         if (node instanceof AnnotatedPredicate ap) {
             String peer = servingPeer(ap);
             if (peer == null) {
+                substituted = true;
                 return null; // peer cannot serve this leaf -> TRUE
             }
             if (firstAnnotationId == null) {
@@ -127,6 +137,7 @@ final class PruneOnlyRelaxer {
                     for (RexNode operand : call.getOperands()) {
                         RexNode child = relaxNode(operand);
                         if (child == null) {
+                            substituted = true;
                             return null;
                         }
                         kept.add(child);
@@ -139,10 +150,12 @@ final class PruneOnlyRelaxer {
                     // every row.
                     RexNode operand = call.getOperands().getFirst();
                     if (!fullyServable(operand)) {
+                        substituted = true;
                         return null;
                     }
                     RexNode child = relaxNode(operand);
                     if (child == null) {
+                        substituted = true;
                         return null;
                     }
                     return rexBuilder.makeCall(SqlStdOperatorTable.NOT, child);
@@ -150,9 +163,11 @@ final class PruneOnlyRelaxer {
                 default:
                     // Any other call shape (comparison over expressions, unrecognised function)
                     // is not a boolean combinator the peer can decompose.
+                    substituted = true;
                     return null;
             }
         }
+        substituted = true;
         return null;
     }
 
