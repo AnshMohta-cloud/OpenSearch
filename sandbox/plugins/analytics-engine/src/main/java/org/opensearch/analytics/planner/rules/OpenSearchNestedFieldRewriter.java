@@ -36,6 +36,7 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.planner.rel.LogicalNestedScope;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -747,10 +748,10 @@ public final class OpenSearchNestedFieldRewriter {
 
         RexCall itemCall;
         RexLiteral valueLit;
-        if (isItemOnArray(left, arrayCol) && right instanceof RexLiteral lit) {
+        if (isItemChainOnArray(left, arrayCol) && right instanceof RexLiteral lit) {
             itemCall = (RexCall) left;
             valueLit = lit;
-        } else if (isItemOnArray(right, arrayCol) && left instanceof RexLiteral lit) {
+        } else if (isItemChainOnArray(right, arrayCol) && left instanceof RexLiteral lit) {
             itemCall = (RexCall) right;
             valueLit = lit;
         } else {
@@ -759,20 +760,28 @@ public final class OpenSearchNestedFieldRewriter {
         if (valueLit.getTypeName() != SqlTypeName.CHAR && valueLit.getTypeName() != SqlTypeName.VARCHAR) {
             return null; // not a string comparison — leave for the generic path
         }
-        RexNode fieldNameNode = itemCall.getOperands().get(1);
-        if (!(fieldNameNode instanceof RexLiteral fieldLit) || fieldLit.getTypeName() != SqlTypeName.CHAR) {
+        // Hop names from the array down to the leaf, e.g. events.tags.name -> ["tags", "name"].
+        List<String> path = itemChainPath(itemCall, arrayCol);
+        if (path == null) {
             return null;
         }
-        String fieldName = fieldLit.getValueAs(String.class);
         String value = valueLit.getValueAs(String.class);
 
-        Map<String, Object> equalityLeafTree = Map.of(
+        // Innermost comparison, then one {"nested": hop, "inner": ...} wrapper per intermediate hop.
+        // A single-hop path (events.name) yields the bare equality exactly as before; a deeper path
+        // (events.tags.name) yields {"nested":"tags","inner":{...}} — the shape
+        // NestedAnyMatchExprSerializer already serves by extending the dotted term path, and which it
+        // reports lossless for when queried on its own.
+        Map<String, Object> tree = Map.of(
             "op",
             "=",
             "args",
-            List.of(Map.of("field", fieldName), Map.of("lit", value))
+            List.of(Map.of("field", path.get(path.size() - 1)), Map.of("lit", value))
         );
-        return buildAnyMatchExprCall(equalityLeafTree, arrayCol, inputRowType, rexBuilder);
+        for (int i = path.size() - 2; i >= 0; i--) {
+            tree = Map.of("nested", path.get(i), "inner", tree);
+        }
+        return buildAnyMatchExprCall(tree, arrayCol, inputRowType, rexBuilder);
     }
 
     /** True if {@code node} is {@code ITEM($arrayCol, 'field')} — a direct nested-leaf reference on our array. */
@@ -781,6 +790,49 @@ public final class OpenSearchNestedFieldRewriter {
             return false;
         }
         return call.getOperands().get(0) instanceof RexInputRef ref && ref.getIndex() == arrayCol;
+    }
+
+    /**
+     * Like {@link #isItemOnArray} but accepts a CHAIN of {@code ITEM} hops rooted at {@code arrayCol},
+     * so a leaf below an inner nested array qualifies too: {@code ITEM(ITEM($events,'tags'),'name')} as
+     * well as {@code ITEM($events,'name')}.
+     *
+     * <p>Only the single-hop form used to be accepted, which silently cost pruning: in
+     * {@code events.name='x' AND events.tags.name='y'} the deeper conjunct produced no pruning peer, so
+     * {@code PruneOnlyRelaxer} relaxed it to TRUE and Lucene pruned on one leaf instead of two — even
+     * though that leaf is served exactly when queried alone. Depth changes nothing about the algebra:
+     * {@code ∃(A ∧ B) ⊆ (∃A) ∧ (∃B)} holds at any nesting level because each individual existential is
+     * implied by the correlated one, so ANDing the extra peer only ever narrows the candidate set.
+     */
+    private static boolean isItemChainOnArray(RexNode node, int arrayCol) {
+        return itemChainPath(node, arrayCol) != null;
+    }
+
+    /**
+     * Field names along an {@code ITEM} chain rooted at {@code arrayCol}, outermost hop last:
+     * {@code ITEM(ITEM($events,'tags'),'name')} → {@code ["tags", "name"]}. Returns {@code null} when
+     * {@code node} is not such a chain, or when any hop name is not a CHAR literal.
+     */
+    private static List<String> itemChainPath(RexNode node, int arrayCol) {
+        List<String> reversed = new ArrayList<>(2);
+        RexNode cur = node;
+        while (cur instanceof RexCall call && "ITEM".equals(call.getOperator().getName()) && call.getOperands().size() == 2) {
+            RexNode nameNode = call.getOperands().get(1);
+            if (!(nameNode instanceof RexLiteral nameLit) || nameLit.getTypeName() != SqlTypeName.CHAR) {
+                return null;
+            }
+            reversed.add(nameLit.getValueAs(String.class));
+            RexNode base = call.getOperands().get(0);
+            if (base instanceof RexInputRef ref) {
+                if (ref.getIndex() != arrayCol) {
+                    return null; // chain rooted at a different column
+                }
+                Collections.reverse(reversed);
+                return reversed;
+            }
+            cur = base;
+        }
+        return null;
     }
 
     /**
