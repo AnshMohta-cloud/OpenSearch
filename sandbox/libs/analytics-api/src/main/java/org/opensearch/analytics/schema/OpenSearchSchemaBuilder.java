@@ -32,6 +32,8 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Builds a Calcite {@link SchemaPlus} from OpenSearch {@link ClusterState} index mappings.
@@ -40,6 +42,12 @@ import java.util.Map;
  * Navigates: IndexMetadata -> MappingMetadata -> sourceAsMap() -> "properties" -> per-field "type".
  */
 public class OpenSearchSchemaBuilder {
+
+    private static final Logger LOGGER = Logger.getLogger(OpenSearchSchemaBuilder.class.getName());
+
+    private static final String SCALING_FACTOR_FIELD = "scaling_factor";
+
+    private static final double NO_SCALING_FACTOR = Double.NaN;
 
     private OpenSearchSchemaBuilder() {}
 
@@ -247,6 +255,15 @@ public class OpenSearchSchemaBuilder {
 
     /** Format-aware overload: classifies {@code date}/{@code date_nanos} into DateOnly / TimeOnly UDT markers. */
     public static RelDataType buildLeafType(String opensearchType, String format, RelDataTypeFactory typeFactory) {
+        return buildLeafType(opensearchType, format, NO_SCALING_FACTOR, typeFactory);
+    }
+
+    /**
+     * Full overload: handles format-aware date classification and scaled_float factor injection.
+     *
+     * @param scalingFactor positive factor for scaled_float fields; NaN when not applicable
+     */
+    public static RelDataType buildLeafType(String opensearchType, String format, double scalingFactor, RelDataTypeFactory typeFactory) {
         if (opensearchType == null) {
             return null;
         }
@@ -266,6 +283,21 @@ public class OpenSearchSchemaBuilder {
         if ("flat_object".equals(opensearchType)) {
             RelDataType varchar = typeFactory.createTypeWithNullability(typeFactory.createSqlType(SqlTypeName.VARCHAR), true);
             return typeFactory.createTypeWithNullability(typeFactory.createMapType(varchar, varchar), true);
+        }
+        if (UnsignedLongType.NAME.equals(opensearchType)) {
+            // mapFieldType still returns BIGINT for unsigned_long; the UnsignedLongType marker
+            // enables translator guards (negative-bound clamping, overflow rejection for values
+            // above Long.MAX_VALUE) without affecting planner coercion.
+            return UnsignedLongType.nullable(typeFactory);
+        }
+        if ("scaled_float".equals(opensearchType)) {
+            if (Double.isNaN(scalingFactor) || scalingFactor <= 0) {
+                // Missing, zero, or negative factor — exclude field from schema (matches how
+                // unrecognized types are dropped). Legacy requires scaling_factor > 0 at index
+                // creation; this guards only corrupted/hand-edited mappings.
+                return null;
+            }
+            return ScaledFloatType.nullable(typeFactory, scalingFactor);
         }
         if ("date".equals(opensearchType) || "date_nanos".equals(opensearchType)) {
             int precision = "date_nanos".equals(opensearchType) ? 9 : 3;
@@ -359,7 +391,8 @@ public class OpenSearchSchemaBuilder {
                 continue;
             }
             String format = (String) fieldProps.get("format");
-            RelDataType columnType = buildLeafType(fieldType, format, typeFactory);
+            double scalingFactor = parseScalingFactor(fieldProps.get(SCALING_FACTOR_FIELD));
+            RelDataType columnType = buildLeafType(fieldType, format, scalingFactor, typeFactory);
             if (columnType == null) {
                 // Unsupported (geo_point/shape/completion/…) or unknown plugin type. Drop the
                 // column; a query referencing it surfaces a Calcite "column not found" via the
@@ -373,8 +406,28 @@ public class OpenSearchSchemaBuilder {
     }
 
     /**
-     * POC nested (N1): builds a Calcite ROW type for the struct inside a nested LIST&lt;STRUCT&gt;
-     * column. Recursively handles nested-in-nested (becomes ARRAY&lt;ROW&gt; inside the struct).
+     * Normalizes a scaling_factor value (Number or String from mapping JSON) to a double.
+     * Returns {@link Double#NaN} when the value is null or unparseable, signaling the caller
+     * to exclude the field.
+     */
+    static double parseScalingFactor(Object raw) {
+        if (raw == null) {
+            return NO_SCALING_FACTOR;
+        }
+        try {
+            if (raw instanceof Number) {
+                return ((Number) raw).doubleValue();
+            }
+            return Double.parseDouble(raw.toString());
+        } catch (NumberFormatException e) {
+            LOGGER.log(Level.WARNING, "Invalid scaling_factor value: " + raw, e);
+            return NO_SCALING_FACTOR;
+        }
+    }
+
+    /**
+     * Builds a Calcite ROW type for the struct inside a nested LIST&lt;STRUCT&gt; column.
+     * Recursively handles nested-in-nested (becomes ARRAY&lt;ROW&gt; inside the struct).
      */
     @SuppressWarnings("unchecked")
     private static RelDataType buildNestedStructType(RelDataTypeFactory typeFactory, Map<String, Object> properties) {
