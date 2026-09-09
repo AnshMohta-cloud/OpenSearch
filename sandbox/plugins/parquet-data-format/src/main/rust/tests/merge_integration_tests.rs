@@ -2276,3 +2276,57 @@ fn test_merge_row_cap_still_applies_when_bytes_are_generous() {
         assert!(*rows <= 12_000, "row group of {} rows exceeds the 10_000 cap + one batch", rows);
     }
 }
+
+#[test]
+fn test_merge_byte_cap_survives_oversized_input_row_groups() {
+    // Regression for the case the first version of the byte cap missed. Checking the cap only after
+    // writing a whole batch let a row group inherit the cursor's batch size, so merging inputs that
+    // ALREADY had oversized row groups reproduced them: measured ~337 MB groups out of a merge whose
+    // inputs had ~337 MB groups, while the same code produced ~135 MB when merging small flush files.
+    // Here the input is written as ONE huge row group, so a post-batch-only check would emit one
+    // huge output row group; splitting inside the batch must bound it regardless of input layout.
+    let index = "test_merge_bytecap_oversized_input";
+    SETTINGS_STORE.insert(
+        index.to_string(),
+        NativeSettings {
+            row_group_max_rows: Some(100_000_000),   // row cap cannot be the splitter
+            row_group_max_bytes: Some(256 * 1024),
+            merge_batch_size: Some(1_000_000),       // one batch covers everything
+            ..Default::default()
+        },
+    );
+
+    let tmp = tempdir().unwrap();
+    let a = tmp.path().join("wide.parquet").to_string_lossy().to_string();
+    // single row group, ~12 MB of text -> ~48x the 256 KB cap
+    let batch = wide_string_batch(60_000, 200);
+    {
+        let file = File::create(&a).unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_size(usize::MAX)
+            .build();
+        let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+    let rgs_in = inspect_row_group_bytes(&a);
+    assert_eq!(rgs_in.len(), 1, "input must be a single row group, got {:?}", rgs_in);
+
+    let out = tmp.path().join("out.parquet").to_string_lossy().to_string();
+    merge_unsorted(&[a], &out, index, 0).unwrap();
+
+    let rgs = inspect_row_group_bytes(&out);
+    assert_eq!(rgs.iter().map(|(r, _)| r).sum::<i64>(), 60_000, "all rows survive");
+    assert!(
+        rgs.len() > 1,
+        "byte cap must split even when the input is one huge row group; got {:?}",
+        rgs
+    );
+    let biggest = rgs.iter().map(|(_, b)| *b).max().unwrap();
+    assert!(
+        biggest < 2 * 1024 * 1024,
+        "row groups must be bounded by the byte cap, not by the input's layout; biggest={} bytes, rgs={:?}",
+        biggest,
+        rgs
+    );
+}

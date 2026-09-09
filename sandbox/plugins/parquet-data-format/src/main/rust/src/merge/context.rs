@@ -160,7 +160,59 @@ impl MergeContext {
     /// when the row count threshold is reached. Each batch is written and dropped
     /// immediately — no buffering — so only one batch's decoded data (~64 MB) is
     /// ever live at a time.
+    /// Estimated encoded size of the row group currently being built. Same quantity `ArrowWriter`
+    /// compares against `max_row_group_bytes`, so merge and flush agree on what "128 MB" means.
+    fn estimated_row_group_bytes(&self) -> usize {
+        self.col_writers
+            .as_ref()
+            .map(|ws| ws.iter().map(|w| w.get_estimated_total_bytes()).sum())
+            .unwrap_or(0)
+    }
+
+    /// Writes a batch, splitting it so a row group cannot overshoot `output_flush_bytes` by more
+    /// than one chunk's residual.
+    ///
+    /// Checking the cap only AFTER writing a whole batch is not enough: a row group then inherits
+    /// whatever size the cursor's batch happened to be. Merging inputs that already have large row
+    /// groups yields correspondingly large batches, so oversize row groups perpetuate across merge
+    /// generations. Measured before this split: merging a generation whose groups were ~337 MB
+    /// produced ~337 MB groups again, while merging small flush files (whose groups ArrowWriter had
+    /// already bounded to 128 MB) produced ~135 MB. Splitting inside the batch removes that
+    /// dependence on the input's layout.
     pub fn push_batch(&mut self, batch: RecordBatch) -> MergeResult<()> {
+        let total = batch.num_rows();
+        if total == 0 {
+            return Ok(());
+        }
+
+        // Bytes per row measured from this batch's in-memory footprint. Encoded output is smaller
+        // than the Arrow representation, so this over-estimates and splits slightly early — the safe
+        // direction. Computed once from the FULL batch: get_array_memory_size() on a slice reports
+        // the whole underlying buffer, so per-slice recomputation would be wrong.
+        let per_row = (batch.get_array_memory_size() / total).max(1);
+
+        let mut offset = 0usize;
+        while offset < total {
+            let used = self.estimated_row_group_bytes();
+            let budget = self.output_flush_bytes.saturating_sub(used);
+            // Always take at least one row so a row wider than the whole budget still progresses
+            // (it produces one oversized row group, which is unavoidable and correct).
+            let take = (budget / per_row).max(1).min(total - offset);
+            self.write_chunk(batch.slice(offset, take))?;
+            offset += take;
+
+            if self.output_row_count >= self.output_flush_rows
+                || self.estimated_row_group_bytes() >= self.output_flush_bytes
+            {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes one chunk straight to the column writers. No flushing decision here — the caller owns
+    /// that. Each chunk is written and dropped immediately, so only one chunk's decoded data is live.
+    fn write_chunk(&mut self, batch: RecordBatch) -> MergeResult<()> {
         let num_rows = batch.num_rows();
         let with_id = append_row_id(&batch, self.next_row_id, &self.output_schema)?;
         let with_id_bytes = with_id.get_array_memory_size();
@@ -214,20 +266,6 @@ impl MergeContext {
         self.next_row_id += num_rows as i64;
         self.output_row_count += num_rows;
         self.total_rows_written += num_rows;
-
-        // Flush on EITHER cap, matching the flush path. The byte estimate is taken from the
-        // column writers rather than from row counts because row width varies enormously with
-        // nested fan-out: at 1000 events/doc a row is ~4.9 KB, so the 1,000,000-row default
-        // corresponds to ~4.9 GB -- three orders of magnitude past the 128 MB byte default.
-        let estimated_bytes: usize = self
-            .col_writers
-            .as_ref()
-            .map(|ws| ws.iter().map(|w| w.get_estimated_total_bytes()).sum())
-            .unwrap_or(0);
-        if self.output_row_count >= self.output_flush_rows || estimated_bytes >= self.output_flush_bytes
-        {
-            self.flush()?;
-        }
         Ok(())
     }
 
