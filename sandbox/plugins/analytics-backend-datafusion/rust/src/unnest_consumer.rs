@@ -25,7 +25,7 @@ use std::sync::Arc;
 use datafusion::common::{Column, DFSchema, DataFusionError, UnnestOptions};
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::{col, Expr, LogicalPlan, LogicalPlanBuilder};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
     from_substrait_plan_with_consumer, DefaultSubstraitConsumer, SubstraitConsumer,
