@@ -265,6 +265,11 @@ public class VSRManager implements AutoCloseable {
                 parquetField.createField(fieldType, activeVSR, pair.getValue());
                 writtenFields++;
             }
+            // Nested (N1): the document's buffered nested children and top-level flat_object maps
+            // are written as whole LIST<STRUCT> / MAP cells for this row, not as leading source
+            // fields, so they sit outside the writtenFields bookkeeping above.
+            writeNestedChildren(doc, activeVSR, rowIndex);
+            writeTopLevelMaps(doc, activeVSR, rowIndex);
             BigIntVector rowIdVector = (BigIntVector) activeVSR.getVector(DocumentInput.ROW_ID_FIELD);
             if (rowIdVector != null) {
                 rowIdVector.setSafe(rowIndex, doc.getRowId());
@@ -337,13 +342,6 @@ public class VSRManager implements AutoCloseable {
                 ),
                 scrubFailure
             );
-        }
-        int rowIndex = activeVSR.getRowCount();
-        writeNestedChildren(doc, activeVSR, rowIndex);
-        writeTopLevelMaps(doc, activeVSR, rowIndex);
-        BigIntVector rowIdVector = (BigIntVector) activeVSR.getVector(DocumentInput.ROW_ID_FIELD);
-        if (rowIdVector != null) {
-            rowIdVector.setSafe(rowIndex, doc.getRowId());
         }
     }
 

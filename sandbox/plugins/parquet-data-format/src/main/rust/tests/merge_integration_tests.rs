@@ -2162,3 +2162,117 @@ fn test_deferred_three_files_different_schemas() {
     }
     assert_eq!(extra_vals, vec!["NULL", "x2", "x3", "NULL", "x5", "x6"]);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// row_group_max_bytes on the MERGE path
+//
+// The flush path drives parquet's ArrowWriter, which enforces both max_row_group_row_count and
+// max_row_group_bytes. The merge path drives SerializedFileWriter and the Arrow column writers
+// directly, so ArrowWriter's byte enforcement never runs and MergeContext has to apply the cap
+// itself. Before that fix only the row cap bound, so a merge coalesced many correctly-sized flush
+// row groups into one limited only by row count -- which is fine for narrow rows and catastrophic
+// for wide ones: at 1000 nested events per document a row is ~4.9 KB, so the 1,000,000-row default
+// produced a single ~3.5 GB row group. That destroys row-group pruning, intra-file parallelism
+// (a row group is an indivisible unit of scan work) and IO/decode pipelining.
+//
+// These tests set the ROW cap impossibly high so that only the BYTE cap can split, which is what
+// makes them regression tests rather than restatements of the row-count behaviour.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Total compressed bytes per row group, plus each row group's row count.
+fn inspect_row_group_bytes(path: &str) -> Vec<(i64, i64)> {
+    let file = File::open(path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    reader
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| (rg.num_rows(), rg.total_byte_size()))
+        .collect()
+}
+
+/// A batch of `rows` wide-ish string rows, so byte accumulation dominates row count.
+fn wide_string_batch(rows: usize, width: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+    let vals: Vec<String> = (0..rows).map(|i| format!("{:0width$}", i, width = width)).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vals.iter().map(|s| s.as_str()).collect::<Vec<_>>()))],
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_merge_honours_row_group_max_bytes() {
+    let index = "test_merge_rg_max_bytes";
+    // Row cap far beyond the data, so ONLY the byte cap can cause a split.
+    // Small batch size so the cap is checked often (it is evaluated after each batch).
+    SETTINGS_STORE.insert(
+        index.to_string(),
+        NativeSettings {
+            row_group_max_rows: Some(100_000_000),
+            row_group_max_bytes: Some(256 * 1024),
+            merge_batch_size: Some(2_000),
+            ..Default::default()
+        },
+    );
+
+    let tmp = tempdir().unwrap();
+    let a = tmp.path().join("a.parquet").to_string_lossy().to_string();
+    let b = tmp.path().join("b.parquet").to_string_lossy().to_string();
+    // ~60_000 rows x 200 B of text -> ~12 MB raw, comfortably many 256 KB row groups
+    write_parquet(&a, &wide_string_batch(30_000, 200));
+    write_parquet(&b, &wide_string_batch(30_000, 200));
+
+    let out = tmp.path().join("out.parquet").to_string_lossy().to_string();
+    merge_unsorted(&[a, b], &out, index, 0).unwrap();
+
+    let rgs = inspect_row_group_bytes(&out);
+    let total_rows: i64 = rgs.iter().map(|(r, _)| r).sum();
+    assert_eq!(total_rows, 60_000, "all rows must survive the merge");
+    assert!(
+        rgs.len() > 1,
+        "byte cap must split the output; got {} row group(s) of {:?}",
+        rgs.len(),
+        rgs
+    );
+    // The cap is checked AFTER a batch is written, so a row group may overshoot by at most one
+    // batch's worth of data -- assert it is bounded, not that it is exact.
+    let biggest = rgs.iter().map(|(_, b)| *b).max().unwrap();
+    assert!(
+        biggest < 8 * 1024 * 1024,
+        "no row group should be anywhere near the pre-fix multi-GB size; biggest={} bytes, rgs={:?}",
+        biggest,
+        rgs
+    );
+}
+
+#[test]
+fn test_merge_row_cap_still_applies_when_bytes_are_generous() {
+    // The reverse guard: a huge byte cap must not disable the row cap, otherwise this fix would
+    // have traded one unbounded dimension for another.
+    let index = "test_merge_rg_row_cap_still_binds";
+    SETTINGS_STORE.insert(
+        index.to_string(),
+        NativeSettings {
+            row_group_max_rows: Some(10_000),
+            row_group_max_bytes: Some(1024 * 1024 * 1024),
+            merge_batch_size: Some(2_000),
+            ..Default::default()
+        },
+    );
+
+    let tmp = tempdir().unwrap();
+    let a = tmp.path().join("a.parquet").to_string_lossy().to_string();
+    write_parquet(&a, &wide_string_batch(30_000, 20));
+
+    let out = tmp.path().join("out.parquet").to_string_lossy().to_string();
+    merge_unsorted(&[a], &out, index, 0).unwrap();
+
+    let rgs = inspect_row_group_bytes(&out);
+    assert_eq!(rgs.iter().map(|(r, _)| r).sum::<i64>(), 30_000, "all rows survive");
+    assert!(rgs.len() >= 3, "row cap of 10_000 over 30_000 rows must split; got {:?}", rgs);
+    for (rows, _) in &rgs {
+        assert!(*rows <= 12_000, "row group of {} rows exceeds the 10_000 cap + one batch", rows);
+    }
+}

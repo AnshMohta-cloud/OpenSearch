@@ -55,6 +55,7 @@ pub fn merge_unsorted_with_pool(
         .unwrap_or_default();
     let batch_size = config.get_merge_batch_size();
     let output_flush_rows = config.get_row_group_max_rows();
+    let output_flush_bytes = config.get_row_group_max_bytes();
     let rayon_threads = config.get_merge_rayon_threads();
     let io_threads = config.get_merge_io_threads();
     log_debug!(
@@ -103,6 +104,7 @@ pub fn merge_unsorted_with_pool(
         output_path,
         index_name,
         output_flush_rows,
+        output_flush_bytes,
         rayon_threads,
         io_threads,
         output_writer_generation,

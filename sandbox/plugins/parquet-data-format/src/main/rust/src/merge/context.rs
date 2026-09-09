@@ -40,6 +40,13 @@ pub struct MergeContext {
     col_writers: Option<Vec<parquet::arrow::arrow_writer::ArrowColumnWriter>>,
     output_row_count: usize,
     output_flush_rows: usize,
+    /// Byte cap for a row group, mirroring `WriterProperties::max_row_group_bytes` on the
+    /// flush path. The merge path drives `SerializedFileWriter` and the Arrow column writers
+    /// directly, so `ArrowWriter`'s own byte enforcement never runs here and this check has to
+    /// exist explicitly -- without it a merge coalesces many correctly-sized flush row groups
+    /// into one bounded only by `output_flush_rows`, which at high nested fan-out produces
+    /// multi-GB row groups (measured: 717,822 rows x ~4.9 KB = 3,538 MB in a single row group).
+    output_flush_bytes: usize,
     row_group_index: usize,
     next_row_id: i64,
     total_rows_written: usize,
@@ -61,6 +68,7 @@ impl MergeContext {
         output_path: &str,
         index_name: &str,
         output_flush_rows: usize,
+        output_flush_bytes: usize,
         rayon_threads: Option<usize>,
         io_threads: Option<usize>,
         output_writer_generation: i64,
@@ -132,6 +140,7 @@ impl MergeContext {
             col_writers: Some(col_writers),
             output_row_count: 0,
             output_flush_rows,
+            output_flush_bytes,
             row_group_index: 0,
             next_row_id: 0,
             total_rows_written: 0,
@@ -206,7 +215,17 @@ impl MergeContext {
         self.output_row_count += num_rows;
         self.total_rows_written += num_rows;
 
-        if self.output_row_count >= self.output_flush_rows {
+        // Flush on EITHER cap, matching the flush path. The byte estimate is taken from the
+        // column writers rather than from row counts because row width varies enormously with
+        // nested fan-out: at 1000 events/doc a row is ~4.9 KB, so the 1,000,000-row default
+        // corresponds to ~4.9 GB -- three orders of magnitude past the 128 MB byte default.
+        let estimated_bytes: usize = self
+            .col_writers
+            .as_ref()
+            .map(|ws| ws.iter().map(|w| w.get_estimated_total_bytes()).sum())
+            .unwrap_or(0);
+        if self.output_row_count >= self.output_flush_rows || estimated_bytes >= self.output_flush_bytes
+        {
             self.flush()?;
         }
         Ok(())
