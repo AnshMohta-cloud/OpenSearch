@@ -372,6 +372,14 @@ pub async unsafe fn create_session_context(
     // already covers every base_schema column.
     let resolved_schema = widen_schema_from_plan(&ctx, plan_bytes, &register_name, &inferred);
 
+    // NOTE: leaf projection deliberately does NOT narrow this schema. The Substrait consumer compares
+    // the plan's declared field type against the registered table's, struct children included, and
+    // rejects a narrowed nested column outright:
+    //   "Field 'events' in Substrait schema has a different type (List(Struct(code, name, status,
+    //    weight))) than the corresponding field in the table schema (List(Struct(code)))"
+    // The narrowing therefore happens after planning, by casting the predicate's array argument —
+    // see `crate::leaf_projection`.
+
     // If widening added columns, disable stat collection: the global stats cache is keyed by
     // path (not schema), so a narrow cached Statistics can be merged against the widened one,
     // failing with "Cannot merge statistics with different number of columns". Non-widened
@@ -612,6 +620,11 @@ pub async fn prepare_partial_plan(
     let logical_plan = crate::unnest_consumer::from_substrait_plan_unnest_aware(&handle.ctx.state(), &plan).await?;
     let dataframe = handle.ctx.execute_logical_plan(logical_plan).await?;
     let physical_plan = dataframe.create_physical_plan().await?;
+
+    // Leaf projection: a nested predicate pushed into the parquet scan reads every leaf of its root
+    // unless its array argument arrives through a narrowing cast. Rewrites the pushed predicate only —
+    // no schema changes, so nothing above the scan is affected. See `crate::leaf_projection`.
+    let physical_plan = crate::leaf_projection::narrow_pushed_nested_predicates(physical_plan);
 
     // Strip first on the raw physical plan so `force_aggregate_mode(Partial)` can find the
     // Final/Partial pair without a RelabelExec wrapper at the root pre-empting the walk.

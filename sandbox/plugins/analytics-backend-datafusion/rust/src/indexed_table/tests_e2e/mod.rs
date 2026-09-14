@@ -313,6 +313,7 @@ async fn run_tree_and_plan(
         pushdown_predicate: None,
         query_config: std::sync::Arc::new(qc),
         predicate_columns: vec![],
+        nested_leaf_paths: HashMap::new(),
         emit_row_ids: false,
         prune_tree_config: None,
         sort_fields: vec![],

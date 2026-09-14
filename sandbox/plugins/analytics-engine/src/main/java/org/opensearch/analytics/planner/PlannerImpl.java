@@ -52,6 +52,9 @@ import org.opensearch.analytics.planner.rules.OpenSearchHashJoinSplitRule;
 import org.opensearch.analytics.planner.rules.OpenSearchJoinRule;
 import org.opensearch.analytics.planner.rules.OpenSearchJoinSplitRule;
 import org.opensearch.analytics.planner.rules.OpenSearchLateMaterializationRewriter;
+import org.opensearch.analytics.planner.rules.OpenSearchCorrelateRule;
+import org.opensearch.analytics.planner.rules.OpenSearchNestedScopeRule;
+import org.opensearch.analytics.planner.rules.OpenSearchUncollectRule;
 import org.opensearch.analytics.planner.rules.OpenSearchProjectRule;
 import org.opensearch.analytics.planner.rules.OpenSearchSortPushdownRewriter;
 import org.opensearch.analytics.planner.rules.OpenSearchSortRule;
@@ -554,6 +557,17 @@ public class PlannerImpl {
             .addRuleCollection(
                 List.of(
                     new OpenSearchTableScanRule(context),
+                    // Converts LogicalNestedScope -> OpenSearchNestedScope. Without it the node is
+                    // never marked, and every operator above it (Filter/Project/Aggregate/Sort) fails
+                    // with "encountered unmarked child [LogicalNestedScope]" -- which is what blocked
+                    // map-key filters (`Links.attributes.link.kind`) and nested-leaf GROUP BY / agg /
+                    // top / rare. The phase is bottomUp, so the scope is marked before its parents run.
+                    new OpenSearchNestedScopeRule(context),
+                    // `expand` lowers to LogicalCorrelate + Uncollect. Both marking rules exist but were
+                    // likewise unregistered, so the aggregate above them failed with
+                    // "encountered unmarked child [LogicalCorrelate]".
+                    new OpenSearchCorrelateRule(context),
+                    new OpenSearchUncollectRule(context),
                     new OpenSearchFilterRule(context),
                     new OpenSearchProjectRule(context),
                     new OpenSearchAggregateRule(context),

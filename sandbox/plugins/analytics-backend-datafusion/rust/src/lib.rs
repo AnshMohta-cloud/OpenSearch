@@ -32,6 +32,7 @@ pub mod ffm;
 pub mod helper;
 pub mod indexed_executor;
 pub mod indexed_table;
+pub mod leaf_projection;
 pub mod local_executor;
 pub mod memory;
 pub mod memory_guard;

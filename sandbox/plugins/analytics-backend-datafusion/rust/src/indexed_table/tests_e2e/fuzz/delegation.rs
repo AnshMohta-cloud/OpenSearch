@@ -483,6 +483,7 @@ pub(in crate::indexed_table::tests_e2e) async fn execute_delegation_tree(
         pushdown_predicate: Some(Arc::clone(&residual_physical)),
         query_config: Arc::new(qc),
         predicate_columns: pred_cols,
+        nested_leaf_paths: HashMap::new(),
         emit_row_ids: false,
         prune_tree_config: None,
         sort_fields: vec![],

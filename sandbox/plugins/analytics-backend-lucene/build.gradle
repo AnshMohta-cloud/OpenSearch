@@ -67,6 +67,12 @@ dependencies {
     // enum-constant warnings in transitive Arrow types.
     compileOnly "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
     compileOnly "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+    // jackson-core explicitly: NestedAnyMatchExprSerializer compiles against JsonMapper, whose
+    // supertypes (Versioned, ObjectCodec, TreeNode) live in jackson-core. Relying on it arriving
+    // transitively through jackson-databind breaks the build with "class file for
+    // com.fasterxml.jackson.core.Versioned not found". analytics-backend-datafusion already
+    // declares all three for the same reason. compileOnly — the server provides Jackson at runtime.
+    compileOnly "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
 
     implementation "org.apache.logging.log4j:log4j-api:${versions.log4j}"
     implementation "org.apache.logging.log4j:log4j-core:${versions.log4j}"

@@ -131,6 +131,7 @@ async fn query_phase(tree: BoolNode) -> Vec<i64> {
             qc
         }),
         predicate_columns: vec![0, 1, 2, 3],
+        nested_leaf_paths: std::collections::HashMap::new(),
         emit_row_ids: true,
         prune_tree_config: None,
         sort_fields: vec![],

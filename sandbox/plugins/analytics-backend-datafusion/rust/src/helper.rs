@@ -112,6 +112,25 @@ pub async fn register_listing_table(
     sort_fields: &[String],
     sort_orders: &[String],
 ) -> Result<(), DataFusionError> {
+    register_listing_table_with_schema(ctx, table_name, table_path, sort_fields, sort_orders, None)
+        .await
+}
+
+/// As [`register_listing_table`], but with an optional schema to use instead of the inferred one.
+///
+/// The override exists for leaf projection: a nested `LIST<STRUCT>` column declared with only the
+/// children a query reads makes DataFusion's physical-expr adapter route the column through a cast to
+/// that narrower type, which `clip_for_cast` clips to those leaves. Declaring fewer struct children than
+/// the file holds is exactly the "logical schema narrower than physical schema" case DataFusion 55
+/// supports; top-level fields are never dropped, so projection indices stay valid.
+pub async fn register_listing_table_with_schema(
+    ctx: &SessionContext,
+    table_name: &str,
+    table_path: ListingTableUrl,
+    sort_fields: &[String],
+    sort_orders: &[String],
+    schema_override: Option<datafusion::arrow::datatypes::SchemaRef>,
+) -> Result<(), DataFusionError> {
     // DF55: `collect_stat` moved off `ListingOptions` to `SessionConfig` (defaults true).
     let mut listing_options =
         ListingOptions::new(Arc::new(ParquetFormat::new())).with_file_extension(".parquet");
@@ -130,6 +149,7 @@ pub async fn register_listing_table(
             e
         })?;
     let resolved_schema = coerce_inferred_schema(resolved_schema);
+    let resolved_schema = schema_override.unwrap_or(resolved_schema);
 
     let table_config = ListingTableConfig::new(table_path)
         .with_listing_options(listing_options)

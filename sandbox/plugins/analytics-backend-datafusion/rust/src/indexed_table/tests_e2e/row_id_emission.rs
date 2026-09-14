@@ -120,6 +120,7 @@ async fn run_tree_row_ids(tree: BoolNode) -> Vec<i64> {
             qc
         }),
         predicate_columns: vec![0, 1, 2, 3],
+        nested_leaf_paths: std::collections::HashMap::new(),
         emit_row_ids: true,
         prune_tree_config: None,
         sort_fields: vec![],
@@ -297,6 +298,7 @@ async fn run_tree_row_ids_with_global_base(tree: BoolNode, global_base: u64) -> 
             qc
         }),
         predicate_columns: vec![0, 1, 2, 3],
+        nested_leaf_paths: std::collections::HashMap::new(),
         emit_row_ids: true,
         prune_tree_config: None,
         sort_fields: vec![],
@@ -584,6 +586,7 @@ async fn test_row_id_with_data_columns() {
             qc
         }),
         predicate_columns: vec![0, 1, 2, 3],
+        nested_leaf_paths: std::collections::HashMap::new(),
         emit_row_ids: true,
         prune_tree_config: None,
         sort_fields: vec![],
@@ -856,6 +859,7 @@ async fn run_two_segments_row_ids(tree: BoolNode) -> Vec<i64> {
             qc
         }),
         predicate_columns: vec![0, 1, 2, 3],
+        nested_leaf_paths: std::collections::HashMap::new(),
         emit_row_ids: true,
         prune_tree_config: None,
         sort_fields: vec![],

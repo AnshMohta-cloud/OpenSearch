@@ -118,9 +118,12 @@ impl PagePruner {
         boundary_set.insert(0i64);
         boundary_set.insert(num_rows as i64);
 
+        // Third slot: a synthetic nested-leaf column (see `nested_prune`), which has no Arrow field and
+        // so no `StatisticsConverter` — its per-page bounds come from the ColumnIndex instead.
         let mut col_converters: Vec<(
             &datafusion::physical_expr::expressions::Column,
             Option<(StatisticsConverter<'_>, usize)>,
+            Option<(usize, datafusion::arrow::datatypes::DataType)>,
         )> = Vec::new();
 
         // Resolve against the segment's own schema (see eval_leaf): the full table
@@ -130,13 +133,38 @@ impl PagePruner {
         let seg_arrow_schema = Arc::clone(&self.seg_arrow_schema);
 
         for col in &columns {
+            if let Some((root, leaf_path)) =
+                crate::indexed_table::nested_prune::parse_synthetic_name(col.name())
+            {
+                let nested = crate::indexed_table::nested_prune::leaf_type_for(
+                    &self.schema,
+                    root,
+                    leaf_path,
+                )
+                .and_then(|dt| {
+                    crate::indexed_table::nested_prune::parquet_leaf_index(descr, root, leaf_path)
+                        .map(|idx| (idx, dt))
+                });
+                match nested {
+                    Some((leaf_idx, dt)) => {
+                        if let Some(oi) = rg_offsets.get(leaf_idx) {
+                            for loc in oi.page_locations() {
+                                boundary_set.insert(loc.first_row_index);
+                            }
+                        }
+                        col_converters.push((col, None, Some((leaf_idx, dt))));
+                    }
+                    None => col_converters.push((col, None, None)),
+                }
+                continue;
+            }
             let converter = match StatisticsConverter::try_new(col.name(), &seg_arrow_schema, descr)
             {
                 Ok(c) => c,
                 Err(_) => {
                     // Column not in Arrow schema either — nothing we can
                     // do. Treat as absent (fills with nulls).
-                    col_converters.push((col, None));
+                    col_converters.push((col, None, None));
                     continue;
                 }
             };
@@ -146,26 +174,26 @@ impl PagePruner {
                     // Column is in Arrow schema but absent from the
                     // parquet file. Fill with null stats so this column
                     // is "unknown" but others still prune.
-                    col_converters.push((col, None));
+                    col_converters.push((col, None, None));
                     continue;
                 }
             };
             let col_locs = match rg_offsets.get(parquet_col_idx) {
                 Some(oi) => oi.page_locations(),
                 None => {
-                    col_converters.push((col, None));
+                    col_converters.push((col, None, None));
                     continue;
                 }
             };
             for loc in col_locs {
                 boundary_set.insert(loc.first_row_index);
             }
-            col_converters.push((col, Some((converter, parquet_col_idx))));
+            col_converters.push((col, Some((converter, parquet_col_idx)), None));
         }
 
         // If no referenced column contributed real page boundaries (all
         // absent or had no page index), pruning can't do anything useful.
-        if col_converters.iter().all(|(_, c)| c.is_none()) {
+        if col_converters.iter().all(|(_, c, n)| c.is_none() && n.is_none()) {
             if let Some(m) = metrics {
                 if let Some(ref c) = m.page_pruning_unavailable {
                     c.add(1);
@@ -319,6 +347,7 @@ impl CommonGridPageStats {
         col_converters: &[(
             &datafusion::physical_expr::expressions::Column,
             Option<(StatisticsConverter<'_>, usize)>,
+            Option<(usize, datafusion::arrow::datatypes::DataType)>,
         )],
         arrow_schema: &SchemaRef,
         parquet_metadata: &ParquetMetaData,
@@ -336,7 +365,34 @@ impl CommonGridPageStats {
 
         let mut col_stats = HashMap::new();
 
-        for (col, maybe_cv) in col_converters {
+        for (col, maybe_cv, maybe_nested) in col_converters {
+            // Synthetic nested-leaf column: per-page bounds from the ColumnIndex, then the same
+            // page->grid mapping as any other column.
+            if let Some((leaf_idx, dt)) = maybe_nested {
+                let Some(col_locs) = rg_offsets.get(*leaf_idx).map(|oi| oi.page_locations()) else {
+                    continue;
+                };
+                let Some((page_mins, page_maxes, page_nulls)) =
+                    crate::indexed_table::nested_prune::nested_leaf_page_stats(
+                        column_index, rg_idx, *leaf_idx, dt,
+                    )
+                else {
+                    continue;
+                };
+                if let Some(stats) = grid_align(
+                    &page_mins,
+                    &page_maxes,
+                    page_nulls.as_deref(),
+                    col_locs,
+                    boundaries,
+                    num_grid_cells,
+                    &grid_row_counts,
+                    num_rows,
+                ) {
+                    col_stats.insert(col.name().to_string(), stats);
+                }
+                continue;
+            }
             let (converter, parquet_col_idx) = match maybe_cv {
                 Some(cv) => cv,
                 None => {
@@ -382,81 +438,18 @@ impl CommonGridPageStats {
                 v
             };
 
-            // Map each grid cell to the page that contains it, then
-            // replicate that page's stats to the grid cell.
-            let mut grid_page_indices = Vec::with_capacity(num_grid_cells);
-            let mut page_idx = 0usize;
-            let mut next_page_start = if col_locs.len() > 1 {
-                col_locs[1].first_row_index
-            } else {
-                i64::MAX
-            };
-
-            for &cell_start in boundaries.iter().take(num_grid_cells) {
-                // Advance page_idx until this cell falls within the page
-                while page_idx + 1 < col_locs.len() && cell_start >= next_page_start {
-                    page_idx += 1;
-                    next_page_start = if page_idx + 1 < col_locs.len() {
-                        col_locs[page_idx + 1].first_row_index
-                    } else {
-                        i64::MAX
-                    };
-                }
-                grid_page_indices.push(page_idx);
-            }
-
-            // Build grid-aligned min/max arrays by indexing into the
-            // per-page arrays. `StatisticsConverter` already converts
-            // `null_pages = true` entries into Arrow nulls, which
-            // `take` propagates correctly.
-            use datafusion::arrow::compute::take;
-            let indices = datafusion::arrow::array::UInt32Array::from(
-                grid_page_indices
-                    .iter()
-                    .map(|i| *i as u32)
-                    .collect::<Vec<_>>(),
-            );
-            let grid_mins = take(&mins, &indices, None).ok()?;
-            let grid_maxs = take(&maxs, &indices, None).ok()?;
-
-            // Null count splitting: a page's `null_count` applies to the
-            // whole page, not to any sub-range of it. When a cell is only
-            // part of a page, the page's null count can't be attributed
-            // directly. Rule:
-            //   - page null_count == 0        → cell null_count = 0
-            //     (no nulls anywhere in the page → none in any sub-cell)
-            //   - page null_count == page_row_count → cell null_count = cell_row_count
-            //     (all values are null → every sub-cell is all-null)
-            //   - otherwise                    → cell null_count = null (unknown)
-            //     `PruningPredicate` treats a null as "unknown" and falls
-            //     back to the safe (non-pruning) branch, so `IS NULL` /
-            //     `IS NOT NULL` stay correct on the split cell.
-            let grid_nulls: Option<ArrayRef> = page_null_counts.map(|page_ncs| {
-                use datafusion::arrow::array::UInt64Array;
-                let mut builder = UInt64Array::builder(num_grid_cells);
-                for (cell_idx, &pidx) in grid_page_indices.iter().enumerate() {
-                    if pidx >= page_ncs.len() || page_ncs.is_null(pidx) {
-                        builder.append_null();
-                        continue;
-                    }
-                    let page_nc = page_ncs.value(pidx) as usize;
-                    let page_rc = page_row_counts.get(pidx).copied().unwrap_or(0);
-                    let cell_rc = grid_row_counts[cell_idx];
-                    if page_nc == 0 {
-                        builder.append_value(0);
-                    } else if page_nc == page_rc {
-                        // All values in the page are null → all values
-                        // in any sub-cell are null too.
-                        builder.append_value(cell_rc as u64);
-                    } else {
-                        // Mixed page split across multiple grid cells:
-                        // can't attribute null_count exactly. Mark as
-                        // unknown so `PruningPredicate` stays conservative.
-                        builder.append_null();
-                    }
-                }
-                Arc::new(builder.finish()) as ArrayRef
-            });
+            let (grid_mins, grid_maxs, grid_nulls) = grid_align(
+                &mins,
+                &maxs,
+                page_null_counts
+                    .as_ref()
+                    .map(|a| a as &dyn datafusion::arrow::array::Array),
+                col_locs,
+                boundaries,
+                num_grid_cells,
+                &grid_row_counts,
+                num_rows,
+            )?;
 
             col_stats.insert(col.name().to_string(), (grid_mins, grid_maxs, grid_nulls));
         }
@@ -466,6 +459,101 @@ impl CommonGridPageStats {
             grid_row_counts,
         })
     }
+}
+
+/// Project per-**page** stats onto the common grid shared by every column in a row group.
+///
+/// Columns in a row group do not agree on page boundaries, so `CommonGridPageStats` evaluates the
+/// predicate over the union of all boundaries ("grid cells"). Each grid cell lies entirely within
+/// one page of a given column, so that page's bounds are a valid (if loose) bound for the cell.
+///
+/// Null counts cannot be split the same way — a page's `null_count` describes the whole page:
+///   - `null_count == 0`               → cell has no nulls either.
+///   - `null_count == page_row_count`  → every value is null, so the cell is all-null too.
+///   - otherwise                       → unknown (Arrow null), which `PruningPredicate` treats
+///     conservatively, keeping `IS NULL` / `IS NOT NULL` correct on a split cell.
+#[allow(clippy::too_many_arguments)]
+fn grid_align(
+    page_mins: &ArrayRef,
+    page_maxes: &ArrayRef,
+    page_null_counts: Option<&dyn datafusion::arrow::array::Array>,
+    col_locs: &[datafusion::parquet::file::page_index::offset_index::PageLocation],
+    boundaries: &[i64],
+    num_grid_cells: usize,
+    grid_row_counts: &[usize],
+    num_rows: usize,
+) -> Option<(ArrayRef, ArrayRef, Option<ArrayRef>)> {
+    // Per-page row counts, needed to recognise an all-null page.
+    let page_row_counts: Vec<usize> = {
+        let mut v = Vec::with_capacity(col_locs.len());
+        for pair in col_locs.windows(2) {
+            v.push((pair[1].first_row_index - pair[0].first_row_index) as usize);
+        }
+        if let Some(last) = col_locs.last() {
+            v.push(num_rows.saturating_sub(last.first_row_index as usize));
+        }
+        v
+    };
+
+    // Which page contains each grid cell.
+    let mut grid_page_indices = Vec::with_capacity(num_grid_cells);
+    let mut page_idx = 0usize;
+    let mut next_page_start = if col_locs.len() > 1 {
+        col_locs[1].first_row_index
+    } else {
+        i64::MAX
+    };
+    for &cell_start in boundaries.iter().take(num_grid_cells) {
+        while page_idx + 1 < col_locs.len() && cell_start >= next_page_start {
+            page_idx += 1;
+            next_page_start = if page_idx + 1 < col_locs.len() {
+                col_locs[page_idx + 1].first_row_index
+            } else {
+                i64::MAX
+            };
+        }
+        grid_page_indices.push(page_idx);
+    }
+
+    // `StatisticsConverter` turns `null_pages = true` entries into Arrow nulls, and `take`
+    // propagates them, so a stats-less page stays "unknown" rather than becoming prunable.
+    use datafusion::arrow::compute::take;
+    let indices = datafusion::arrow::array::UInt32Array::from(
+        grid_page_indices.iter().map(|i| *i as u32).collect::<Vec<_>>(),
+    );
+    let grid_mins = take(page_mins, &indices, None).ok()?;
+    let grid_maxs = take(page_maxes, &indices, None).ok()?;
+
+    let grid_nulls: Option<ArrayRef> = page_null_counts.and_then(|page_ncs| {
+        use datafusion::arrow::array::{Int64Array, UInt64Array};
+        // Callers supply either UInt64 (`StatisticsConverter`) or Int64 (ColumnIndex); normalise.
+        let casted = datafusion::arrow::compute::cast(
+            page_ncs,
+            &datafusion::arrow::datatypes::DataType::Int64,
+        )
+        .ok()?;
+        let page_ncs = casted.as_any().downcast_ref::<Int64Array>()?;
+        let mut builder = UInt64Array::builder(num_grid_cells);
+        for (cell_idx, &pidx) in grid_page_indices.iter().enumerate() {
+            if pidx >= page_ncs.len() || page_ncs.is_null(pidx) {
+                builder.append_null();
+                continue;
+            }
+            let page_nc = page_ncs.value(pidx) as usize;
+            let page_rc = page_row_counts.get(pidx).copied().unwrap_or(0);
+            let cell_rc = grid_row_counts.get(cell_idx).copied().unwrap_or(0);
+            if page_nc == 0 {
+                builder.append_value(0);
+            } else if page_nc == page_rc {
+                builder.append_value(cell_rc as u64);
+            } else {
+                builder.append_null();
+            }
+        }
+        Some(Arc::new(builder.finish()) as ArrayRef)
+    });
+
+    Some((grid_mins, grid_maxs, grid_nulls))
 }
 
 impl PruningStatistics for CommonGridPageStats {
@@ -560,6 +648,27 @@ fn eval_leaf(
     }
     let mut col_stats: HashMap<String, (ArrayRef, ArrayRef, Option<ArrayRef>)> = HashMap::new();
     for col in &columns {
+        // Synthetic nested-leaf column (see `nested_prune`): not an Arrow field at all, so
+        // `StatisticsConverter` -- which resolves a TOP-LEVEL field name to a parquet leaf -- cannot
+        // serve it. Read the leaf's statistics straight from the footer by column path instead.
+        if let Some((root, leaf_path)) = crate::indexed_table::nested_prune::parse_synthetic_name(col.name())
+        {
+            let Some(dt) = crate::indexed_table::nested_prune::leaf_type_for(schema, root, leaf_path)
+            else {
+                continue;
+            };
+            let Some(leaf_idx) =
+                crate::indexed_table::nested_prune::parquet_leaf_index(descr, root, leaf_path)
+            else {
+                continue;
+            };
+            if let Some(stats) = crate::indexed_table::nested_prune::nested_leaf_rg_stats(
+                &rg_metas, leaf_idx, &dt,
+            ) {
+                col_stats.insert(col.name().to_string(), stats);
+            }
+            continue;
+        }
         if arrow_schema.index_of(col.name()).is_err() {
             continue;
         }
@@ -864,6 +973,289 @@ mod tests {
         r: Arc<dyn PhysicalExpr>,
     ) -> Arc<dyn PhysicalExpr> {
         Arc::new(BinaryExpr::new(l, op, r))
+    }
+
+    /// 32-row parquet whose only column is `events: List<Struct<name: Utf8, code: Int32>>` with two
+    /// elements per row, written with a page row-count limit of 8 -> four 8-row pages.
+    ///
+    /// Row `i` holds codes `2i, 2i+1` and names `n{2i}, n{2i+1}` zero-padded to two digits, so page
+    /// 0 covers codes 0..15, page 1 16..31, page 2 32..47, page 3 48..63 -- and because the names are
+    /// padded, their lexicographic order matches, letting one fixture cover both a numeric and a
+    /// keyword leaf.
+    fn nested_fixture() -> (PagePruner, SchemaRef, DataType) {
+        use datafusion::arrow::array::{ListArray, StringArray, StructArray};
+        use datafusion::arrow::buffer::OffsetBuffer;
+        use datafusion::arrow::datatypes::Fields;
+
+        let elem_fields: Fields = vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("code", DataType::Int32, true),
+        ]
+        .into();
+        let elem_field = Arc::new(Field::new("element", DataType::Struct(elem_fields.clone()), true));
+        let events_type = DataType::List(Arc::clone(&elem_field));
+        let schema = Arc::new(Schema::new(vec![Field::new("events", events_type.clone(), true)]));
+
+        let codes: Vec<i32> = (0..64).collect();
+        let names: Vec<String> = (0..64).map(|i| format!("n{i:02}")).collect();
+        let elements = StructArray::new(
+            elem_fields,
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(Int32Array::from(codes)),
+            ],
+            None,
+        );
+        // Two elements per row: offsets 0, 2, 4, ... 64.
+        let offsets = OffsetBuffer::new((0..=32).map(|i| i * 2).collect::<Vec<i32>>().into());
+        let events = ListArray::new(elem_field, offsets, Arc::new(elements), None);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(events)]).unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(32)
+            .set_data_page_row_count_limit(8)
+            .set_write_batch_size(8)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let mut w =
+            ArrowWriter::try_new(tmp.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let meta = ArrowReaderMetadata::load(
+            &tmp.reopen().unwrap(),
+            ArrowReaderOptions::new().with_page_index(true),
+        )
+        .unwrap();
+        let arc_meta = meta.metadata().clone();
+        // Four pages per leaf, or the row-range expectations below mean nothing.
+        let pages = arc_meta.offset_index().unwrap()[0][0].page_locations().len();
+        assert_eq!(pages, 4, "fixture must write 4 pages per leaf, got {pages}");
+        let pruner = PagePruner::new(&schema, Arc::clone(&arc_meta), schema.clone());
+        (pruner, schema, events_type)
+    }
+
+    /// Rows kept for a nested predicate, going through the same synthesized-predicate path
+    /// production uses.
+    fn nested_rows_kept(tree_json: &str) -> usize {
+        let (pruner, _schema, events_type) = nested_fixture();
+        let (pp, _refs) =
+            crate::indexed_table::nested_prune::synthesize("events", &events_type, tree_json)
+                .expect("predicate should synthesize");
+        match pruner.prune_rg(&pp, 0, None) {
+            Some(sel) => count_rows_kept(&sel),
+            // No selection means "could not prune"; report the whole RG so a regression from
+            // pruning to not-pruning shows up as a value mismatch rather than a panic.
+            None => 32,
+        }
+    }
+
+    fn nested_cmp(field: &str, op: &str, lit: &str) -> String {
+        format!(r#"{{"op":"{op}","args":[{{"field":"{field}"}},{{"lit":{lit}}}]}}"#)
+    }
+
+    /// Which leaf TYPES actually prune? `resolve_leaf_type` accepts a type, but pruning also needs the
+    /// stats array's type to match the synthetic field's declared type, or `PruningPredicate::prune`
+    /// errors and silently prunes nothing. This walks the accepted types over a real parquet file so
+    /// the answer comes from behaviour rather than from reading the match arms.
+    #[test]
+    fn nested_leaf_type_coverage() {
+        use datafusion::arrow::array::{ListArray, StructArray};
+        use datafusion::arrow::buffer::OffsetBuffer;
+        use datafusion::arrow::datatypes::{Fields, TimeUnit};
+
+        // Each case: leaf type, the value written into element i, and a literal that no page contains.
+        let cases: Vec<(&str, DataType)> = vec![
+            ("utf8", DataType::Utf8),
+            ("i32", DataType::Int32),
+            ("i64", DataType::Int64),
+            ("f32", DataType::Float32),
+            ("f64", DataType::Float64),
+            ("bool", DataType::Boolean),
+            ("date32", DataType::Date32),
+            ("date64", DataType::Date64),
+            ("ts", DataType::Timestamp(TimeUnit::Millisecond, None)),
+        ];
+        let mut pruned = Vec::new();
+        let mut not_pruned = Vec::new();
+        for (name, dt) in &cases {
+            let elem_fields: Fields = vec![Field::new("v", dt.clone(), true)].into();
+            let elem_field =
+                Arc::new(Field::new("element", DataType::Struct(elem_fields.clone()), true));
+            let events_type = DataType::List(Arc::clone(&elem_field));
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("events", events_type.clone(), true)]));
+            // 64 element values 0..64 (or their type's analogue), two per row over 32 rows.
+            let vals: ArrayRef = match dt {
+                DataType::Utf8 => Arc::new(datafusion::arrow::array::StringArray::from(
+                    (0..64).map(|i| format!("n{i:02}")).collect::<Vec<_>>(),
+                )),
+                DataType::Int32 => Arc::new(Int32Array::from((0..64).collect::<Vec<i32>>())),
+                DataType::Int64 => Arc::new(datafusion::arrow::array::Int64Array::from(
+                    (0..64).collect::<Vec<i64>>(),
+                )),
+                DataType::Float32 => Arc::new(datafusion::arrow::array::Float32Array::from(
+                    (0..64).map(|i| i as f32).collect::<Vec<_>>(),
+                )),
+                DataType::Float64 => Arc::new(datafusion::arrow::array::Float64Array::from(
+                    (0..64).map(|i| i as f64).collect::<Vec<_>>(),
+                )),
+                DataType::Boolean => Arc::new(datafusion::arrow::array::BooleanArray::from(
+                    (0..64).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+                )),
+                DataType::Date32 => Arc::new(datafusion::arrow::array::Date32Array::from(
+                    (0..64).collect::<Vec<i32>>(),
+                )),
+                DataType::Date64 => Arc::new(datafusion::arrow::array::Date64Array::from(
+                    (0..64).map(|i| i as i64 * 86_400_000).collect::<Vec<_>>(),
+                )),
+                DataType::Timestamp(_, _) => {
+                    Arc::new(datafusion::arrow::array::TimestampMillisecondArray::from(
+                        (0..64).map(|i| i as i64 * 1000).collect::<Vec<_>>(),
+                    ))
+                }
+                other => panic!("unhandled fixture type {other:?}"),
+            };
+            let elements = StructArray::new(elem_fields, vec![vals], None);
+            let offsets =
+                OffsetBuffer::new((0..=32).map(|i| i * 2).collect::<Vec<i32>>().into());
+            let events = ListArray::new(elem_field, offsets, Arc::new(elements), None);
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(events)]).unwrap();
+
+            let tmp = NamedTempFile::new().unwrap();
+            let props = WriterProperties::builder()
+                .set_max_row_group_size(32)
+                .set_data_page_row_count_limit(8)
+                .set_write_batch_size(8)
+                .set_statistics_enabled(EnabledStatistics::Page)
+                .build();
+            let mut w =
+                ArrowWriter::try_new(tmp.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            let meta = ArrowReaderMetadata::load(
+                &tmp.reopen().unwrap(),
+                ArrowReaderOptions::new().with_page_index(true),
+            )
+            .unwrap();
+            let pruner = PagePruner::new(&schema, meta.metadata().clone(), schema.clone());
+
+            // A value no page can hold: every leaf is < 1000 (bool uses a shape that cannot miss, so
+            // it is checked for "engages without error" only).
+            let tree = if matches!(dt, DataType::Boolean) {
+                r#"{"op":"=","args":[{"field":"v"},{"lit":true}]}"#.to_string()
+            } else if matches!(dt, DataType::Utf8) {
+                r#"{"op":"=","args":[{"field":"v"},{"lit":"zzz"}]}"#.to_string()
+            } else {
+                r#"{"op":">","args":[{"field":"v"},{"lit":100000}]}"#.to_string()
+            };
+            match crate::indexed_table::nested_prune::synthesize("events", &events_type, &tree) {
+                None => not_pruned.push(format!("{name} (no predicate synthesized)")),
+                Some((pp, _)) => match pruner.prune_rg(&pp, 0, None) {
+                    Some(sel) => {
+                        let kept = count_rows_kept(&sel);
+                        if matches!(dt, DataType::Boolean) {
+                            pruned.push(format!("{name} (engaged, kept {kept})"));
+                        } else if kept == 0 {
+                            pruned.push(name.to_string());
+                        } else {
+                            not_pruned.push(format!("{name} (kept {kept}/32)"));
+                        }
+                    }
+                    None => not_pruned.push(format!("{name} (prune returned None)")),
+                },
+            }
+        }
+        println!("PRUNED:     {pruned:?}");
+        println!("NOT PRUNED: {not_pruned:?}");
+        // Every supported scalar type must prune an absent value away completely.
+        for want in ["utf8", "i32", "i64", "f32", "f64"] {
+            assert!(
+                pruned.iter().any(|p| p == want),
+                "leaf type {want} did not prune; PRUNED={pruned:?} NOT_PRUNED={not_pruned:?}"
+            );
+        }
+        // Temporal leaves must DECLINE rather than guess at units (see `resolve_leaf_type`). The
+        // failure mode being avoided is a wrong answer, so "no predicate synthesized" is the pass.
+        for want in ["date32", "date64", "ts"] {
+            assert!(
+                not_pruned.contains(&format!("{want} (no predicate synthesized)")),
+                "leaf type {want} must decline; PRUNED={pruned:?} NOT_PRUNED={not_pruned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_numeric_leaf_prunes_to_one_page() {
+        // code = 20 lives only in page 1 (codes 16..31).
+        assert_eq!(nested_rows_kept(&nested_cmp("code", "=", "20")), 8);
+    }
+
+    #[test]
+    fn nested_numeric_leaf_absent_value_prunes_every_page() {
+        // No element has code 99, so every page's [min,max] excludes it.
+        assert_eq!(nested_rows_kept(&nested_cmp("code", "=", "99")), 0);
+    }
+
+    #[test]
+    fn nested_keyword_leaf_prunes_to_one_page() {
+        // 'n40' falls in page 2 (n32..n47).
+        assert_eq!(nested_rows_kept(&nested_cmp("name", "=", "\"n40\"")), 8);
+    }
+
+    #[test]
+    fn nested_keyword_leaf_absent_value_prunes_every_page() {
+        assert_eq!(nested_rows_kept(&nested_cmp("name", "=", "\"zzz\"")), 0);
+    }
+
+    #[test]
+    fn nested_range_over_one_leaf_intersects_pages() {
+        // code >= 16 AND code <= 31 selects exactly page 1.
+        let tree = format!(
+            r#"{{"op":"AND","args":[{},{}]}}"#,
+            nested_cmp("code", ">=", "16"),
+            nested_cmp("code", "<=", "31")
+        );
+        assert_eq!(nested_rows_kept(&tree), 8);
+    }
+
+    #[test]
+    fn nested_two_leaf_and_intersects_pages() {
+        // code < 16 keeps page 0; name >= 'n48' keeps page 3. Disjoint -> nothing survives.
+        let tree = format!(
+            r#"{{"op":"AND","args":[{},{}]}}"#,
+            nested_cmp("code", "<", "16"),
+            nested_cmp("name", ">=", "\"n48\"")
+        );
+        assert_eq!(nested_rows_kept(&tree), 0);
+    }
+
+    #[test]
+    fn nested_saturated_predicate_keeps_every_page() {
+        // Every page contains a code >= 0, so nothing may be skipped.
+        assert_eq!(nested_rows_kept(&nested_cmp("code", ">=", "0")), 32);
+    }
+
+    #[test]
+    fn nested_or_and_neq_are_not_pruned() {
+        // `harvest` deliberately declines OR / != -- `synthesize` finds nothing prunable, which is
+        // the "no pruning" contract rather than an error.
+        let or_tree = format!(
+            r#"{{"op":"OR","args":[{},{}]}}"#,
+            nested_cmp("code", "=", "20"),
+            nested_cmp("code", "=", "40")
+        );
+        let (_, _, events_type) = nested_fixture();
+        assert!(
+            crate::indexed_table::nested_prune::synthesize("events", &events_type, &or_tree)
+                .is_none(),
+            "OR must not synthesize a predicate"
+        );
+        let neq = nested_cmp("code", "!=", "20");
+        assert!(
+            crate::indexed_table::nested_prune::synthesize("events", &events_type, &neq).is_none(),
+            "!= must not synthesize a predicate"
+        );
     }
 
     #[test]

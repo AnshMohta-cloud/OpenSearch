@@ -21,16 +21,18 @@
 
 use std::sync::Arc;
 
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::{
-    arrow::datatypes::SchemaRef,
+    arrow::datatypes::{DataType, SchemaRef},
     catalog::Session,
     common::tree_node::{TreeNode, TreeNodeRecursion},
     common::DataFusionError,
+    common::ScalarValue,
     datasource::{TableProvider, TableType},
     execution::memory_pool::MemoryPool,
     execution::object_store::ObjectStoreUrl,
     logical_expr::Expr,
-    physical_expr::expressions::Column,
+    physical_expr::expressions::{Column, Literal},
     physical_expr::PhysicalExpr,
     physical_optimizer::pruning::PruningPredicate,
     physical_plan::displayable,
@@ -42,7 +44,7 @@ use datafusion::{
 // ExtensionSingle(unnest_reshape:<col>) rebuilds LogicalPlan::Unnest (nested aggregation path).
 // Aliased to from_substrait_plan so existing call sites are unchanged; non-unnest plans are unaffected.
 use crate::unnest_consumer::from_substrait_plan_unnest_aware as from_substrait_plan;
-use native_bridge_common::log_debug;
+use native_bridge_common::{log_debug, log_info};
 use prost::Message;
 use substrait::proto::Plan;
 
@@ -308,6 +310,311 @@ fn collect_predicate_column_indices_from_exprs(exprs: &[Arc<dyn PhysicalExpr>]) 
     indices.into_iter().collect()
 }
 
+/// Which leaves of each nested `LIST<STRUCT>` root the predicate actually reads.
+///
+/// Returns `root index -> leaf names`, for roots that are referenced ONLY as the array argument of
+/// `nested_any_match_expr`. A root referenced any other way (bare column, arithmetic, a UDF we do not
+/// recognise) is deliberately absent from the map, because that reference may need every leaf.
+///
+/// The names come from the `{"field":"..."}` nodes of the UDF's own expression JSON — the same nodes
+/// `compile_node` resolves against the struct's `Fields` **by name** at evaluation time. That shared
+/// source is what makes narrowing safe: a leaf the UDF will look up is a leaf that appears here, so a
+/// struct pruned to exactly this set still satisfies every lookup. Clauses delegated to Lucene appear
+/// as `{"lucene":i}` with no field name and are correctly omitted — their leaf is never read from
+/// parquet at all.
+///
+/// Consumed by `IndexedTableProvider::scan`, which narrows the schema handed to `ParquetSource`. That
+/// is the only lever available: DataFusion 55 picks leaf column chunks from the *expressions*
+/// (`projection_read_plan::build_projection_read_plan`), where a whole-column reference reads every
+/// leaf of the root. Declaring a narrower logical schema makes the physical-expr adapter route the
+/// column through a cast to the narrow type, which `clip_for_cast` can then clip to these leaves.
+pub(crate) fn collect_nested_leaf_paths(
+    exprs: &[Arc<dyn PhysicalExpr>],
+    schema: &SchemaRef,
+) -> HashMap<usize, Vec<String>> {
+    use datafusion::physical_expr::ScalarFunctionExpr;
+
+    let mut narrowable: HashMap<usize, HashSet<String>> = HashMap::new();
+    let mut needs_full: HashSet<usize> = HashSet::new();
+
+    for expr in exprs {
+        let _ = expr.apply(|node| {
+            if let Some(f) = node.downcast_ref::<ScalarFunctionExpr>() {
+                if f.name() == "nested_any_match_expr" && f.args().len() == 2 {
+                    if let (Some(col), Some(lit)) = (
+                        f.args()[0].downcast_ref::<Column>(),
+                        f.args()[1].downcast_ref::<Literal>(),
+                    ) {
+                        let json = match lit.value() {
+                            ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
+                                Some(v.clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(json) = json {
+                            match serde_json::from_str::<serde_json::Value>(&json) {
+                                Ok(tree) if json_has_deeper_boundary(&tree) => {
+                                    // Depth >= 2. `OpenSearchNestedFieldRewriter` wraps a comparison
+                                    // that crosses a further array boundary in
+                                    // `{"nested":<arrayField>,"inner":{...}}`, so the `{"field":...}`
+                                    // inside names a leaf of the INNER element, not of this struct.
+                                    // Narrowing on that name would be wrong whenever it collides with a
+                                    // direct child here: `products.variants.name` against a `products`
+                                    // that also has its own `name` would keep `name` and prune away
+                                    // `variants`, reading the wrong column. Decline instead — lifting
+                                    // this needs a path TREE and a recursive narrow, which
+                                    // DataFusion supports (`clip_type` recurses through Struct and
+                                    // List) but this derivation does not yet build.
+                                    needs_full.insert(col.index());
+                                }
+                                Ok(tree) => {
+                                    let mut fields = HashSet::new();
+                                    collect_json_field_names(&tree, &mut fields);
+                                    // No field names at all means every clause was delegated; there is
+                                    // nothing to prove about the leaf set, so leave the root alone.
+                                    if fields.is_empty() {
+                                        needs_full.insert(col.index());
+                                    } else {
+                                        narrowable.entry(col.index()).or_default().extend(fields);
+                                    }
+                                }
+                                Err(_) => {
+                                    needs_full.insert(col.index());
+                                }
+                            }
+                            // Do NOT descend: the array argument is a whole-column reference only in
+                            // form, and counting it as one would disqualify the very root we just
+                            // proved narrowable.
+                            return Ok(TreeNodeRecursion::Jump);
+                        }
+                    }
+                }
+            }
+            if let Some(col) = node.downcast_ref::<Column>() {
+                needs_full.insert(col.index());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+
+    // Diagnostic: the expression shape is the one thing that decides whether a root is narrowable, and
+    // guessing at it from the Java serialiser is how the numeric shapes were misread once already.
+    // Gated on the env var so it costs nothing unless asked for.
+    if std::env::var("MUSTANG_LEAF_DEBUG").is_ok() {
+        for (i, e) in exprs.iter().enumerate() {
+            log_info!("[LEAF-DBG] leaf_expr[{}]: {}", i, e);
+        }
+        log_info!(
+            "[LEAF-DBG] narrowable={:?} needs_full={:?}",
+            narrowable,
+            needs_full
+        );
+    }
+
+    narrowable
+        .into_iter()
+        .filter(|(root, _)| !needs_full.contains(root))
+        .filter(|(root, _)| {
+            // Keep only roots that are actually a LIST<STRUCT> in this schema; anything else (MAP, a
+            // plain column, an index past the end after a rewrite) is left untouched.
+            schema
+                .fields()
+                .get(*root)
+                .is_some_and(|f| matches!(f.data_type(), DataType::List(e) if matches!(e.data_type(), DataType::Struct(_))))
+        })
+        .map(|(root, names)| {
+            let mut v: Vec<String> = names.into_iter().collect();
+            v.sort();
+            (root, v)
+        })
+        .collect()
+}
+
+/// Column names the plan actually CONSUMES: expression references plus the final output schema.
+///
+/// Deliberately NOT `collect_plan_column_names`, which also collects every intermediate node's output
+/// schema. That difference matters here: `build_reshaping_unnest` double-unnests the duplicated array so
+/// EVERY struct child becomes a top-level column, whether or not anything reads it. Collecting node
+/// schemas therefore reported all five `Events` children for `stats count() by Events.name` and narrowed
+/// nothing, while the aggregate above consumes only `name`.
+fn collect_consumed_column_names(plan: &datafusion::logical_expr::LogicalPlan) -> HashSet<String> {
+    let mut names: HashSet<String> = plan
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    // Walk TOP-DOWN and stop at the reshaping unnest, collecting only what sits ABOVE it.
+    //
+    // Everything from the unnest downwards names every struct child by construction:
+    // `build_reshaping_unnest` double-unnests the duplicated array (so each child becomes a top-level
+    // column) and then adds a rename projection that lists all of them explicitly
+    // (`col("Events__u.name").alias("name")`). Collecting those made the derivation report all five
+    // `Events` children for `stats count() by Events.name` and narrow nothing. The genuine consumer is
+    // the aggregate above, whose group expression references just `name`.
+    //
+    // The boundary is recognised two ways: an `Unnest` node, or any node whose expressions mention a
+    // `__u` column -- the dup-alias convention that same builder uses.
+    let _ = plan.apply(|node| {
+        if matches!(node, LogicalPlan::Unnest(_)) {
+            return Ok(TreeNodeRecursion::Jump);
+        }
+        let mut is_reshape_boundary = false;
+        let _ = node.apply_expressions(|expr| {
+            let _ = expr.apply(|e| {
+                if let Expr::Column(col) = e {
+                    if col.name().contains("__u") {
+                        is_reshape_boundary = true;
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if is_reshape_boundary {
+            return Ok(TreeNodeRecursion::Jump);
+        }
+        let _ = node.apply_expressions(|expr| {
+            let _ = expr.apply(|e| {
+                if let Expr::Column(col) = e {
+                    names.insert(col.name().to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            Ok(TreeNodeRecursion::Continue)
+        });
+        Ok(TreeNodeRecursion::Continue)
+    });
+    names
+}
+
+/// Nested leaves the PLAN names by dotted reference, e.g. `Events.name` or
+/// `Links.attributes.link.kind`.
+///
+/// The predicate-derived map above only sees `nested_any_match_expr`, which covers filters. It does not
+/// cover the unnest shapes -- `stats count() by Events.name`, `expand`, map-key access -- where the leaf
+/// appears in the plan's own schema (`projection=[count(), Events.name]`) while the SCAN still projects
+/// the whole `Events` root and therefore reads every leaf. Measured on otel1m: 75.4 MB read for a
+/// group-by that needs only the 0.12 MB `name` leaf, and 14.5 MB for a map filter that needs only the
+/// ~0 MB map leaves (the rest being `Links.spanId` + `traceId`).
+///
+/// Only the FIRST segment after the root is taken, so `Links.attributes.link.kind` yields child
+/// `attributes` -- the map column -- rather than a key name that is not a struct child at all.
+///
+/// Roots that appear BARE in the plan's output schema are excluded by the caller: those values are
+/// returned to the user (`SELECT Events`), so every leaf is genuinely needed.
+fn collect_nested_leaf_paths_from_plan(
+    plan: &datafusion::logical_expr::LogicalPlan,
+    schema: &SchemaRef,
+) -> HashMap<usize, Vec<String>> {
+    let names: Vec<String> = collect_consumed_column_names(plan).into_iter().collect();
+    let top_level: HashSet<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+    // Which roots this plan actually explodes. `build_reshaping_unnest` names the duplicated array
+    // column `<root>__u`, so its presence is the marker, and it is what makes the BARE-name reading
+    // below safe: without it, a bare `name` could belong to some unrelated column.
+    let exploded: HashSet<&str> = names
+        .iter()
+        .filter_map(|n| n.strip_suffix("__u"))
+        .collect();
+
+    let mut out: HashMap<usize, HashSet<String>> = HashMap::new();
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let DataType::List(elem) = field.data_type() else {
+            continue;
+        };
+        let DataType::Struct(children) = elem.data_type() else {
+            continue;
+        };
+        let root = field.name().as_str();
+        for n in &names {
+            // Two spellings reach here:
+            //   `Events.name`            -- dotted, as Calcite/PPL names it
+            //   `name`                   -- BARE, which is what `build_reshaping_unnest` renames the
+            //                               exploded children to (only trusted when the root is
+            //                               actually exploded in this plan, and the bare name is not
+            //                               itself a top-level column)
+            //   `Events__u.name`         -- the collision-guard spelling the same builder keeps when a
+            //                               child's bare name would clash with a parent field
+            let child = if let Some(rest) = n.strip_prefix(&format!("{root}.")) {
+                rest.split('.').next().unwrap_or(rest)
+            } else if let Some(rest) = n.strip_prefix(&format!("{root}__u.")) {
+                rest.split('.').next().unwrap_or(rest)
+            } else if exploded.contains(root) && !top_level.contains(n.as_str()) {
+                n.as_str()
+            } else {
+                continue;
+            };
+            if children.iter().any(|c| c.name() == child) {
+                out.entry(idx).or_default().insert(child.to_string());
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(k, v)| {
+            let mut names: Vec<String> = v.into_iter().collect();
+            names.sort();
+            (k, names)
+        })
+        .collect()
+}
+
+/// Roots returned to the caller as a whole array, which therefore need every leaf.
+///
+/// Taken from the plan's OUTPUT schema, not from the scan's projection: the scan must project the whole
+/// `Events` column for an unnest to explode it, so a projection-based test would refuse to narrow exactly
+/// the shapes this is meant to fix. The output schema distinguishes them -- `stats count() by Events.name`
+/// emits `[count(), Events.name]` with no bare `Events`, while `SELECT Events` emits `Events`.
+fn roots_output_whole(
+    plan: &datafusion::logical_expr::LogicalPlan,
+    schema: &SchemaRef,
+) -> HashSet<usize> {
+    plan.schema()
+        .fields()
+        .iter()
+        .filter_map(|f| schema.index_of(f.name()).ok())
+        .filter(|idx| matches!(schema.field(*idx).data_type(), DataType::List(_)))
+        .collect()
+}
+
+/// True when the tree crosses a further nested-array boundary, i.e. contains a `{"nested":…}` node.
+///
+/// Emitted by `OpenSearchNestedFieldRewriter.ExprTreeBuilder` for a multi-hop path such as
+/// `products.variants.color`; the enclosed `{"field":…}` then refers to the inner element's struct.
+fn json_has_deeper_boundary(node: &serde_json::Value) -> bool {
+    match node {
+        serde_json::Value::Object(map) => {
+            map.contains_key("nested") || map.values().any(json_has_deeper_boundary)
+        }
+        serde_json::Value::Array(items) => items.iter().any(json_has_deeper_boundary),
+        _ => false,
+    }
+}
+
+/// Collects every `{"field":"name"}` name in a `nested_any_match_expr` tree.
+///
+/// A dotted name means the clause reaches through a deeper level than the struct we would prune, so it
+/// is recorded whole (`a.b`) and will simply fail to match a direct child in
+/// `narrow_nested_root`, which then declines to narrow that root.
+pub(crate) fn collect_json_field_names(node: &serde_json::Value, out: &mut HashSet<String>) {
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(name)) = map.get("field") {
+                out.insert(name.clone());
+            }
+            for v in map.values() {
+                collect_json_field_names(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_json_field_names(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_predicate_column_names(
     extraction: Option<&ExtractionResult>,
     schema: &SchemaRef,
@@ -357,6 +664,32 @@ fn collect_plan_column_names(plan: &datafusion::logical_expr::LogicalPlan) -> Ve
     names.into_iter().collect()
 }
 
+/// `build_pruning_predicate`, falling back to a synthesized nested-leaf predicate.
+///
+/// A nested predicate arrives as one opaque `nested_any_match_expr` call, which DataFusion cannot
+/// turn into min/max logic -- `try_new` collapses it to always_true and `build_pruning_predicate`
+/// returns None, which is why nested filters historically consulted no row-group or page statistics
+/// at all. Synthesize a predicate over the nested LEAF columns instead; sound because
+/// `∃e:(A ∧ rest)` implies `∃e:A`, so a container whose leaf stats exclude A cannot hold a matching
+/// row. Used by every pruning-predicate site so row-group and page pruning behave alike.
+/// See [`crate::indexed_table::nested_prune`].
+fn pruning_predicate_or_nested(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &SchemaRef,
+) -> Option<Arc<PruningPredicate>> {
+    build_pruning_predicate(expr, Arc::clone(schema)).or_else(|| {
+        crate::indexed_table::nested_prune::synthesize_from_expr(expr, schema).map(|(pp, refs)| {
+            native_bridge_common::log_info!(
+                "[NESTED-PRUNE] synthesized pruning predicate over {:?}",
+                refs.iter()
+                    .map(|r| r.synthetic_name.as_str())
+                    .collect::<Vec<_>>()
+            );
+            pp
+        })
+    })
+}
+
 /// Build the `prune_tree_config` tuple from a BoolNode tree and schema.
 /// Builds per-leaf PruningPredicates from pre-collected leaf exprs.
 fn build_prune_tree_config(
@@ -371,8 +704,8 @@ fn build_prune_tree_config(
     let leaf_predicates: HashMap<usize, Arc<PruningPredicate>> = leaf_exprs
         .iter()
         .filter_map(|expr| {
-            build_pruning_predicate(expr, Arc::clone(schema))
-                .map(|pp| (Arc::as_ptr(expr) as *const () as usize, pp))
+            let pp = pruning_predicate_or_nested(expr, schema)?;
+            Some((Arc::as_ptr(expr) as *const () as usize, pp))
         })
         .collect();
     if leaf_predicates.is_empty() {
@@ -1044,6 +1377,30 @@ async unsafe fn execute_indexed_with_context_inner(
 
     let predicate_columns = collect_predicate_column_indices_from_exprs(&leaf_exprs);
 
+    let nested_leaf_paths = {
+        let mut m = collect_nested_leaf_paths(&leaf_exprs, &schema);
+        // The plan-derived leaves are NOT applied to the scan schema: the reshaping unnest above the
+        // scan is built against the FULL element struct, so a narrowed schema fails Arrow's check with
+        // "column types must match schema types, expected List(Struct(cache_key, ...))". They are
+        // applied to the scan's PROJECTION instead, after physical planning, where `transform_up`
+        // rebuilds Projection/Unnest/Aggregate and each re-derives its schema. See
+        // `leaf_projection::narrow_scan_projection`.
+        m
+    };
+
+    // By NAME, for the post-planning projection rewrite (the unnest path).
+    let plan_leaf_paths: HashMap<String, Vec<String>> =
+        collect_nested_leaf_paths_from_plan(&logical_plan, &schema)
+            .into_iter()
+            .filter(|(root, _)| !roots_output_whole(&logical_plan, &schema).contains(root))
+            .filter_map(|(root, leaves)| {
+                schema.fields().get(root).map(|f| (f.name().clone(), leaves))
+            })
+            .collect();
+    if std::env::var("MUSTANG_LEAF_DEBUG").is_ok() {
+        log_info!("[LEAF-DBG] plan-derived leaves (by name): {:?}", plan_leaf_paths);
+    }
+
     // Augment each segment's footer-only metadata with a scoped page index so
     // the indexed PagePruner can page-prune. Both predicate (→ ColumnIndex) and
     // projection (→ OffsetIndex) are wired — a match()-only query still needs a
@@ -1094,7 +1451,7 @@ async unsafe fn execute_indexed_with_context_inner(
                 .and_then(|e| residual_bool_to_physical_expr(&e.tree));
             let residual_pruning_predicate: Option<Arc<PruningPredicate>> = residual_expr
                 .as_ref()
-                .and_then(|expr| build_pruning_predicate(expr, Arc::clone(&schema_for_pruner)));
+                .and_then(|expr| pruning_predicate_or_nested(expr, &schema_for_pruner));
 
             (
                 Arc::new(
@@ -1183,7 +1540,7 @@ async unsafe fn execute_indexed_with_context_inner(
                 .and_then(residual_bool_to_physical_expr);
             let residual_pruning_predicate: Option<Arc<PruningPredicate>> = residual_expr
                 .as_ref()
-                .and_then(|expr| build_pruning_predicate(expr, Arc::clone(&schema_for_pruner)));
+                .and_then(|expr| pruning_predicate_or_nested(expr, &schema_for_pruner));
 
             let call_strategy = CollectorCallStrategy::PageRangeSplit;
             let bloom_store = Arc::clone(&store);
@@ -1303,7 +1660,7 @@ async unsafe fn execute_indexed_with_context_inner(
                 leaf_exprs
                     .iter()
                     .filter_map(|expr| {
-                        let result = build_pruning_predicate(expr, Arc::clone(&schema_for_pruner));
+                        let result = pruning_predicate_or_nested(expr, &schema_for_pruner);
                         result.map(|pp| (Arc::as_ptr(expr) as *const () as usize, pp))
                     })
                     .collect(),
@@ -1410,6 +1767,7 @@ async unsafe fn execute_indexed_with_context_inner(
         pushdown_predicate,
         query_config: Arc::clone(&query_config),
         predicate_columns,
+        nested_leaf_paths,
         emit_row_ids,
         prune_tree_config,
         sort_fields: sort_fields.clone(),
@@ -1425,6 +1783,10 @@ async unsafe fn execute_indexed_with_context_inner(
     );
     let dataframe = ctx.execute_logical_plan(logical_plan).await?;
     let physical_plan = dataframe.create_physical_plan().await?;
+    // Narrow the parquet scan's projection to the leaves the plan actually names (unnest / group-by /
+    // map-key shapes). No-op when nothing was derived.
+    let physical_plan =
+        crate::leaf_projection::narrow_scan_projection(physical_plan, &plan_leaf_paths);
     // Retag bit-compatible Int↔UInt output mismatches to match the substrait-declared
     // types. The target is schema_coerce::coerce_inferred_schema(physical_schema) — same
     // narrowing the partition-stream registration uses, so consumer-side StreamingTable

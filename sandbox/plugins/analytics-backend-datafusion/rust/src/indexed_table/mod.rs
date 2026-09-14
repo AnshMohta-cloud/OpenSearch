@@ -62,6 +62,7 @@ pub mod ffm_callbacks;
 pub mod index;
 pub mod metrics;
 pub mod page_pruner;
+pub mod nested_prune;
 pub mod parquet_bridge;
 pub mod partitioning;
 pub mod row_id_injection;

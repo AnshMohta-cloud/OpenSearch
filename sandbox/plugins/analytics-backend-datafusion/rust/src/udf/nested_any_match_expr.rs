@@ -293,6 +293,21 @@ enum CmpOp {
     Ne,
 }
 
+impl CmpOp {
+    /// The operator that holds when the operands are swapped, so `lit OP field` can be evaluated as
+    /// `field OP.flipped() lit`.
+    fn flipped(self) -> Self {
+        match self {
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Ge => CmpOp::Le,
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Eq => CmpOp::Eq,
+            CmpOp::Ne => CmpOp::Ne,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ArithOp {
     Add,
@@ -321,6 +336,18 @@ enum CNode<'a> {
     Exists(CVal<'a>, bool),
     /// Child-grain split leaf: use clause `idx`'s per-element verdict when supplied, else `fallback`.
     Lucene { idx: usize, fallback: Box<CNode<'a>> },
+    /// Key lookup in a `MAP<Utf8,Utf8>` child of the element struct, compared against a literal:
+    /// `Links.attributes['link.kind'] = 'follows_from'`. Reached from the same
+    /// `{"nested":<field>,"inner":…}` wire shape as an array descent -- the writer emits one shape for
+    /// both and the child's Arrow type decides which this is. Sharing the shape is deliberate: it means
+    /// `NestedAnyMatchExprSerializer` already turns it into the dotted Lucene term path
+    /// (`Links.attributes.link.kind`), so map predicates get Lucene pruning with no serializer change.
+    MapCmp {
+        col: usize,
+        key: &'a str,
+        op: CmpOp,
+        lit: Val<'a>,
+    },
     /// Descent into an inner `LIST<STRUCT>` column, opening a fresh existential over its elements.
     /// `inner` is compiled against the *inner* struct's fields.
     Nested { col: usize, inner: Box<CNode<'a>> },
@@ -368,6 +395,58 @@ fn compile_val<'a>(node: &'a Json, fields: &datafusion::arrow::datatypes::Fields
     plan_err!("nested_any_match_expr: unrecognized value node {node}")
 }
 
+/// Parses the `inner` of a MAP descent: `{"op":<cmp>,"args":[{"field":<key>},{"lit":<v>}]}`.
+///
+/// Only a direct comparison against a literal is accepted. Anything else (arithmetic on a map value,
+/// two map keys compared to each other, a nested boolean tree) is rejected rather than guessed at, so an
+/// unsupported shape fails loudly here instead of silently matching nothing.
+fn parse_map_cmp<'a>(node: &'a Json, field_name: &str) -> Result<(CmpOp, &'a str, Val<'a>)> {
+    let op = node
+        .get("op")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| DataFusionError::Execution(format!(
+            "nested_any_match_expr: map field '{field_name}' inner node needs a comparison 'op', got {node}"
+        )))?;
+    let cmp = match op {
+        "=" => CmpOp::Eq,
+        "!=" => CmpOp::Ne,
+        ">" => CmpOp::Gt,
+        ">=" => CmpOp::Ge,
+        "<" => CmpOp::Lt,
+        "<=" => CmpOp::Le,
+        other => {
+            return plan_err!("nested_any_match_expr: unsupported map comparison '{other}' on '{field_name}'")
+        }
+    };
+    let args = node
+        .get("args")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| DataFusionError::Execution(format!(
+            "nested_any_match_expr: map field '{field_name}' inner node missing 'args'"
+        )))?;
+    if args.len() != 2 {
+        return plan_err!("nested_any_match_expr: map comparison on '{field_name}' expects 2 args");
+    }
+    // Either order: key on the left or the right.
+    let (key_node, lit_node, cmp) = if args[0].get("field").is_some() {
+        (&args[0], &args[1], cmp)
+    } else if args[1].get("field").is_some() {
+        (&args[1], &args[0], cmp.flipped())
+    } else {
+        return plan_err!("nested_any_match_expr: map comparison on '{field_name}' needs one {{\"field\":key}} arg");
+    };
+    let key = key_node
+        .get("field")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| DataFusionError::Execution(format!(
+            "nested_any_match_expr: map key on '{field_name}' must be a string"
+        )))?;
+    let lit = lit_node.get("lit").ok_or_else(|| DataFusionError::Execution(format!(
+        "nested_any_match_expr: map comparison on '{field_name}' must compare against a {{\"lit\":v}}"
+    )))?;
+    Ok((cmp, key, json_to_val(lit)))
+}
+
 fn compile_node<'a>(node: &'a Json, fields: &datafusion::arrow::datatypes::Fields) -> Result<CNode<'a>> {
     // Child-grain split leaf: `{"lucene": <clauseIdx>, "fallback": <originalPredicateSubtree>}`.
     // Lucene is a pure OPTIMIZATION, never a correctness dependency: the executor may or may not supply
@@ -406,7 +485,14 @@ fn compile_node<'a>(node: &'a Json, fields: &datafusion::arrow::datatypes::Field
                     )
                 }
             },
-            other => return plan_err!("nested_any_match_expr: nested field '{field_name}' must be a List, got {other:?}"),
+            // A MAP child is a key lookup, not a level of nesting: `inner` names the map KEY in its
+            // `{"field":…}` slot rather than a struct child, so it is parsed here instead of compiled
+            // against struct fields.
+            DataType::Map(_, _) => {
+                let (op, key, lit) = parse_map_cmp(inner_subtree, field_name)?;
+                return Ok(CNode::MapCmp { col, key, op, lit });
+            }
+            other => return plan_err!("nested_any_match_expr: nested field '{field_name}' must be a List or Map, got {other:?}"),
         };
         return Ok(CNode::Nested {
             col,
@@ -502,6 +588,41 @@ fn eval_compiled(
                 }
             }
             eval_compiled(fallback, struct_array, elem_idx, lucene)
+        }
+
+        // Map key lookup on this element: scan the element's key/value pairs for `key`, then compare.
+        // A missing key yields None (SQL null), which behaves like any other null leaf: the element
+        // simply does not match, and an absent key is therefore never confused with a present-but-false
+        // one.
+        CNode::MapCmp { col, key, op, lit } => {
+            let map_col = struct_array.column(*col);
+            if map_col.is_null(elem_idx) {
+                return Ok(None);
+            }
+            let map = map_col
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::MapArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "nested_any_match_expr: map column {col} must be a Map, got {:?}",
+                        map_col.data_type()
+                    ))
+                })?;
+            let offsets = map.value_offsets();
+            let start = offsets[elem_idx] as usize;
+            let end = offsets[elem_idx + 1] as usize;
+            let keys = map.keys();
+            let values = map.values();
+            for i in start..end {
+                if matches!(read_field(keys.as_ref(), i), Val::Str(k) if k == *key) {
+                    // `compare` already yields None for a null operand, so a present-but-null value
+                    // behaves like any other null leaf.
+                    return Ok(compare(&read_field(values.as_ref(), i), *op, lit));
+                }
+            }
+            // Key absent: SQL null, so this element simply does not match. An absent key is therefore
+            // never conflated with a key whose value fails the comparison.
+            Ok(None)
         }
 
         // Semantics here are TWO-VALUED, not 3VL — matching vanilla OpenSearch nested-query existential
@@ -783,15 +904,7 @@ fn try_vectorize(
         CNode::Cmp(op, CVal::Field(col), CVal::Lit(lit)) => cmp_field_lit(struct_array.column(*col), *op, lit),
         // Literal on the left: flip the operator rather than the operands.
         CNode::Cmp(op, CVal::Lit(lit), CVal::Field(col)) => {
-            let flipped = match op {
-                CmpOp::Gt => CmpOp::Lt,
-                CmpOp::Ge => CmpOp::Le,
-                CmpOp::Lt => CmpOp::Gt,
-                CmpOp::Le => CmpOp::Ge,
-                CmpOp::Eq => CmpOp::Eq,
-                CmpOp::Ne => CmpOp::Ne,
-            };
-            cmp_field_lit(struct_array.column(*col), flipped, lit)
+            cmp_field_lit(struct_array.column(*col), op.flipped(), lit)
         }
 
         // A Lucene-delegated leaf is a straight bit lookup per element — cheap, and no tree walk.
@@ -799,6 +912,10 @@ fn try_vectorize(
             Some(l) if l.has_clause(*idx) => Some(BooleanArray::from_iter((0..len).map(|i| Some(l.value(*idx, i))))),
             _ => try_vectorize(fallback, struct_array, lucene, len),
         },
+
+        // Map lookups are not vectorised: each element's key list must be scanned individually, so
+        // declining here routes them to the per-element walk rather than pretending to a fast path.
+        CNode::MapCmp { .. } => None,
 
         // Inner LIST<STRUCT> level: vectorise the inner condition over the inner values array, then
         // roll it up to THIS level's elements. Two-valued (empty or null inner list => false),

@@ -119,6 +119,15 @@ fn has_aggregate_or_window_below(plan: &LogicalPlan) -> bool {
         LogicalPlan::Aggregate(_)
         | LogicalPlan::Window(_)
         | LogicalPlan::Join(_)
+        // Unnest belongs here for the same reason as the rest: a filter ABOVE an unnest references
+        // the unnested scope's columns, not the table's. A map-key filter
+        // (`Links.attributes.link.kind = 'x'`) lowers to
+        // `array_element(map_extract(attributes, 'link.kind'), 1)`, where `attributes` is an
+        // element-scope column; extracting that as a scan-level predicate made
+        // `create_physical_expr` fail with "No field named attributes" and killed the whole query.
+        // Skipping it leaves the predicate for DataFusion to evaluate above the scan, and lets a
+        // filter BELOW the unnest still be found and delegated.
+        | LogicalPlan::Unnest(_)
         | LogicalPlan::Union(_) => true,
         LogicalPlan::Projection(p) => has_aggregate_or_window_below(&p.input),
         LogicalPlan::Sort(s) => has_aggregate_or_window_below(&s.input),

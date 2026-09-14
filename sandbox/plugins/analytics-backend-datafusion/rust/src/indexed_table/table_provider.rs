@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::compute::SortOptions;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Result, Statistics};
 use datafusion::datasource::TableType;
@@ -64,7 +64,7 @@ use crate::datafusion_query_config::DatafusionQueryConfig;
 use crate::indexed_table::metrics::StreamMetrics;
 use crate::indexed_table::page_pruner::StatsPruneTree;
 use crate::search_stats::accumulate_from_exec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Info about a segment and its corresponding parquet file.
 #[derive(Debug, Clone)]
@@ -197,6 +197,11 @@ pub struct IndexedTableConfig {
     pub query_config: Arc<DatafusionQueryConfig>,
     /// Full-schema column indices referenced by BoolNode Predicate leaves.
     pub predicate_columns: Vec<usize>,
+    /// For each nested `LIST<STRUCT>` root the predicate reads through
+    /// `nested_any_match_expr` and nothing else: the leaf names it reads.
+    /// Built by `collect_nested_leaf_paths`; consumed by `scan()` to narrow the
+    /// schema handed to parquet. Empty map = narrow nothing.
+    pub nested_leaf_paths: HashMap<usize, Vec<String>>,
     /// When true, the `___row_id` column in the output projection is computed
     /// from position (global_base + rg.first_row + position_in_rg) instead of
     /// being read from parquet. Other projected columns are read normally.
@@ -219,6 +224,106 @@ pub struct IndexedTableConfig {
     /// down to `IndexReader` so the scan cooperatively stops when the query task
     /// is cancelled. `None` for untracked queries (`context_id == 0`) and tests.
     pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+/// Narrows nested `LIST<STRUCT>` roots to the leaves the predicate reads, for the schema handed to
+/// parquet.
+///
+/// Why this is the lever: DataFusion 55 chooses leaf column chunks from the *expressions*, in
+/// `projection_read_plan::build_projection_read_plan`. A root referenced as a whole column reads every
+/// leaf beneath it — the declared struct children are not consulted, so `events` costs all of
+/// `name, status, code, weight` plus their def/rep levels even for `count(*) WHERE events.name = ?`.
+/// Declaring a narrower **logical** file schema is what changes that: the physical-expr adapter then
+/// routes the column through a cast to the narrow type, and `nested_schema_pruning::clip_for_cast`
+/// clips the read to the leaves the cast names.
+///
+/// Two roots are deliberately left alone:
+/// - anything in the OUTPUT projection, because the caller receives those values and needs every leaf
+///   (`SELECT events`, `_source`); DataFusion would fall back to a full read of that root anyway, since
+///   a whole-column reference takes precedence over a cast on the same root;
+/// - anything absent from `nested_leaf_paths`, i.e. read by an expression we could not prove reads only
+///   named leaves.
+///
+/// Set `MUSTANG_LEAF_PROJECTION=0` to disable and read every leaf as before.
+fn narrow_scan_schema(
+    full_schema: &SchemaRef,
+    output_projection: Option<&Vec<usize>>,
+    nested_leaf_paths: &HashMap<usize, Vec<String>>,
+) -> SchemaRef {
+    if nested_leaf_paths.is_empty() || !leaf_projection_enabled() {
+        return Arc::clone(full_schema);
+    }
+    // NOTE: deliberately NOT gated on the scan's projection any more. A scan must project the whole
+    // `events` column for an unnest above it to explode, so testing the projection refused to narrow
+    // exactly the shapes that over-read the most (`stats count() by Events.name` read 75.4 MB for a
+    // 0.12 MB leaf). The accurate test is whether the root is returned to the caller as a whole array,
+    // which `indexed_executor::roots_output_whole` decides from the plan's OUTPUT schema and applies by
+    // removing the root from this map.
+    let _ = output_projection;
+
+    let mut fields: Vec<Arc<Field>> = full_schema.fields().iter().map(Arc::clone).collect();
+    let mut narrowed_any = false;
+    for (&root, leaves) in nested_leaf_paths {
+        let Some(field) = fields.get(root) else { continue };
+        if let Some(narrow) = narrow_nested_root(field, leaves) {
+            fields[root] = Arc::new(narrow);
+            narrowed_any = true;
+        }
+    }
+    if !narrowed_any {
+        return Arc::clone(full_schema);
+    }
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        full_schema.metadata().clone(),
+    ))
+}
+
+/// `LIST<STRUCT<a,b,c,d>>` -> `LIST<STRUCT<a>>`, keeping each retained child's own type intact.
+///
+/// Returns `None` — meaning "read this root in full" — unless the narrowing is provably safe and
+/// worthwhile: the root must be `LIST<STRUCT>`, EVERY requested name must resolve to a direct child
+/// (a dotted path from a deeper level will not, which is the intended rejection), and at least one
+/// child must actually drop.
+pub(crate) fn narrow_nested_root(field: &Arc<Field>, leaves: &[String]) -> Option<Field> {
+    let DataType::List(elem) = field.data_type() else {
+        return None;
+    };
+    let DataType::Struct(children) = elem.data_type() else {
+        return None;
+    };
+    let kept: Vec<Arc<Field>> = children
+        .iter()
+        .filter(|c| leaves.iter().any(|l| l == c.name()))
+        .map(Arc::clone)
+        .collect();
+    // Every requested name must resolve, and at least one child must drop. A dotted path from a deeper
+    // nesting level will not resolve, which is the intended rejection: narrowing to a set that misses a
+    // leaf the UDF looks up by name fails the query outright (observed as HTTP 500 — loud, not silent).
+    if kept.len() != leaves.len() || kept.len() >= children.len() {
+        return None;
+    }
+    Some(Field::new(
+        field.name(),
+        DataType::List(Arc::new(Field::new(
+            elem.name(),
+            DataType::Struct(Fields::from(kept)),
+            elem.is_nullable(),
+        ))),
+        field.is_nullable(),
+    ))
+}
+
+pub(crate) fn leaf_projection_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("MUSTANG_LEAF_PROJECTION")
+                .unwrap_or_default()
+                .as_str(),
+            "0" | "off" | "false"
+        )
+    })
 }
 
 /// Table provider. Returns a `QueryShardExec` that fans out across chunks.
@@ -425,9 +530,17 @@ impl TableProvider for IndexedTableProvider {
             ordering_optimized.add(1);
         }
 
+        // The schema parquet sees. Output/predicate wiring above is all built from the unnarrowed
+        // `full_schema`, so top-level indices — and therefore `read_projection` — stay valid.
+        let scan_schema = narrow_scan_schema(
+            &full_schema,
+            projection,
+            &self.config.nested_leaf_paths,
+        );
+
         Ok(Arc::new(QueryShardExec {
             config: Arc::clone(&self.config),
-            full_schema,
+            full_schema: scan_schema,
             projected_schema,
             projection: read_projection,
             assignments,
@@ -875,6 +988,7 @@ mod tests {
                 crate::datafusion_query_config::DatafusionQueryConfig::test_default(),
             ),
             predicate_columns: vec![],
+            nested_leaf_paths: HashMap::new(),
             emit_row_ids: false,
             prune_tree_config: None,
             sort_fields: vec![],

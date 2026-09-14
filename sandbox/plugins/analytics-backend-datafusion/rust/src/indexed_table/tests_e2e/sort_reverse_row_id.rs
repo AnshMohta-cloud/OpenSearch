@@ -247,6 +247,7 @@ async fn collect_row_ids(
         pushdown_predicate: None,
         query_config: Arc::new(qc),
         predicate_columns: vec![],
+        nested_leaf_paths: HashMap::new(),
         emit_row_ids: true,
         prune_tree_config: None,
         sort_fields: vec![],

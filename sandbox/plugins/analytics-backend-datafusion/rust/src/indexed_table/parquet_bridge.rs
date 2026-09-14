@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use native_bridge_common::log_info;
 use datafusion::common::Result;
 use datafusion::datasource::physical_plan::parquet::metadata::CachedParquetMetaData;
 use datafusion::datasource::physical_plan::parquet::{
@@ -221,6 +222,84 @@ pub fn create_full_scan_stream(
     create_stream_with_access_plan(config, access_plan, false)
 }
 
+/// SPIKE: narrow nested `LIST<STRUCT>` columns to a subset of leaves before handing the schema to
+/// `ParquetSource`, to measure whether DataFusion 55's `clip_for_cast` prunes leaf column chunks when
+/// the narrowed schema arrives from mustang's own scan path. It demonstrably works when the narrowing
+/// comes from a `CREATE EXTERNAL TABLE` declaration (measured: bytes_scanned 4.91 GB -> 1.39 GB), but
+/// that route puts an explicit CAST in the projection, which this one does not.
+///
+/// Driven by an env var so the answer needs a node restart, not a rebuild:
+///     MUSTANG_LEAF_SPIKE="events:name"          keep only events.name
+///     MUSTANG_LEAF_SPIKE="events:name|status"   keep events.name and events.status
+///
+/// Only STRUCT CHILDREN are pruned, never top-level columns: `RowGroupStreamConfig.projection` holds
+/// indices into this schema, so dropping a top-level field would silently misalign every projection.
+fn spike_narrow_schema(schema: &SchemaRef) -> SchemaRef {
+    static SPEC: std::sync::OnceLock<Vec<(String, Vec<String>)>> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        std::env::var("MUSTANG_LEAF_SPIKE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|part| {
+                        let (col, leaves) = part.split_once(':')?;
+                        Some((
+                            col.trim().to_string(),
+                            leaves.split('|').map(|l| l.trim().to_string()).collect(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if spec.is_empty() {
+        return Arc::clone(schema);
+    }
+
+    let mut changed = false;
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let keep = match spec.iter().find(|(c, _)| c == f.name()) {
+                Some((_, leaves)) => leaves,
+                None => return Arc::clone(f),
+            };
+            // events: List(element: Struct(name, status, code, weight)) -> List(element: Struct(name))
+            if let DataType::List(elem) = f.data_type() {
+                if let DataType::Struct(children) = elem.data_type() {
+                    let kept: Vec<Arc<Field>> = children
+                        .iter()
+                        .filter(|c| keep.iter().any(|k| k == c.name()))
+                        .cloned()
+                        .collect();
+                    if !kept.is_empty() && kept.len() < children.len() {
+                        changed = true;
+                        let new_elem = Field::new(
+                            elem.name(),
+                            DataType::Struct(Fields::from(kept)),
+                            elem.is_nullable(),
+                        );
+                        return Arc::new(Field::new(
+                            f.name(),
+                            DataType::List(Arc::new(new_elem)),
+                            f.is_nullable(),
+                        ));
+                    }
+                }
+            }
+            Arc::clone(f)
+        })
+        .collect();
+
+    if !changed {
+        return Arc::clone(schema);
+    }
+    let narrowed = Arc::new(Schema::new(fields));
+    log_info!("[LEAF-SPIKE] narrowed scan schema: {:?}", narrowed);
+    narrowed
+}
+
 fn create_stream_with_access_plan(
     config: &RowGroupStreamConfig,
     access_plan: ParquetAccessPlan,
@@ -235,7 +314,8 @@ fn create_stream_with_access_plan(
         Arc::clone(&config.io_stats),
     )) as Arc<dyn ParquetFileReaderFactory>;
 
-    let mut parquet_source = ParquetSource::new(config.full_schema.clone())
+    let scan_schema = spike_narrow_schema(&config.full_schema);
+    let mut parquet_source = ParquetSource::new(scan_schema)
         .with_parquet_file_reader_factory(reader_factory)
         // cannot use page index because we have collector bitset matches that are not visible
         // with just parquet predicates

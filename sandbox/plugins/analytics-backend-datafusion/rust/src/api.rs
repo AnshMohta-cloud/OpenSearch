@@ -1241,21 +1241,29 @@ fn resolve_dynamic_spill_limit(spill_dir: &str) -> u64 {
 }
 
 /// Whether a shard query routes to the indexed executor (vs the ListingTable path),
-/// decided by scanning the substrait plan bytes for two needles: the `index_filter`
-/// UDF name and the `__row_id__` column name. Either one → indexed path.
+/// decided by scanning the substrait plan bytes for three needles: the `index_filter`
+/// UDF name, the `__row_id__` column name, and the `nested_any_match_expr` UDF name.
+/// Any one → indexed path.
 ///
-/// This is a cheap byte-substring scan, not a parse. A false positive on
-/// `index_filter` takes the indexed path and then fails in `execute_indexed_query`
-/// when `classify_filter` returns `None` (no automatic retry on the ListingTable
-/// path) — unreachable in practice because the needle is not a valid DataFusion
-/// identifier a plan would otherwise contain.
+/// The nested needle is what makes nested pruning independent of Lucene delegation. The Java
+/// planner delegates a nested KEYWORD leaf but reports `treeShape=NO_DELEGATION` for a nested
+/// NUMERIC one, so a numeric nested plan carries no `index_filter`. Without this needle such a plan
+/// lands on the ListingTable, where neither our row-group/page pruner nor DataFusion's own exists
+/// for a nested leaf (DataFusion's `PruningPredicate` resolves top-level fields only, and the
+/// predicate is an opaque UDF) — so it scans every page. On the indexed path the same plan is a
+/// `FilterClass::None` predicate-only scan, which prunes via the synthesized nested-leaf predicate
+/// in `indexed_table::nested_prune` and evaluates the identical residual, so the answer is unchanged
+/// and only the bytes read differ.
+///
+/// This is a cheap byte-substring scan, not a parse. A false positive is harmless: with no
+/// `index_filter` present, `classify_filter` yields `FilterClass::None`, the branch that scans every
+/// row and applies the whole predicate as residual.
 fn use_indexed_path(plan_bytes: &[u8]) -> bool {
     const INDEX_FILTER: &[u8] = b"index_filter";
     const ROW_ID: &[u8] = crate::ROW_ID_COLUMN_NAME.as_bytes();
-    plan_bytes
-        .windows(INDEX_FILTER.len())
-        .any(|w| w == INDEX_FILTER)
-        || plan_bytes.windows(ROW_ID.len()).any(|w| w == ROW_ID)
+    const NESTED_MATCH: &[u8] = b"nested_any_match_expr";
+    let has = |needle: &[u8]| plan_bytes.windows(needle.len()).any(|w| w == needle);
+    has(INDEX_FILTER) || has(ROW_ID) || has(NESTED_MATCH)
 }
 
 /// Best-effort budget acquisition from cached parquet metadata.
@@ -2329,6 +2337,20 @@ mod tests {
     use super::*;
     use arrow_array::{BinaryViewArray, Int64Array, StringViewArray};
     use arrow_schema::{Field, Schema};
+
+    #[test]
+    fn use_indexed_path_routes_nested_without_delegation() {
+        // A delegated plan routes on `index_filter`, and a QTF plan on `__row_id__`.
+        assert!(use_indexed_path(b"...extension: index_filter..."));
+        assert!(use_indexed_path(crate::ROW_ID_COLUMN_NAME.as_bytes()));
+        // A nested predicate the planner declined to delegate (numeric leaf: NO_DELEGATION) carries
+        // neither needle, and on the ListingTable nothing can prune a nested leaf.
+        assert!(use_indexed_path(
+            b"...extension: nested_any_match_expr...events..."
+        ));
+        // A plain scalar plan still takes the ListingTable path.
+        assert!(!use_indexed_path(b"...tenant = 't1'..."));
+    }
 
     /// Shared lock for tests that mutate `memory_guard`'s global SPILL_ENABLED / SPILL_DIR
     /// or that observe the global runtime state from `create_global_runtime`. cargo test

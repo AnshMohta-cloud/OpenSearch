@@ -190,6 +190,7 @@ async fn run_indexed(sql: &str) -> (Vec<i32>, Arc<dyn datafusion::physical_plan:
         pushdown_predicate: None,
         query_config: std::sync::Arc::new(qc),
         predicate_columns: vec![],
+        nested_leaf_paths: std::collections::HashMap::new(),
         emit_row_ids: false,
         prune_tree_config: None,
         sort_fields: vec![],

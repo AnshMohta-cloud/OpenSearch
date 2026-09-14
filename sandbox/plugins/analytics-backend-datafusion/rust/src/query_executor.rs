@@ -94,6 +94,11 @@ pub async fn execute_query(
     // schema_coerce::coerce_inferred_schema(physical_schema) — the same narrowing the
     // partition-stream registration uses, so the consumer's StreamingTable and the
     // batches arriving from this producer agree by construction.
+    // Leaf projection: a nested predicate pushed into the parquet scan reads every leaf of its root
+    // unless the array argument arrives through a narrowing cast. Rewrites only the pushed predicate,
+    // so no schema changes and nothing above the scan is affected. See `crate::leaf_projection`.
+    let physical_plan = crate::leaf_projection::narrow_pushed_nested_predicates(physical_plan);
+
     let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
     let physical_plan = crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;
 
@@ -311,7 +316,12 @@ pub async fn execute_with_context(
         // ProjectRowIdOptimizer (registered in session_context when strategy=ListingTable).
         let physical_plan = dataframe.create_physical_plan().await?;
 
-        let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
+        // Leaf projection: a nested predicate pushed into the parquet scan reads every leaf of its root
+    // unless the array argument arrives through a narrowing cast. Rewrites only the pushed predicate,
+    // so no schema changes and nothing above the scan is affected. See `crate::leaf_projection`.
+    let physical_plan = crate::leaf_projection::narrow_pushed_nested_predicates(physical_plan);
+
+    let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
         let physical_plan =
             crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;
         log_debug!(

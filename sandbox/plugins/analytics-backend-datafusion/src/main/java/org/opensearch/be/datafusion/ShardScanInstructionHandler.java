@@ -65,7 +65,17 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
             MemorySegment segment = arena.allocate(WireConfigSnapshot.BYTE_SIZE);
             snapshot.writeTo(segment);
             SessionContextHandle sessionCtxHandle;
-            if (node.requestsRowIds()) {
+            // A nested predicate needs the indexed context even with nothing delegated to Lucene. On
+            // the plain ListingTable path a nested leaf cannot be pruned by anyone: DataFusion's own
+            // PruningPredicate resolves top-level fields only, and the predicate reaches it as one
+            // opaque nested_any_match_expr UDF, so it reads every page. The indexed path prunes the
+            // same predicate from the leaf's own row-group and page statistics. Nested KEYWORD leaves
+            // already arrive here delegated (via ShardScanWithDelegationHandler); nested NUMERIC ones
+            // report treeShape=NO_DELEGATION and would otherwise land on the ListingTable and scan in
+            // full. Detected by scanning the fragment for the UDF name rather than by a new field on
+            // ShardScanInstructionNode, which would be a wire-format change needing BWC handling.
+            boolean hasNestedPredicate = containsNestedPredicate(context.getFragmentBytes());
+            if (node.requestsRowIds() || hasNestedPredicate) {
                 // QTF query phase — narrowed scan emits __row_id__. Use the indexed session
                 // context so the IndexedTableProvider injects shard-global row ids during scan.
                 // No delegated predicates here (delegation goes through ShardScanWithDelegationHandler),
@@ -77,7 +87,9 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
                     contextId,
                     FilterTreeShape.NO_DELEGATION.ordinal(),
                     0,
-                    true,
+                    // Only QTF wants row ids. The nested case takes this context purely for pruning,
+                    // and emitting __row_id__ there would add a column its projection never asked for.
+                    node.requestsRowIds(),
                     context.hasPartialAggregate(),
                     segment.address(),
                     context.getFragmentBytes()
@@ -96,5 +108,35 @@ public class ShardScanInstructionHandler implements FragmentInstructionHandler<S
             }
             return new DataFusionSessionState(sessionCtxHandle);
         }
+    }
+
+    /**
+     * The Substrait function name the nested-field rewriter emits, as written by
+     * DataFusionFragmentConvertor's function mapping.
+     */
+    private static final byte[] NESTED_ANY_MATCH_EXPR = "nested_any_match_expr".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+    /**
+     * Does this fragment carry a nested predicate? A substring scan of the Substrait bytes, not a
+     * parse — the function name appears in the plan's extension declarations whenever the rewriter
+     * emitted a {@code NESTED_ANY_MATCH_EXPR} call.
+     *
+     * <p>A false positive costs nothing: the indexed path with nothing delegated is a predicate-only
+     * scan that reads every row and applies the whole predicate as a residual, which is what the
+     * ListingTable path does anyway.
+     */
+    private static boolean containsNestedPredicate(byte[] fragmentBytes) {
+        if (fragmentBytes == null || fragmentBytes.length < NESTED_ANY_MATCH_EXPR.length) {
+            return false;
+        }
+        outer: for (int i = 0; i <= fragmentBytes.length - NESTED_ANY_MATCH_EXPR.length; i++) {
+            for (int j = 0; j < NESTED_ANY_MATCH_EXPR.length; j++) {
+                if (fragmentBytes[i + j] != NESTED_ANY_MATCH_EXPR[j]) {
+                    continue outer;
+                }
+            }
+            return true;
+        }
+        return false;
     }
 }

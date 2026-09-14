@@ -218,6 +218,12 @@ impl LocalSession {
         let dataframe = self.ctx.execute_logical_plan(logical_plan).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
 
+        // Leaf projection: a nested predicate pushed into the parquet scan reads every leaf of its root
+        // unless its array argument arrives through a narrowing cast. Rewrites the pushed predicate only —
+        // no schema changes, so nothing above the scan is affected. See `crate::leaf_projection`.
+        let physical_plan =
+            crate::leaf_projection::narrow_pushed_nested_predicates(physical_plan);
+
         let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
         let physical_plan =
             crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;
@@ -258,6 +264,12 @@ impl LocalSession {
         let logical_plan = from_substrait_plan_unnest_aware(&self.ctx.state(), &plan).await?;
         let dataframe = self.ctx.execute_logical_plan(logical_plan).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
+
+        // Leaf projection: a nested predicate pushed into the parquet scan reads every leaf of its root
+        // unless its array argument arrives through a narrowing cast. Rewrites the pushed predicate only —
+        // no schema changes, so nothing above the scan is affected. See `crate::leaf_projection`.
+        let physical_plan =
+            crate::leaf_projection::narrow_pushed_nested_predicates(physical_plan);
         // Strip first so `force_aggregate_mode(Final)` can find the Final/Partial pair
         // through the raw plan; then derive `target_schema` and wrap with RelabelExec from
         // the stripped output (otherwise the relabel target would carry the pre-strip Final
