@@ -880,21 +880,49 @@ impl IndexedStream {
         let rg_skipped = m(&self.metrics.rg_skipped);
         let rg_prefetch_pruned = m(&self.metrics.dynamic_filter_rg_pruned_at_prefetch);
         let rg_bloom = m(&self.metrics.rg_bloom_pruned);
+        // `seg_*` fields are THIS segment's contribution; the unprefixed ones remain the stream's
+        // running totals. Sum `seg_*` across lines to get a per-query figure -- summing the running
+        // totals does not work, and reading them as per-segment is what produced impossible ratios
+        // like "96 of 46 row groups skipped".
+        let now = crate::indexed_table::metrics::SegmentCounterSnapshot {
+            rg_processed: m(&self.metrics.rg_processed),
+            rg_skipped,
+            pages_pruned: m(&self.metrics.pages_pruned),
+            pages_total: m(&self.metrics.pages_total),
+            rows_matched: m(&self.metrics.rows_matched),
+            output_rows: m(&self.metrics.output_rows),
+        };
+        // The snapshot lives on the SHARED `StreamMetrics`, not on this stream: a partition task
+        // builds a fresh stream per segment while the counters persist across all of them, so a
+        // stream-local snapshot would always start at zero and just re-print the running total.
+        let prev = match self.metrics.prev_segment_summary.lock() {
+            Ok(mut guard) => std::mem::replace(&mut *guard, now),
+            Err(_) => crate::indexed_table::metrics::SegmentCounterSnapshot::default(),
+        };
+        let d = |cur: usize, before: usize| cur.saturating_sub(before);
         log_info!(
             "[SCF-DF] file={} row_groups={} rg_processed={} rg_skipped={} rg_pruned_prefetch={} rg_bloom_pruned={} \
-             pages_pruned={}/{} rows_matched={} rows_pruned={} output_rows={} ffm_collector_calls={} elapsed={:?}",
+             pages_pruned={}/{} rows_matched={} rows_pruned={} output_rows={} ffm_collector_calls={} \
+             seg_rg_processed={} seg_rg_skipped={} seg_pages_pruned={}/{} seg_rows_matched={} seg_output_rows={} \
+             elapsed={:?}",
             self.object_path.filename().unwrap_or("?"),
             rg_total,
-            m(&self.metrics.rg_processed),
+            now.rg_processed,
             rg_skipped,
             rg_prefetch_pruned,
             rg_bloom,
-            m(&self.metrics.pages_pruned),
-            m(&self.metrics.pages_total),
-            m(&self.metrics.rows_matched),
+            now.pages_pruned,
+            now.pages_total,
+            now.rows_matched,
             m(&self.metrics.rows_pruned),
-            m(&self.metrics.output_rows),
+            now.output_rows,
             m(&self.metrics.ffm_collector_calls),
+            d(now.rg_processed, prev.rg_processed),
+            d(now.rg_skipped, prev.rg_skipped),
+            d(now.pages_pruned, prev.pages_pruned),
+            d(now.pages_total, prev.pages_total),
+            d(now.rows_matched, prev.rows_matched),
+            d(now.output_rows, prev.output_rows),
             self.stream_start.map(|s| s.elapsed()).unwrap_or_default()
         );
         // [SCF-TIMING] per-STAGE latency breakdown for this segment stream (all values ms). Surfaces

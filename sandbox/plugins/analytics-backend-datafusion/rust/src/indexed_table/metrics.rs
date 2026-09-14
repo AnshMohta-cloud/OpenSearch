@@ -24,8 +24,28 @@ use crate::indexed_table::parquet_bridge::ReadIoStats;
 ///
 /// All fields are `Option` because standalone uses of `IndexedExec` (i.e. not
 /// under a multi-segment parent) have no shared parent metrics to update.
+/// Snapshot of the cumulative scan counters, used to turn running totals into per-segment deltas.
+#[derive(Default, Clone, Copy)]
+pub struct SegmentCounterSnapshot {
+    pub rg_processed: usize,
+    pub rg_skipped: usize,
+    pub pages_pruned: usize,
+    pub pages_total: usize,
+    pub rows_matched: usize,
+    pub output_rows: usize,
+}
+
 #[derive(Clone)]
 pub struct StreamMetrics {
+    /// Counter values as of the last `[SCF-DF]` line, so each line can report its own segment's
+    /// contribution rather than the partition's running total.
+    ///
+    /// This lives here, not on the stream, precisely because it must be SHARED: a partition task
+    /// creates a fresh stream per segment while these counters persist across all of them. A
+    /// stream-local snapshot always starts at zero and so reproduces the running total, which is what
+    /// made a 1-row-group file report "9 row groups skipped". `Arc<Mutex<..>>` because `StreamMetrics`
+    /// is `Clone` and shared, and the logger only has `&self`.
+    pub prev_segment_summary: Arc<std::sync::Mutex<SegmentCounterSnapshot>>,
     pub output_rows: Option<Count>,
     pub elapsed_compute: Option<Time>,
     pub index_time: Option<Time>,
@@ -131,6 +151,7 @@ impl StreamMetrics {
     /// No-op metrics for standalone execution.
     pub fn empty() -> Self {
         Self {
+            prev_segment_summary: Arc::new(std::sync::Mutex::new(Default::default())),
             output_rows: None,
             elapsed_compute: None,
             index_time: None,
@@ -269,6 +290,7 @@ impl PartitionMetrics {
         inner_parquet_metrics: Option<Arc<std::sync::Mutex<Vec<MetricsSet>>>>,
     ) -> StreamMetrics {
         StreamMetrics {
+            prev_segment_summary: Arc::new(std::sync::Mutex::new(Default::default())),
             output_rows: Some(self.output_rows),
             elapsed_compute: Some(self.elapsed_compute),
             index_time: Some(self.index_time),
